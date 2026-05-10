@@ -39,12 +39,13 @@ The backend is located in the `src-tauri` directory.
 
 ### Testing the Backend
 
+Unit tests for the Rust backend are located in `src-tauri/src/lib.rs`. These tests directly call the `toggle_service_logic` function to verify service state transitions (start, stop, invalid action) without requiring a full Tauri runtime, ensuring robust and isolated testing.
+
 To run the Rust tests:
 ```bash
 cd src-tauri
 cargo test
 ```
-*(Note: No backend tests have been written yet.)*
 
 ## Frontend (React)
 
@@ -56,11 +57,18 @@ The frontend is a React application located in the `src` directory.
 
 ### Testing the Frontend
 
-To run the frontend tests:
+The frontend is tested using [Vitest](https://vitest.dev/) and [@testing-library/react](https://testing-library.com/docs/react-testing-library/intro/). The test files are located in the `src/__tests__` directory.
+
+The tests for the `App` component (`src/__tests__/App.test.tsx`) verify that the UI renders correctly and that user interactions trigger the expected Tauri commands. The `@tauri-apps/api/core` `invoke` function is mocked to isolate the frontend components from the Rust backend during testing.
+
+To run the frontend tests, use the following command from the project root:
 ```bash
 npm test
 ```
-*(Note: No frontend tests have been written yet.)*
+To run the tests with coverage, use:
+```bash
+npm run coverage
+```
 
 ## Building for Production
 
