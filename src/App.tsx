@@ -1,13 +1,13 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import KeysManager from "./components/KeysManager";
+import SovereignSigner from "./components/SovereignSigner";
 import "./App.css";
 
-// This type should match the Rust enum
 type ServiceStatus = "running" | "stopped" | "starting";
-
 const SERVICES = ["Nostr", "Blossom", "IPFS"];
 
-function App() {
+function ServiceSwitchPanel() {
     const [serviceStatus, setServiceStatus] = useState<
         Record<string, ServiceStatus>
     >(
@@ -36,8 +36,8 @@ function App() {
     };
 
     return (
-        <main className="container">
-            <h1>Service Switch Panel</h1>
+        <>
+            <h2>Service Switch Panel</h2>
             <div className="service-list">
                 {SERVICES.map((name) => (
                     <div key={name} className="service-item">
@@ -55,6 +55,45 @@ function App() {
                         </button>
                     </div>
                 ))}
+            </div>
+        </>
+    );
+}
+
+function App() {
+    const [activeTab, setActiveTab] = useState<"services" | "keys" | "signer">(
+        "services",
+    );
+
+    return (
+        <main className="container">
+            <h1>iYou Home</h1>
+
+            <div className="tabs">
+                <button
+                    className={activeTab === "services" ? "active" : ""}
+                    onClick={() => setActiveTab("services")}
+                >
+                    Services
+                </button>
+                <button
+                    className={activeTab === "keys" ? "active" : ""}
+                    onClick={() => setActiveTab("keys")}
+                >
+                    Keys (Vault)
+                </button>
+                <button
+                    className={activeTab === "signer" ? "active" : ""}
+                    onClick={() => setActiveTab("signer")}
+                >
+                    Signer
+                </button>
+            </div>
+
+            <div className="tab-content">
+                {activeTab === "services" && <ServiceSwitchPanel />}
+                {activeTab === "keys" && <KeysManager />}
+                {activeTab === "signer" && <SovereignSigner />}
             </div>
         </main>
     );

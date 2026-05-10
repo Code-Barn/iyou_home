@@ -15,16 +15,18 @@
 }
 
 .container {
-    margin: 0;
+    margin: 0 auto;
+    max-width: 800px;
     padding-top: 2rem;
     display: flex;
     flex-direction: column;
-    justify-content: center;
-    text-align: center;
+    justify-content: flex-start;
+    min-height: 100vh;
 }
 
 h1 {
     text-align: center;
+    margin-bottom: 2rem;
 }
 
 button {
@@ -36,22 +38,153 @@ button {
     font-family: inherit;
     color: #0f0f0f;
     background-color: #ffffff;
-    transition: border-color 0.25s;
+    transition:
+        border-color 0.25s,
+        background-color 0.25s;
     box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
     cursor: pointer;
-    width: 80px;
 }
 
 button:hover {
     border-color: #396cd8;
 }
 
+button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    justify-content: center;
+    gap: 1rem;
+    margin-bottom: 2rem;
+    border-bottom: 2px solid #ddd;
+    padding-bottom: 1rem;
+}
+
+.tabs button {
+    background: none;
+    box-shadow: none;
+    border: 2px solid transparent;
+    border-radius: 0;
+}
+
+.tabs button.active {
+    border-bottom: 2px solid #396cd8;
+    color: #396cd8;
+}
+
+.tab-content {
+    background: white;
+    padding: 2rem;
+    border-radius: 12px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+}
+
+/* Components */
+.component-container h2 {
+    margin-top: 0;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 0.5rem;
+}
+
+.section {
+    margin-top: 2rem;
+    padding: 1.5rem;
+    background: #f9f9f9;
+    border-radius: 8px;
+    border: 1px solid #eee;
+}
+
+.section h3 {
+    margin-top: 0;
+}
+
+/* Forms */
+.form-group {
+    margin-bottom: 1rem;
+    display: flex;
+    flex-direction: column;
+    text-align: left;
+}
+
+.form-group label {
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    font-size: 0.9em;
+}
+
+input[type="text"],
+input[type="password"],
+textarea {
+    padding: 0.8rem;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+    font-family: inherit;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* Specific UI Elements */
+.vault-badge {
+    display: inline-block;
+    background-color: #e6f4ea;
+    color: #137333;
+    padding: 0.4rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.85em;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    border: 1px solid #ceead6;
+}
+
+.did-display {
+    display: block;
+    background: #eef1f6;
+    padding: 1rem;
+    border-radius: 4px;
+    word-break: break-all;
+    font-family: monospace;
+    border: 1px solid #d4dbe8;
+}
+
+.did-display.muted {
+    color: #666;
+}
+
+.json-display {
+    background: #2d2d2d;
+    color: #ccc;
+    padding: 1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    text-align: left;
+    font-size: 0.9em;
+}
+
+.error-message {
+    background: #fce8e6;
+    color: #c5221f;
+    padding: 1rem;
+    border-radius: 4px;
+    margin-bottom: 1rem;
+    border: 1px solid #fad2cf;
+}
+
+.success-text {
+    color: #137333;
+    font-weight: 600;
+}
+
+/* Service Switch Panel (Legacy) */
 .service-list {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 1rem;
-    margin-top: 2rem;
+    margin-top: 1rem;
 }
 
 .service-item {
@@ -61,8 +194,8 @@ button:hover {
     width: 300px;
     padding: 0.8rem;
     border-radius: 8px;
-    background-color: #fff;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    background-color: #f9f9f9;
+    border: 1px solid #eee;
 }
 
 .service-name {
@@ -110,15 +243,37 @@ button:hover {
 @media (prefers-color-scheme: dark) {
     :root {
         color: #f6f6f6;
+        background-color: #1a1a1a;
+    }
+
+    .tab-content,
+    .section,
+    .service-item {
         background-color: #2f2f2f;
+        border-color: #444;
     }
 
     button {
         color: #ffffff;
-        background-color: #0f0f0f98;
+        background-color: #333;
     }
 
-    .service-item {
-        background-color: #3a3a3a;
+    input[type="text"],
+    input[type="password"],
+    textarea {
+        background-color: #222;
+        color: #fff;
+        border-color: #555;
+    }
+
+    .did-display {
+        background-color: #222;
+        border-color: #444;
+    }
+
+    .vault-badge {
+        background-color: #1e3a29;
+        color: #81c995;
+        border-color: #285038;
     }
 }

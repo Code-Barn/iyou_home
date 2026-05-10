@@ -18,8 +18,7 @@ describe("App", () => {
     });
 
     it("calls the toggle_service command when a button is clicked", async () => {
-        (invoke as jest.Mock).mockResolvedValue("running");
-
+        (invoke as any).mockResolvedValue("running");
         render(<App />);
 
         const nostrButton = screen.getAllByRole("button", {

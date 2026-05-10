@@ -1,0 +1,3 @@
+[submodule "libs/did_rust"]
+	path = libs/did_rust
+	url = ssh://iyou@qnap:/share/homes/iyou/repos/did_rust.git

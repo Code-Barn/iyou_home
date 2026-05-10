@@ -77,3 +77,12 @@ To build the application for production, run:
 npm run tauri build
 ```
 This will create a standalone executable for your platform in the `src-tauri/target/release/bundle` directory.
+
+## Sovereign Signer Architecture
+
+This application employs a Level 2 (Sovereign) security posture using a "Secure Enclave" architecture:
+
+*   **The Vault (Rust Backend):** Identity keys (DIDs and private seeds) are stored securely on the local filesystem and managed exclusively by the Rust backend (`src-tauri/src/vault.rs`). The private key never leaves the Rust process.
+*   **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates cryptographic operations. It triggers signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge` command).
+*   **Cryptography:** All DID generation, verification, and Verifiable Presentation (VP) signing is performed natively by the `did_rust` library, ensuring maximum security and isolation.
+*   **WASM Capabilities:** The `did_rust` library is also compiled to WebAssembly (`src/lib/did_rust_wasm/`) to provide non-sensitive cryptographic parsing and verification utilities directly to the frontend when required.
