@@ -32,7 +32,7 @@ pub struct ServiceState {
 
 // State for WS requests
 pub struct WsState {
-    pub response_sender: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -182,7 +182,7 @@ async fn submit_ws_response(
     let sender = guard.as_ref().ok_or("No WebSocket connected")?;
 
     if !approved {
-        let _ = sender.send("{\"status\":\"denied\"}".to_string());
+        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
         println!("WS sign request denied by user");
         return Ok(());
     }
@@ -196,7 +196,7 @@ async fn submit_ws_response(
     });
 
     println!("Sending signed VP back to browser");
-    let _ = sender.send(response.to_string());
+    let _ = sender.send(Message::Text(response.to_string().into()));
     Ok(())
 }
 
@@ -294,26 +294,44 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         }
     };
 
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
+    let (response_tx, response_rx) = mpsc::unbounded_channel::<Message>();
 
     {
         let ws_state = app_handle.state::<WsState>();
-        *ws_state.response_sender.lock().unwrap() = Some(response_tx);
+        *ws_state.response_sender.lock().unwrap() = Some(response_tx.clone());
     }
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     let app_clone = app_handle.clone();
     tokio::spawn(async move {
-        while let Some(response) = response_rx.recv().await {
-            println!("Sending response over WebSocket: {}", response);
-            if let Err(e) = ws_sender.send(Message::Text(response.into())).await {
-                eprintln!("Failed to send WS message: {}", e);
-                break;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+        tokio::pin!(response_rx);
+        loop {
+            tokio::select! {
+                msg = response_rx.recv() => {
+                    let msg = match msg {
+                        Some(msg) => msg,
+                        None => break,
+                    };
+                    println!("Sending response over WebSocket: {:?}", msg);
+                    if let Err(e) = ws_sender.send(msg).await {
+                        eprintln!("Failed to send WS message: {}", e);
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
+                        eprintln!("Failed to send Ping: {}", e);
+                        break;
+                    }
+                    println!("Heartbeat Ping sent");
+                }
             }
         }
         let ws_state = app_clone.state::<WsState>();
         *ws_state.response_sender.lock().unwrap() = None;
+        println!("DEBUG: Forwarder Task Exited");
     });
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -334,8 +352,14 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                     );
                 }
             }
+        } else if msg.is_pong() {
+            println!("Heartbeat Pong received");
         }
     }
+    println!("DEBUG: WebSocket Read Loop Exited");
+
+    let ws_state = app_handle.state::<WsState>();
+    *ws_state.response_sender.lock().unwrap() = None;
 }
 
 async fn listen_on(addrs: &str, app: AppHandle) {
