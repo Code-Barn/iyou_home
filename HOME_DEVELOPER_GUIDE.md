@@ -78,11 +78,11 @@ npm run tauri build
 ```
 This will create a standalone executable for your platform in the `src-tauri/target/release/bundle` directory.
 
-## Sovereign Signer Architecture
+## Architecture: The Secure Enclave
 
-This application employs a Level 2 (Sovereign) security posture using a "Secure Enclave" architecture:
+This application strictly employs a Level 2 (Sovereign) security posture using a "Secure Enclave" model. This is the foundational security principle of the iYou Home project:
 
-*   **The Vault (Rust Backend):** Identity keys (DIDs and private seeds) are stored securely on the local filesystem and managed exclusively by the Rust backend (`src-tauri/src/vault.rs`). The private key never leaves the Rust process.
-*   **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates cryptographic operations. It triggers signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge` command).
-*   **Cryptography:** All DID generation, verification, and Verifiable Presentation (VP) signing is performed natively by the `did_rust` library, ensuring maximum security and isolation.
-*   **WASM Capabilities:** The `did_rust` library is also compiled to WebAssembly (`src/lib/did_rust_wasm/`) to provide non-sensitive cryptographic parsing and verification utilities directly to the frontend when required.
+1.  **The Vault (Rust Backend):** The Rust process acts as the Secure Enclave. Identity keys (DIDs and private seeds) are stored securely on the local filesystem and managed exclusively by Rust (`src-tauri/src/vault.rs`). **The private key is never exposed, serialized, or transmitted to the JavaScript frontend context.**
+2.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates cryptographic operations. It acts purely as a dumb terminal for identity operations. It triggers signing by passing challenges to the backend via Tauri IPC (e.g., the `sign_auth_challenge` command).
+3.  **Backend Cryptography:** All sensitive DID generation and Verifiable Presentation (VP) signing is performed natively in Rust by the `did_rust` library, ensuring maximum security, memory isolation, and defense against XSS or prototype-pollution attacks in the browser layer.
+4.  **WASM Utilities:** The `did_rust` library is compiled to WebAssembly (`src/lib/did_rust_wasm/`) only to provide non-sensitive cryptographic parsing and validation utilities directly to the frontend (e.g., verifying a VP structure before displaying it).

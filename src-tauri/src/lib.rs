@@ -134,6 +134,13 @@ fn sign_auth_challenge(
     if store.did != did_id {
         return Err("Requested DID does not match the active Vault identity".to_string());
     }
+    sign_auth_challenge_logic(&store, &challenge)
+}
+
+fn sign_auth_challenge_logic(
+    store: &vault::IdentityStore,
+    challenge: &str,
+) -> Result<String, String> {
     let presentation = serde_json::json!({
         "@context": ["https://www.w3.org/2018/credentials/v1"],
         "type": ["VerifiablePresentation"],
@@ -142,9 +149,8 @@ fn sign_auth_challenge(
         "verifiableCredential": []
     });
     let vp_json = presentation.to_string();
-    let signed_vp = did_rust::issue_vc(&vp_json, &store.did, &store.private_key_base58)
-        .map_err(|e| format!("Failed to sign presentation: {}", e))?;
-    Ok(signed_vp)
+    did_rust::issue_vc(&vp_json, &store.did, &store.private_key_base58)
+        .map_err(|e| format!("Failed to sign presentation: {}", e))
 }
 
 #[tauri::command]
@@ -370,5 +376,32 @@ mod tests {
         let result = toggle_service_logic(service_name.clone(), "stop".to_string(), &state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), ServiceStatus::Stopped);
+    }
+
+    #[test]
+    fn test_sign_auth_challenge_logic() {
+        // Generate a real DID for testing the signing logic
+        let generated_json_str = did_rust::generate_did("key").expect("Should generate DID");
+        let parsed: serde_json::Value = serde_json::from_str(&generated_json_str).unwrap();
+
+        let store = vault::IdentityStore {
+            did: parsed["did"].as_str().unwrap().to_string(),
+            private_key_base58: parsed["private_key_base58"].as_str().unwrap().to_string(),
+        };
+
+        let challenge = "test-challenge-uuid-1234";
+
+        let vp_json_str =
+            sign_auth_challenge_logic(&store, challenge).expect("Should sign successfully");
+
+        let vp: serde_json::Value =
+            serde_json::from_str(&vp_json_str).expect("Should be valid JSON");
+
+        assert_eq!(vp["challenge"].as_str().unwrap(), challenge);
+        assert_eq!(vp["holder"].as_str().unwrap(), store.did);
+        assert!(
+            vp.get("proof").is_some(),
+            "VP should contain a proof object"
+        );
     }
 }
