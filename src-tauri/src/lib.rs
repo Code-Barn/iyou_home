@@ -231,6 +231,7 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
     };
 
     let request_str = String::from_utf8_lossy(&buf[..n]);
+    println!("Raw HTTP headers received:\n{}", request_str);
 
     if request_str.starts_with("OPTIONS") {
         let mut full_request = request_str.to_string();
@@ -275,7 +276,10 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
     };
 
     let mut ws_stream = match accept_hdr_async(prepend, cors_callback).await {
-        Ok(ws) => ws,
+        Ok(ws) => {
+            println!("WebSocket Handshake Successful");
+            ws
+        }
         Err(e) => {
             eprintln!("WebSocket handshake failed: {}", e);
             return;
@@ -285,9 +289,11 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
     while let Some(Ok(msg)) = ws_stream.next().await {
         if msg.is_text() {
             let text = msg.to_text().unwrap();
+            println!("Received Message: {:?}", text);
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
                 if json["action"] == "sign" && json["challenge"].is_string() {
                     let challenge = json["challenge"].as_str().unwrap().to_string();
+                    println!("Triggering Signature for Challenge: {}", challenge);
                     let request_id = Uuid::new_v4().to_string();
 
                     let (tx, rx) = oneshot::channel();
