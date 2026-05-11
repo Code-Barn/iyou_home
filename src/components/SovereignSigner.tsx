@@ -26,6 +26,7 @@ export default function SovereignSigner() {
     };
 
     const handlePasteFromClipboard = async () => {
+        setError(null);
         try {
             const text = await readText();
             if (!text) {
@@ -33,22 +34,23 @@ export default function SovereignSigner() {
                 return;
             }
 
-            // "Magic" sniffing logic
             try {
                 const json = JSON.parse(text);
                 if (json.challenge) {
                     setChallenge(json.challenge);
-                    setError(null);
                     return;
                 }
             } catch (e) {
-                // Not JSON, fall back to plain text
             }
 
             setChallenge(text);
-            setError(null);
         } catch (err: any) {
-            setError(`Failed to read clipboard: ${err.toString()}`);
+            const msg = err.toString();
+            if (msg.toLowerCase().includes("not allowed") || msg.toLowerCase().includes("permission denied")) {
+                setError("Clipboard access denied. Grant clipboard permission in your OS settings or paste manually.");
+            } else {
+                setError(`Failed to read clipboard: ${msg}`);
+            }
         }
     };
 
