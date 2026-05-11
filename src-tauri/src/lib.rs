@@ -8,8 +8,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 mod vault;
@@ -31,7 +32,7 @@ pub struct ServiceState {
 
 // State for WS requests
 pub struct WsState {
-    pub pending_requests: Mutex<HashMap<String, oneshot::Sender<Option<String>>>>,
+    pub response_sender: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -169,26 +170,33 @@ fn show_main_window(app: AppHandle) {
     }
 }
 
-// Improved command that handles the signing
 #[tauri::command]
 async fn submit_ws_response(
-    id: String,
+    _id: String,
     challenge: String,
     approved: bool,
     app: AppHandle,
     ws_state: State<'_, WsState>,
 ) -> Result<(), String> {
-    let mut requests = ws_state.pending_requests.lock().unwrap();
-    if let Some(tx) = requests.remove(&id) {
-        if approved {
-            let did =
-                get_active_did(app.clone(), app.state::<ServiceState>()).ok_or("No active DID")?;
-            let signed_vp = sign_auth_challenge(app, challenge, did)?;
-            let _ = tx.send(Some(signed_vp));
-        } else {
-            let _ = tx.send(None);
-        }
+    let guard = ws_state.response_sender.lock().unwrap();
+    let sender = guard.as_ref().ok_or("No WebSocket connected")?;
+
+    if !approved {
+        let _ = sender.send("{\"status\":\"denied\"}".to_string());
+        println!("WS sign request denied by user");
+        return Ok(());
     }
+
+    let store = vault::load_identity(&app)?;
+    let signed_vp = sign_auth_challenge_logic(&store, &challenge)?;
+
+    let response = serde_json::json!({
+        "type": "signature",
+        "vp": signed_vp
+    });
+
+    println!("Sending signed VP back to browser");
+    let _ = sender.send(response.to_string());
     Ok(())
 }
 
@@ -275,7 +283,7 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         Ok(res)
     };
 
-    let mut ws_stream = match accept_hdr_async(prepend, cors_callback).await {
+    let ws_stream = match accept_hdr_async(prepend, cors_callback).await {
         Ok(ws) => {
             println!("WebSocket Handshake Successful");
             ws
@@ -286,51 +294,44 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         }
     };
 
-    while let Some(Ok(msg)) = ws_stream.next().await {
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
+
+    {
+        let ws_state = app_handle.state::<WsState>();
+        *ws_state.response_sender.lock().unwrap() = Some(response_tx);
+    }
+
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    let app_clone = app_handle.clone();
+    tokio::spawn(async move {
+        while let Some(response) = response_rx.recv().await {
+            println!("Sending response over WebSocket: {}", response);
+            if let Err(e) = ws_sender.send(Message::Text(response.into())).await {
+                eprintln!("Failed to send WS message: {}", e);
+                break;
+            }
+        }
+        let ws_state = app_clone.state::<WsState>();
+        *ws_state.response_sender.lock().unwrap() = None;
+    });
+
+    while let Some(Ok(msg)) = ws_receiver.next().await {
         if msg.is_text() {
-            let text = msg.to_text().unwrap();
+            let text = msg.to_text().unwrap().to_string();
             println!("Received Message: {:?}", text);
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                 if json["action"] == "sign" && json["challenge"].is_string() {
                     let challenge = json["challenge"].as_str().unwrap().to_string();
                     println!("Triggering Signature for Challenge: {}", challenge);
-                    let request_id = Uuid::new_v4().to_string();
-
-                    let (tx, rx) = oneshot::channel();
-                    {
-                        let ws_state = app_handle.state::<WsState>();
-                        ws_state
-                            .pending_requests
-                            .lock()
-                            .unwrap()
-                            .insert(request_id.clone(), tx);
-                    }
 
                     let _ = app_handle.emit(
                         "ws-sign-request",
                         SignRequestEvent {
-                            id: request_id,
+                            id: Uuid::new_v4().to_string(),
                             challenge,
                         },
                     );
-
-                    if let Ok(Some(signed_vp)) = rx.await {
-                        let response = serde_json::json!({
-                            "status": "success",
-                            "vp": signed_vp
-                        });
-                        let _ = ws_stream
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                response.to_string().into(),
-                            ))
-                            .await;
-                    } else {
-                        let _ = ws_stream
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                "{\"status\":\"denied\"}".into(),
-                            ))
-                            .await;
-                    }
                 }
             }
         }
@@ -367,7 +368,7 @@ pub fn run() {
         active_did: Mutex::new(None),
     };
     let ws_state = WsState {
-        pending_requests: Mutex::new(HashMap::new()),
+        response_sender: Mutex::new(None),
     };
 
     let builder = tauri::Builder::default()
