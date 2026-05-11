@@ -798,7 +798,6 @@ dependencies = [
  "bs58",
  "chrono",
  "ed25519-dalek",
- "getrandom 0.2.17",
  "once_cell",
  "rand",
  "reqwest 0.12.28",
@@ -1405,10 +1404,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi",
- "wasm-bindgen",
 ]
 
 [[package]]

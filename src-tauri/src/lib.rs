@@ -1,12 +1,15 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
 use uuid::Uuid;
 
 mod vault;
@@ -189,6 +192,145 @@ async fn submit_ws_response(
     Ok(())
 }
 
+struct PrependStream<S> {
+    stream: S,
+    prefix: Vec<u8>,
+    pos: usize,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for PrependStream<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let n = std::cmp::min(buf.remaining(), self.prefix.len() - self.pos);
+            buf.put_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        } else {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for PrependStream<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
+    let mut buf = vec![0u8; 4096];
+    let n = match stream.read(&mut buf).await {
+        Ok(0) | Err(_) => return,
+        Ok(n) => n,
+    };
+
+    let request_str = String::from_utf8_lossy(&buf[..n]);
+
+    if request_str.starts_with("OPTIONS") {
+        let mut full_request = request_str.to_string();
+        while !full_request.contains("\r\n\r\n") {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            full_request.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Access-Control-Allow-Private-Network: true\r\n\
+            Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+            Access-Control-Allow-Headers: *\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\r\n";
+        let _ = stream.write_all(response).await;
+        return;
+    }
+
+    if !request_str.starts_with("GET") {
+        return;
+    }
+
+    let prepend = PrependStream {
+        stream,
+        prefix: buf[..n].to_vec(),
+        pos: 0,
+    };
+
+    let cors_callback = |_req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
+        res.headers_mut().insert(
+            "Access-Control-Allow-Origin",
+            tauri::http::HeaderValue::from_static("*"),
+        );
+        res.headers_mut().insert(
+            "Access-Control-Allow-Private-Network",
+            tauri::http::HeaderValue::from_static("true"),
+        );
+        Ok(res)
+    };
+
+    let mut ws_stream = match accept_hdr_async(prepend, cors_callback).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("WebSocket handshake failed: {}", e);
+            return;
+        }
+    };
+
+    while let Some(Ok(msg)) = ws_stream.next().await {
+        if msg.is_text() {
+            let text = msg.to_text().unwrap();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                if json["action"] == "sign" && json["challenge"].is_string() {
+                    let challenge = json["challenge"].as_str().unwrap().to_string();
+                    let request_id = Uuid::new_v4().to_string();
+
+                    let (tx, rx) = oneshot::channel();
+                    {
+                        let ws_state = app_handle.state::<WsState>();
+                        ws_state
+                            .pending_requests
+                            .lock()
+                            .unwrap()
+                            .insert(request_id.clone(), tx);
+                    }
+
+                    let _ = app_handle.emit(
+                        "ws-sign-request",
+                        SignRequestEvent {
+                            id: request_id,
+                            challenge,
+                        },
+                    );
+
+                    if let Ok(Some(signed_vp)) = rx.await {
+                        let response = serde_json::json!({
+                            "status": "success",
+                            "vp": signed_vp
+                        });
+                        let _ = ws_stream
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                response.to_string().into(),
+                            ))
+                            .await;
+                    } else {
+                        let _ = ws_stream
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                "{\"status\":\"denied\"}".into(),
+                            ))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn start_ws_server(app: AppHandle) {
     let listener = TcpListener::bind("127.0.0.1:9001")
         .await
@@ -198,57 +340,7 @@ async fn start_ws_server(app: AppHandle) {
     while let Ok((stream, _)) = listener.accept().await {
         let app_handle = app.clone();
         tokio::spawn(async move {
-            if let Ok(mut ws_stream) = accept_async(stream).await {
-                while let Some(Ok(msg)) = ws_stream.next().await {
-                    if msg.is_text() {
-                        let text = msg.to_text().unwrap();
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                            if json["action"] == "sign" && json["challenge"].is_string() {
-                                let challenge = json["challenge"].as_str().unwrap().to_string();
-                                let request_id = Uuid::new_v4().to_string();
-
-                                let (tx, rx) = oneshot::channel();
-                                {
-                                    let ws_state = app_handle.state::<WsState>();
-                                    ws_state
-                                        .pending_requests
-                                        .lock()
-                                        .unwrap()
-                                        .insert(request_id.clone(), tx);
-                                }
-
-                                // Emit event to frontend
-                                let _ = app_handle.emit(
-                                    "ws-sign-request",
-                                    SignRequestEvent {
-                                        id: request_id,
-                                        challenge: challenge,
-                                    },
-                                );
-
-                                // Wait for user approval
-                                if let Ok(Some(signed_vp)) = rx.await {
-                                    let response = serde_json::json!({
-                                        "status": "success",
-                                        "vp": signed_vp
-                                    });
-                                    let _ = ws_stream
-                                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                                            response.to_string().into(),
-                                        ))
-                                        .await;
-                                } else {
-                                    let _ = ws_stream
-                                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                                            "{\"status\":\"denied\"}".into(),
-                                        ))
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            handle_connection(stream, app_handle).await;
         });
     }
 }
