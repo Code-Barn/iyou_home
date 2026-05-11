@@ -1,12 +1,10 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Mutex;
-use std::task::{Context, Poll};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::accept_hdr_async;
@@ -200,56 +198,15 @@ async fn submit_ws_response(
     Ok(())
 }
 
-struct PrependStream<S> {
-    stream: S,
-    prefix: Vec<u8>,
-    pos: usize,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for PrependStream<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        if self.pos < self.prefix.len() {
-            let n = std::cmp::min(buf.remaining(), self.prefix.len() - self.pos);
-            buf.put_slice(&self.prefix[self.pos..self.pos + n]);
-            self.pos += n;
-            Poll::Ready(Ok(()))
-        } else {
-            Pin::new(&mut self.stream).poll_read(cx, buf)
-        }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for PrependStream<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
 async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
-    let mut buf = vec![0u8; 4096];
-    let n = match stream.read(&mut buf).await {
+    let mut peek_buf = [0u8; 4];
+    let n = match stream.peek(&mut peek_buf).await {
         Ok(0) | Err(_) => return,
         Ok(n) => n,
     };
 
-    let request_str = String::from_utf8_lossy(&buf[..n]);
-    println!("Raw HTTP headers received:\n{}", request_str);
-
-    if request_str.starts_with("OPTIONS") {
-        let mut full_request = request_str.to_string();
-        while !full_request.contains("\r\n\r\n") {
-            let n = match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            full_request.push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
+    if n >= 4 && &peek_buf[..4] == b"OPTI" {
+        println!("OPTIONS pre-flight received");
         let response = b"HTTP/1.1 200 OK\r\n\
             Access-Control-Allow-Origin: *\r\n\
             Access-Control-Allow-Private-Network: true\r\n\
@@ -261,17 +218,13 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         return;
     }
 
-    if !request_str.starts_with("GET") {
+    if n < 3 || &peek_buf[..3] != b"GET" {
         return;
     }
 
-    let prepend = PrependStream {
-        stream,
-        prefix: buf[..n].to_vec(),
-        pos: 0,
-    };
-
-    let cors_callback = |_req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
+    let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
+        println!("DEBUG: Handshake callback triggered");
+        println!("DEBUG: Request method: {:?}", req.method());
         res.headers_mut().insert(
             "Access-Control-Allow-Origin",
             tauri::http::HeaderValue::from_static("*"),
@@ -283,9 +236,9 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         Ok(res)
     };
 
-    let ws_stream = match accept_hdr_async(prepend, cors_callback).await {
+    let ws_stream = match accept_hdr_async(stream, cors_callback).await {
         Ok(ws) => {
-            println!("WebSocket Handshake Successful");
+            println!("DEBUG: WebSocket Upgrade Complete");
             ws
         }
         Err(e) => {
