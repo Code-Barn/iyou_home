@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{AppHandle, State};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
 mod vault;
 
@@ -156,6 +157,11 @@ fn sign_auth_challenge(
     Ok(signed_vp)
 }
 
+#[tauri::command]
+fn get_public_did_document(did: String) -> Result<String, String> {
+    did_rust::resolve_did(&did).map_err(|e| format!("Failed to resolve DID document: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let initial_services = HashMap::new();
@@ -164,19 +170,82 @@ pub fn run() {
         active_did: Mutex::new(None),
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(service_state)
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let show_i =
+                tauri::menu::MenuItem::with_id(app, "show", "Show Hub", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
+
+            let mut tray_builder = TrayIconBuilder::new()
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| match event {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    _ => {}
+                });
+
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+
+            tray_builder.build(app)?;
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             toggle_service,
             generate_did,
             import_did,
             get_active_did,
-            sign_auth_challenge
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+            sign_auth_challenge,
+            get_public_did_document
+        ]);
+
+    builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| match event {
+            RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                if label == "main" {
+                    // Prevent window from closing, hide it instead to act as a background process
+                    let window = app_handle.get_webview_window("main").unwrap();
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+            _ => {}
+        });
 }
 
 #[cfg(test)]

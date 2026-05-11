@@ -5,7 +5,7 @@ import SovereignSigner from "./components/SovereignSigner";
 import "./App.css";
 
 type ServiceStatus = "running" | "stopped" | "starting";
-const SERVICES = ["Nostr", "Blossom", "IPFS"];
+const SERVICES = ["IPFS", "Prosody", "Polly"];
 
 function ServiceSwitchPanel() {
     const [serviceStatus, setServiceStatus] = useState<
@@ -19,6 +19,7 @@ function ServiceSwitchPanel() {
             {} as Record<string, ServiceStatus>,
         ),
     );
+    const [notification, setNotification] = useState<string | null>(null);
 
     const handleToggleService = async (name: string) => {
         const currentStatus = serviceStatus[name];
@@ -30,6 +31,10 @@ function ServiceSwitchPanel() {
                 action,
             });
             setServiceStatus((prev) => ({ ...prev, [name]: newStatus }));
+            if (newStatus === "running" || newStatus === "starting") {
+                setNotification(`${name} Service Coming Soon!`);
+                setTimeout(() => setNotification(null), 3000);
+            }
         } catch (error) {
             console.error(`Failed to toggle service ${name}:`, error);
         }
@@ -38,6 +43,19 @@ function ServiceSwitchPanel() {
     return (
         <>
             <h2>Service Switch Panel</h2>
+            {notification && (
+                <div
+                    className="vault-badge"
+                    style={{
+                        marginBottom: "1rem",
+                        backgroundColor: "#fff3cd",
+                        color: "#856404",
+                        borderColor: "#ffeeba",
+                    }}
+                >
+                    {notification}
+                </div>
+            )}
             <div className="service-list">
                 {SERVICES.map((name) => (
                     <div key={name} className="service-item">
