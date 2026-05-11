@@ -331,18 +331,26 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
     }
 }
 
-async fn start_ws_server(app: AppHandle) {
-    let listener = TcpListener::bind("127.0.0.1:9001")
-        .await
-        .expect("Failed to bind WS");
-    println!("WebSocket server listening on ws://127.0.0.1:9001");
+async fn listen_on(addrs: &str, app: AppHandle) {
+    let listener = TcpListener::bind(addrs).await.unwrap_or_else(|e| {
+        panic!("Failed to bind WS on {}: {}", addrs, e);
+    });
+    println!("WebSocket server listening on ws://{}", addrs);
 
-    while let Ok((stream, _)) = listener.accept().await {
+    while let Ok((stream, peer)) = listener.accept().await {
+        println!("TCP Connection received from: {:?}", peer);
         let app_handle = app.clone();
         tokio::spawn(async move {
             handle_connection(stream, app_handle).await;
         });
     }
+}
+
+async fn start_ws_server(app: AppHandle) {
+    tokio::join!(
+        listen_on("0.0.0.0:9001", app.clone()),
+        listen_on("[::]:9001", app),
+    );
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
