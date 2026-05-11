@@ -1,0 +1,86 @@
+import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+
+interface SignRequestPayload {
+  id: string;
+  challenge: string;
+}
+
+export default function WsSignPopup() {
+  const [request, setRequest] = useState<SignRequestPayload | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  useEffect(() => {
+    const unlisten = listen<SignRequestPayload>('ws-sign-request', (event) => {
+      setRequest(event.payload);
+      // Bring window to front
+      invoke('show_main_window').catch(console.error); // We'll add this small helper
+    });
+
+    return () => {
+      unlisten.then(f => f());
+    };
+  }, []);
+
+  const handleResponse = async (approved: boolean) => {
+    if (!request) return;
+    setIsProcessing(true);
+
+    try {
+      await invoke('submit_ws_response', {
+        id: request.id,
+        challenge: request.challenge,
+        approved
+      });
+    } catch (err) {
+      console.error("Failed to submit WS response:", err);
+    } finally {
+      setIsProcessing(false);
+      setRequest(null);
+    }
+  };
+
+  if (!request) return null;
+
+  return (
+    <div className="popup-overlay" style={{
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+      backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex',
+      alignItems: 'center', justifyContent: 'center', zIndex: 1000
+    }}>
+      <div className="popup-content" style={{
+        background: 'white', padding: '2rem', borderRadius: '12px',
+        maxWidth: '400px', width: '100%', boxShadow: '0 10px 25px rgba(0,0,0,0.2)'
+      }}>
+        <h2 style={{marginTop: 0}}>Signature Request</h2>
+        <p>A local application is requesting a signature from your Vault identity.</p>
+
+        <div style={{margin: '1.5rem 0'}}>
+          <strong>Challenge:</strong>
+          <pre style={{
+            background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
+            overflowX: 'auto', fontSize: '0.85em', color: '#333'
+          }}>{request.challenge}</pre>
+        </div>
+
+        <div style={{display: 'flex', gap: '1rem', justifyContent: 'flex-end'}}>
+          <button
+            onClick={() => handleResponse(false)}
+            disabled={isProcessing}
+            style={{background: '#f4f4f4', color: '#333', border: '1px solid #ccc'}}
+          >
+            Deny
+          </button>
+          <button
+            onClick={() => handleResponse(true)}
+            disabled={isProcessing}
+            style={{background: '#137333', color: 'white'}}
+          >
+            {isProcessing ? 'Signing...' : 'Approve & Sign'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

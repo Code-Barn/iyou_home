@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import KeysManager from "./components/KeysManager";
 import SovereignSigner from "./components/SovereignSigner";
+import WsSignPopup from "./components/WsSignPopup";
 import "./App.css";
 
 type ServiceStatus = "running" | "stopped" | "starting";
@@ -84,36 +85,39 @@ function App() {
     );
 
     return (
-        <main className="container">
-            <h1>iYou Home</h1>
+        <>
+            <WsSignPopup />
+            <main className="container">
+                <h1>iYou Home</h1>
 
-            <div className="tabs">
-                <button
-                    className={activeTab === "services" ? "active" : ""}
-                    onClick={() => setActiveTab("services")}
-                >
-                    Services
-                </button>
-                <button
-                    className={activeTab === "keys" ? "active" : ""}
-                    onClick={() => setActiveTab("keys")}
-                >
-                    Keys (Vault)
-                </button>
-                <button
-                    className={activeTab === "signer" ? "active" : ""}
-                    onClick={() => setActiveTab("signer")}
-                >
-                    Signer
-                </button>
-            </div>
+                <div className="tabs">
+                    <button
+                        className={activeTab === "services" ? "active" : ""}
+                        onClick={() => setActiveTab("services")}
+                    >
+                        Services
+                    </button>
+                    <button
+                        className={activeTab === "keys" ? "active" : ""}
+                        onClick={() => setActiveTab("keys")}
+                    >
+                        Keys (Vault)
+                    </button>
+                    <button
+                        className={activeTab === "signer" ? "active" : ""}
+                        onClick={() => setActiveTab("signer")}
+                    >
+                        Signer
+                    </button>
+                </div>
 
-            <div className="tab-content">
-                {activeTab === "services" && <ServiceSwitchPanel />}
-                {activeTab === "keys" && <KeysManager />}
-                {activeTab === "signer" && <SovereignSigner />}
-            </div>
-        </main>
+                <div className="tab-content">
+                    {activeTab === "services" && <ServiceSwitchPanel />}
+                    {activeTab === "keys" && <KeysManager />}
+                    {activeTab === "signer" && <SovereignSigner />}
+                </div>
+            </main>
+        </>
     );
 }
 
