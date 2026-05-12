@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -30,13 +30,7 @@ pub struct ServiceState {
 #[derive(Default)]
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
-    pub pending_challenge: Mutex<Option<String>>,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
-}
-
-#[derive(Serialize, Clone)]
-struct UpdatePayload {
-    challenge: Option<String>,
 }
 
 // ... existing commands ...
@@ -161,18 +155,6 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_pending_ws_challenge(state: State<'_, WsState>) -> Option<String> {
-    println!("DEBUG: Command 'get_pending_ws_challenge' called by React");
-    println!("DEBUG: React polling global state address: {:p}", &*state);
-    let mut lock = state.pending_challenge.lock().unwrap();
-    let challenge = lock.take();
-    if challenge.is_some() {
-        println!("DEBUG: React GRABBED challenge: {:?}", challenge);
-    }
-    challenge
-}
-
-#[tauri::command]
 fn show_main_window(app: AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -195,8 +177,6 @@ async fn submit_ws_response(
     app: AppHandle,
     ws_state: State<'_, WsState>,
 ) -> Result<(), String> {
-    *ws_state.pending_challenge.lock().unwrap() = None;
-
     let sender = {
         let guard = ws_state.response_sender.lock().unwrap();
         guard.clone().ok_or("No WebSocket connected")?
@@ -334,13 +314,6 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                         }
 
                         {
-                            let global_state = app.state::<WsState>();
-                            let mut challenge_lock = global_state.pending_challenge.lock().unwrap();
-                            *challenge_lock = Some(challenge.clone());
-                            println!("!!! SUCCESS: CHALLENGE WRITTEN TO GLOBAL MANAGED STATE !!!");
-                        }
-
-                        {
                             let state = app.state::<WsState>();
                             let pipe = state.challenge_channel.lock().unwrap();
                             if let Some(channel) = pipe.as_ref() {
@@ -350,8 +323,6 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                                 println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
                             }
                         }
-
-                        let _ = app.emit("state-changed", UpdatePayload { challenge: Some(challenge) });
                     });
                 } else {
                     println!("DEBUG: Received unknown JSON structure: {}", text);
@@ -458,7 +429,6 @@ pub fn run() {
             get_public_did_document,
             submit_ws_response,
             show_main_window,
-            get_pending_ws_challenge,
             register_challenge_pipe,
         ]);
 
@@ -536,38 +506,5 @@ mod tests {
             vp.get("proof").is_some(),
             "VP should contain a proof object"
         );
-    }
-
-    #[test]
-    fn test_pending_challenge_stress() {
-        let ws_state = std::sync::Arc::new(WsState::default());
-        let mut handles = Vec::new();
-
-        let state = ws_state.clone();
-        handles.push(std::thread::spawn(move || {
-            for i in 0..200 {
-                let mut lock = state.pending_challenge.lock().unwrap();
-                *lock = Some(format!("challenge-{}", i));
-                drop(lock);
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }));
-
-        let state = ws_state.clone();
-        handles.push(std::thread::spawn(move || {
-            for _ in 0..200 {
-                let mut lock = state.pending_challenge.lock().unwrap();
-                let _challenge = lock.take();
-                drop(lock);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }));
-
-        for h in handles {
-            h.join().expect("Thread panicked");
-        }
-
-        let final_lock = ws_state.pending_challenge.lock().unwrap();
-        assert!(final_lock.is_none() || final_lock.is_some());
     }
 }

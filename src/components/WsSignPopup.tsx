@@ -18,21 +18,6 @@ export default function WsSignPopup() {
     };
     invoke('register_challenge_pipe', { channel });
     console.log("REACT: Challenge channel registered with backend");
-
-    const interval = setInterval(async () => {
-      console.log("INTERNAL: Polling Rust for challenge...");
-      try {
-        const challenge = await invoke<string | null>('get_pending_ws_challenge');
-        if (challenge) {
-          alert("CHALLENGE CAPTURED BY UI (polling fallback): " + challenge);
-          setRequest({ challenge });
-        }
-      } catch (e) {
-        console.error("INTERNAL: Invoke failed! Permission issue?", e);
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
