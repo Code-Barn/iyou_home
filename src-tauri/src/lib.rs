@@ -163,6 +163,7 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 #[tauri::command]
 fn show_main_window(app: AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -298,13 +299,12 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
 
                     show_main_window(app_handle.clone());
 
-                    let _ = app_handle.emit(
-                        "ws-sign-request",
-                        SignRequestEvent {
-                            id: Uuid::new_v4().to_string(),
-                            challenge,
-                        },
-                    );
+                    let payload = SignRequestEvent {
+                        id: Uuid::new_v4().to_string(),
+                        challenge,
+                    };
+                    let emit_result = app_handle.emit("ws-sign-request", &payload);
+                    println!("DEBUG: Event 'ws-sign-request' emitted. Result: {:?}", emit_result);
                 }
             }
         } else if msg.is_pong() {
