@@ -31,7 +31,7 @@ export default function WsSignPopup() {
       try {
         const challenge = await invoke<string | null>('get_pending_ws_challenge');
         if (challenge) {
-          console.log("INTERNAL: Found challenge!", challenge);
+          alert("CHALLENGE CAPTURED BY UI: " + challenge);
           setRequest({ id: '', challenge });
         }
       } catch (e) {

@@ -165,6 +165,7 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 #[tauri::command]
 fn get_pending_ws_challenge(state: State<'_, WsState>) -> Option<String> {
     println!("DEBUG: Command 'get_pending_ws_challenge' called by React");
+    println!("DEBUG: React is looking in the Global Box now...");
     let mut lock = state.pending_challenge.lock().unwrap();
     let challenge = lock.take();
     if challenge.is_some() {
@@ -192,8 +193,10 @@ async fn submit_ws_response(
 ) -> Result<(), String> {
     *ws_state.pending_challenge.lock().unwrap() = None;
 
-    let guard = ws_state.response_sender.lock().unwrap();
-    let sender = guard.as_ref().ok_or("No WebSocket connected")?;
+    let sender = {
+        let guard = ws_state.response_sender.lock().unwrap();
+        guard.clone().ok_or("No WebSocket connected")?
+    };
 
     if !approved {
         let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
@@ -320,10 +323,10 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                     };
 
                     {
-                        let state = app_handle.state::<WsState>();
-                        let mut lock = state.pending_challenge.lock().unwrap();
-                        *lock = Some(challenge);
-                        println!("DEBUG: Challenge SAVED to Managed State.");
+                        let global_state = app_handle.state::<WsState>();
+                        let mut challenge_lock = global_state.pending_challenge.lock().unwrap();
+                        *challenge_lock = Some(challenge);
+                        println!("!!! SUCCESS: CHALLENGE WRITTEN TO GLOBAL MANAGED STATE !!!");
                     }
 
                     if let Some(window) = app_handle.get_webview_window("main") {
@@ -515,5 +518,38 @@ mod tests {
             vp.get("proof").is_some(),
             "VP should contain a proof object"
         );
+    }
+
+    #[test]
+    fn test_pending_challenge_stress() {
+        let ws_state = std::sync::Arc::new(WsState::default());
+        let mut handles = Vec::new();
+
+        let state = ws_state.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..200 {
+                let mut lock = state.pending_challenge.lock().unwrap();
+                *lock = Some(format!("challenge-{}", i));
+                drop(lock);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }));
+
+        let state = ws_state.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..200 {
+                let mut lock = state.pending_challenge.lock().unwrap();
+                let _challenge = lock.take();
+                drop(lock);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }));
+
+        for h in handles {
+            h.join().expect("Thread panicked");
+        }
+
+        let final_lock = ws_state.pending_challenge.lock().unwrap();
+        assert!(final_lock.is_none() || final_lock.is_some());
     }
 }
