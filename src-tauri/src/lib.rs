@@ -183,6 +183,8 @@ async fn submit_ws_response(
     app: AppHandle,
     ws_state: State<'_, WsState>,
 ) -> Result<(), String> {
+    *ws_state.pending_challenge.lock().unwrap() = None;
+
     let guard = ws_state.response_sender.lock().unwrap();
     let sender = guard.as_ref().ok_or("No WebSocket connected")?;
 
