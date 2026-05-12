@@ -292,6 +292,7 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         println!("DEBUG: Forwarder Task Exited");
     });
 
+    // WARNING: DO NOT handle logic inside this loop; always spawn a task to prevent protocol deadlocks.
     while let Some(Ok(msg)) = ws_receiver.next().await {
         if msg.is_text() {
             let text = msg.to_text().unwrap().to_string();
