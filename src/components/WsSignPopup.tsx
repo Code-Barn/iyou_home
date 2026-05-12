@@ -2,22 +2,27 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
-interface SignRequestPayload {
-  id: string;
+interface UpdatePayload {
+  challenge: string | null;
+}
+
+interface SignRequest {
   challenge: string;
 }
 
 const appWindow = getCurrentWebviewWindow();
 
 export default function WsSignPopup() {
-  const [request, setRequest] = useState<SignRequestPayload | null>(null);
+  const [request, setRequest] = useState<SignRequest | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [autoSign, setAutoSign] = useState(false);
 
   useEffect(() => {
-    const unlisten = appWindow.listen<SignRequestPayload>('ws-sign-request', (event) => {
-      console.log("REACT: Received sign request for challenge:", event.payload);
-      setRequest(event.payload);
+    const unlisten = appWindow.listen<UpdatePayload>('state-changed', (event) => {
+      if (event.payload.challenge) {
+        console.log("REACT: Received state-changed with challenge:", event.payload.challenge);
+        setRequest({ challenge: event.payload.challenge });
+      }
     });
 
     return () => {
@@ -32,7 +37,7 @@ export default function WsSignPopup() {
         const challenge = await invoke<string | null>('get_pending_ws_challenge');
         if (challenge) {
           alert("CHALLENGE CAPTURED BY UI: " + challenge);
-          setRequest({ id: '', challenge });
+          setRequest({ challenge });
         }
       } catch (e) {
         console.error("INTERNAL: Invoke failed! Permission issue?", e);
@@ -55,7 +60,7 @@ export default function WsSignPopup() {
 
     try {
       await invoke('submit_ws_response', {
-        id: request.id,
+        id: '',
         challenge: request.challenge,
         approved
       });

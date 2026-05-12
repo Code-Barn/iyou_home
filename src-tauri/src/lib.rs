@@ -9,8 +9,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
-
 mod vault;
 
 // Define the service status enum
@@ -36,9 +34,8 @@ pub struct WsState {
 }
 
 #[derive(Serialize, Clone)]
-struct SignRequestEvent {
-    id: String,
-    challenge: String,
+struct UpdatePayload {
+    challenge: Option<String>,
 }
 
 // ... existing commands ...
@@ -165,7 +162,7 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 #[tauri::command]
 fn get_pending_ws_challenge(state: State<'_, WsState>) -> Option<String> {
     println!("DEBUG: Command 'get_pending_ws_challenge' called by React");
-    println!("DEBUG: React is looking in the Global Box now...");
+    println!("DEBUG: React polling global state address: {:p}", &*state);
     let mut lock = state.pending_challenge.lock().unwrap();
     let challenge = lock.take();
     if challenge.is_some() {
@@ -317,24 +314,14 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
 
                     show_main_window(app_handle.clone());
 
-                    let payload = SignRequestEvent {
-                        id: Uuid::new_v4().to_string(),
-                        challenge: challenge.clone(),
-                    };
-
                     {
                         let global_state = app_handle.state::<WsState>();
                         let mut challenge_lock = global_state.pending_challenge.lock().unwrap();
-                        *challenge_lock = Some(challenge);
+                        *challenge_lock = Some(challenge.clone());
                         println!("!!! SUCCESS: CHALLENGE WRITTEN TO GLOBAL MANAGED STATE !!!");
                     }
 
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let res = window.emit("ws-sign-request", &payload);
-                        println!("DEBUG: Window-direct emit result: {:?}", res);
-                    } else {
-                        println!("DEBUG: Could not find 'main' window to emit event!");
-                    }
+                    let _ = app_handle.emit("state-changed", UpdatePayload { challenge: Some(challenge) });
                 }
             }
         } else if msg.is_pong() {
@@ -363,10 +350,7 @@ async fn listen_on(addrs: &str, app: AppHandle) {
 }
 
 async fn start_ws_server(app: AppHandle) {
-    tokio::join!(
-        listen_on("0.0.0.0:9001", app.clone()),
-        listen_on("[::]:9001", app),
-    );
+    listen_on("[::]:9001", app).await;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
