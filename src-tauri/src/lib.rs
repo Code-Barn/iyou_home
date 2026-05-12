@@ -210,10 +210,12 @@ async fn submit_ws_response(
 
     let store = vault::load_identity(&app)?;
     let signed_vp = sign_auth_challenge_logic(&store, &challenge)?;
+    let vp_value: serde_json::Value = serde_json::from_str(&signed_vp)
+        .map_err(|e| format!("Failed to parse signed VP as JSON: {}", e))?;
 
     let response = serde_json::json!({
         "type": "signature",
-        "vp": signed_vp
+        "vp": vp_value
     });
 
     println!("Sending signed VP back to browser");

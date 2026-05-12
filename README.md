@@ -62,7 +62,3 @@ Events (`ws-sign-request`) are emitted as a fast path, but the reliable path is 
 ## Getting Started
 
 To get started with development or to run the application, please refer to the `DEVELOPER_GUIDE.md`.
-
-## Recommended IDE Setup
-
-*   [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
