@@ -315,7 +315,8 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
             let text = msg.to_text().unwrap().to_string();
             println!("Received Message: {:?}", text);
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if json["action"] == "sign" && json["challenge"].is_string() {
+                let is_sign = json["action"] == "sign" || json["type"] == "sign";
+                if is_sign && json["challenge"].is_string() {
                     let challenge = json["challenge"].as_str().unwrap().to_string();
                     println!("Triggering Signature for Challenge: {}", challenge);
                     println!("DEBUG: Spawning background task to handle sign challenge...");
@@ -344,12 +345,14 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                                 let _ = channel.send(challenge.clone());
                                 println!("!!! SUCCESS: CHALLENGE PIPED TO REACT BACKGROUND TASK !!!");
                             } else {
-                                println!("DEBUG: Logic reached, but NO CHANNEL REGISTERED in global state.");
+                                println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
                             }
                         }
 
                         let _ = app.emit("state-changed", UpdatePayload { challenge: Some(challenge) });
                     });
+                } else {
+                    println!("DEBUG: Received unknown JSON structure: {}", text);
                 }
             }
         } else if msg.is_pong() {
