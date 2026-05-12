@@ -6,8 +6,11 @@
     "permissions": [
         "core:default",
         "core:event:default",
-        "core:event:allow-emit",
-        "core:event:allow-listen",
+        "core:webview:default",
+        "core:window:default",
+        "core:app:default",
+        "core:resources:default",
+        "core:path:default",
         "opener:default",
         "clipboard-manager:default",
         "clipboard-manager:allow-read-text",

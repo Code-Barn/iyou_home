@@ -162,8 +162,13 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_pending_ws_challenge(ws_state: State<'_, WsState>) -> Option<String> {
-    ws_state.pending_challenge.lock().unwrap().take()
+fn get_pending_ws_challenge(state: State<'_, WsState>) -> Option<String> {
+    let mut lock = state.pending_challenge.lock().unwrap();
+    let challenge = lock.take();
+    if challenge.is_some() {
+        println!("DEBUG: React GRABBED challenge: {:?}", challenge);
+    }
+    challenge
 }
 
 #[tauri::command]

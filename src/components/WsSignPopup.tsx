@@ -27,14 +27,15 @@ export default function WsSignPopup() {
 
   useEffect(() => {
     const interval = setInterval(async () => {
+      console.log("INTERNAL: Polling Rust for challenge...");
       try {
         const challenge = await invoke<string | null>('get_pending_ws_challenge');
         if (challenge) {
-          console.log("REACT: Polled pending challenge:", challenge);
+          console.log("INTERNAL: Found challenge!", challenge);
           setRequest({ id: '', challenge });
         }
-      } catch (err) {
-        console.error("REACT: Poll error:", err);
+      } catch (e) {
+        console.error("INTERNAL: Invoke failed! Permission issue?", e);
       }
     }, 1000);
 
