@@ -318,28 +318,38 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                 if json["action"] == "sign" && json["challenge"].is_string() {
                     let challenge = json["challenge"].as_str().unwrap().to_string();
                     println!("Triggering Signature for Challenge: {}", challenge);
+                    println!("DEBUG: Spawning background task to handle sign challenge...");
 
-                    show_main_window(app_handle.clone());
+                    let app_handle = app_handle.clone();
+                    tokio::spawn(async move {
+                        let app = app_handle;
 
-                    {
-                        let global_state = app_handle.state::<WsState>();
-                        let mut challenge_lock = global_state.pending_challenge.lock().unwrap();
-                        *challenge_lock = Some(challenge.clone());
-                        println!("!!! SUCCESS: CHALLENGE WRITTEN TO GLOBAL MANAGED STATE !!!");
-                    }
-
-                    {
-                        let state = app_handle.state::<WsState>();
-                        let chan = state.challenge_channel.lock().unwrap().clone();
-                        if let Some(channel) = chan {
-                            let _ = channel.send(challenge.clone());
-                            println!("!!! SUCCESS: CHALLENGE PIPED DIRECTLY TO REACT !!!");
-                        } else {
-                            println!("DEBUG: No challenge channel registered yet");
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
                         }
-                    }
 
-                    let _ = app_handle.emit("state-changed", UpdatePayload { challenge: Some(challenge) });
+                        {
+                            let global_state = app.state::<WsState>();
+                            let mut challenge_lock = global_state.pending_challenge.lock().unwrap();
+                            *challenge_lock = Some(challenge.clone());
+                            println!("!!! SUCCESS: CHALLENGE WRITTEN TO GLOBAL MANAGED STATE !!!");
+                        }
+
+                        {
+                            let state = app.state::<WsState>();
+                            let pipe = state.challenge_channel.lock().unwrap();
+                            if let Some(channel) = pipe.as_ref() {
+                                let _ = channel.send(challenge.clone());
+                                println!("!!! SUCCESS: CHALLENGE PIPED TO REACT BACKGROUND TASK !!!");
+                            } else {
+                                println!("DEBUG: Logic reached, but NO CHANNEL REGISTERED in global state.");
+                            }
+                        }
+
+                        let _ = app.emit("state-changed", UpdatePayload { challenge: Some(challenge) });
+                    });
                 }
             }
         } else if msg.is_pong() {
