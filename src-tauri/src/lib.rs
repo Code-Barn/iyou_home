@@ -29,6 +29,7 @@ pub struct ServiceState {
 }
 
 // State for WS requests
+#[derive(Default)]
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pub pending_challenge: Mutex<Option<String>>,
@@ -163,6 +164,7 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 
 #[tauri::command]
 fn get_pending_ws_challenge(state: State<'_, WsState>) -> Option<String> {
+    println!("DEBUG: Command 'get_pending_ws_challenge' called by React");
     let mut lock = state.pending_challenge.lock().unwrap();
     let challenge = lock.take();
     if challenge.is_some() {
@@ -318,8 +320,10 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                     };
 
                     {
-                        let ws_state = app_handle.state::<WsState>();
-                        *ws_state.pending_challenge.lock().unwrap() = Some(challenge);
+                        let state = app_handle.state::<WsState>();
+                        let mut lock = state.pending_challenge.lock().unwrap();
+                        *lock = Some(challenge);
+                        println!("DEBUG: Challenge SAVED to Managed State.");
                     }
 
                     if let Some(window) = app_handle.get_webview_window("main") {
@@ -369,10 +373,7 @@ pub fn run() {
         services: Mutex::new(initial_services),
         active_did: Mutex::new(None),
     };
-    let ws_state = WsState {
-        response_sender: Mutex::new(None),
-        pending_challenge: Mutex::new(None),
-    };
+    let ws_state = WsState::default();
 
     let builder = tauri::Builder::default()
         .manage(service_state)
