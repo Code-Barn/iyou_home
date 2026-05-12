@@ -6,6 +6,8 @@
     "permissions": [
         "core:default",
         "core:event:default",
+        "core:event:allow-emit",
+        "core:event:allow-listen",
         "opener:default",
         "clipboard-manager:default",
         "clipboard-manager:allow-read-text",

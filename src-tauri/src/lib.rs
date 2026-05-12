@@ -31,6 +31,7 @@ pub struct ServiceState {
 // State for WS requests
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
+    pub pending_challenge: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -158,6 +159,11 @@ fn sign_auth_challenge_logic(
 #[tauri::command]
 fn get_public_did_document(did: String) -> Result<String, String> {
     did_rust::resolve_did(&did).map_err(|e| format!("Failed to resolve DID document: {}", e))
+}
+
+#[tauri::command]
+fn get_pending_ws_challenge(ws_state: State<'_, WsState>) -> Option<String> {
+    ws_state.pending_challenge.lock().unwrap().take()
 }
 
 #[tauri::command]
@@ -301,10 +307,20 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
 
                     let payload = SignRequestEvent {
                         id: Uuid::new_v4().to_string(),
-                        challenge,
+                        challenge: challenge.clone(),
                     };
-                    let emit_result = app_handle.emit("ws-sign-request", &payload);
-                    println!("DEBUG: Event 'ws-sign-request' emitted. Result: {:?}", emit_result);
+
+                    {
+                        let ws_state = app_handle.state::<WsState>();
+                        *ws_state.pending_challenge.lock().unwrap() = Some(challenge);
+                    }
+
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let res = window.emit("ws-sign-request", &payload);
+                        println!("DEBUG: Window-direct emit result: {:?}", res);
+                    } else {
+                        println!("DEBUG: Could not find 'main' window to emit event!");
+                    }
                 }
             }
         } else if msg.is_pong() {
@@ -348,6 +364,7 @@ pub fn run() {
     };
     let ws_state = WsState {
         response_sender: Mutex::new(None),
+        pending_challenge: Mutex::new(None),
     };
 
     let builder = tauri::Builder::default()
@@ -412,7 +429,8 @@ pub fn run() {
             sign_auth_challenge,
             get_public_did_document,
             submit_ws_response,
-            show_main_window
+            show_main_window,
+            get_pending_ws_challenge,
         ]);
 
     builder

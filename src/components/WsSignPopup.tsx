@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 interface SignRequestPayload {
   id: string;
   challenge: string;
 }
+
+const appWindow = getCurrentWebviewWindow();
 
 export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequestPayload | null>(null);
@@ -13,7 +15,7 @@ export default function WsSignPopup() {
   const [autoSign, setAutoSign] = useState(false);
 
   useEffect(() => {
-    const unlisten = listen<SignRequestPayload>('ws-sign-request', (event) => {
+    const unlisten = appWindow.listen<SignRequestPayload>('ws-sign-request', (event) => {
       console.log("REACT: Received sign request for challenge:", event.payload);
       setRequest(event.payload);
     });
@@ -21,6 +23,22 @@ export default function WsSignPopup() {
     return () => {
       unlisten.then(f => f());
     };
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const challenge = await invoke<string | null>('get_pending_ws_challenge');
+        if (challenge) {
+          console.log("REACT: Polled pending challenge:", challenge);
+          setRequest({ id: '', challenge });
+        }
+      } catch (err) {
+        console.error("REACT: Poll error:", err);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
