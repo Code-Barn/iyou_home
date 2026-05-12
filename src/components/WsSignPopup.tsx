@@ -1,16 +1,9 @@
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
-
-interface UpdatePayload {
-  challenge: string | null;
-}
+import { invoke, Channel } from '@tauri-apps/api/core';
 
 interface SignRequest {
   challenge: string;
 }
-
-const appWindow = getCurrentWebviewWindow();
 
 export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequest | null>(null);
@@ -18,25 +11,20 @@ export default function WsSignPopup() {
   const [autoSign, setAutoSign] = useState(false);
 
   useEffect(() => {
-    const unlisten = appWindow.listen<UpdatePayload>('state-changed', (event) => {
-      if (event.payload.challenge) {
-        console.log("REACT: Received state-changed with challenge:", event.payload.challenge);
-        setRequest({ challenge: event.payload.challenge });
-      }
-    });
-
-    return () => {
-      unlisten.then(f => f());
+    const channel = new Channel<string>();
+    channel.onmessage = (challenge) => {
+      console.log("REACT: Received challenge via direct channel pipe:", challenge);
+      setRequest({ challenge });
     };
-  }, []);
+    invoke('register_challenge_pipe', { channel });
+    console.log("REACT: Challenge channel registered with backend");
 
-  useEffect(() => {
     const interval = setInterval(async () => {
       console.log("INTERNAL: Polling Rust for challenge...");
       try {
         const challenge = await invoke<string | null>('get_pending_ws_challenge');
         if (challenge) {
-          alert("CHALLENGE CAPTURED BY UI: " + challenge);
+          alert("CHALLENGE CAPTURED BY UI (polling fallback): " + challenge);
           setRequest({ challenge });
         }
       } catch (e) {

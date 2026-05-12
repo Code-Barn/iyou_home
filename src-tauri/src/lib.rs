@@ -31,6 +31,7 @@ pub struct ServiceState {
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pub pending_challenge: Mutex<Option<String>>,
+    pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -181,6 +182,12 @@ fn show_main_window(app: AppHandle) {
 }
 
 #[tauri::command]
+fn register_challenge_pipe(channel: tauri::ipc::Channel<String>, state: State<'_, WsState>) {
+    *state.challenge_channel.lock().unwrap() = Some(channel);
+    println!("DEBUG: Challenge channel registered by React");
+}
+
+#[tauri::command]
 async fn submit_ws_response(
     _id: String,
     challenge: String,
@@ -321,6 +328,17 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                         println!("!!! SUCCESS: CHALLENGE WRITTEN TO GLOBAL MANAGED STATE !!!");
                     }
 
+                    {
+                        let state = app_handle.state::<WsState>();
+                        let chan = state.challenge_channel.lock().unwrap().clone();
+                        if let Some(channel) = chan {
+                            let _ = channel.send(challenge.clone());
+                            println!("!!! SUCCESS: CHALLENGE PIPED DIRECTLY TO REACT !!!");
+                        } else {
+                            println!("DEBUG: No challenge channel registered yet");
+                        }
+                    }
+
                     let _ = app_handle.emit("state-changed", UpdatePayload { challenge: Some(challenge) });
                 }
             }
@@ -426,6 +444,7 @@ pub fn run() {
             submit_ws_response,
             show_main_window,
             get_pending_ws_challenge,
+            register_challenge_pipe,
         ]);
 
     builder
