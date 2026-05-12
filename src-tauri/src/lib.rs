@@ -296,6 +296,8 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                     let challenge = json["challenge"].as_str().unwrap().to_string();
                     println!("Triggering Signature for Challenge: {}", challenge);
 
+                    show_main_window(app_handle.clone());
+
                     let _ = app_handle.emit(
                         "ws-sign-request",
                         SignRequestEvent {

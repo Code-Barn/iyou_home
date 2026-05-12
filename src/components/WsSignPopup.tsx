@@ -10,18 +10,25 @@ interface SignRequestPayload {
 export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequestPayload | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [autoSign, setAutoSign] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<SignRequestPayload>('ws-sign-request', (event) => {
+      console.log("REACT: Received sign request for challenge:", event.payload);
       setRequest(event.payload);
-      // Bring window to front
-      invoke('show_main_window').catch(console.error); // We'll add this small helper
     });
 
     return () => {
       unlisten.then(f => f());
     };
   }, []);
+
+  useEffect(() => {
+    if (autoSign && request && !isProcessing) {
+      console.log("REACT: Auto-sign enabled, approving immediately");
+      handleResponse(true);
+    }
+  }, [autoSign, request]);
 
   const handleResponse = async (approved: boolean) => {
     if (!request) return;
@@ -33,6 +40,7 @@ export default function WsSignPopup() {
         challenge: request.challenge,
         approved
       });
+      console.log("REACT: submit_ws_response succeeded");
     } catch (err) {
       console.error("Failed to submit WS response:", err);
     } finally {
@@ -64,21 +72,31 @@ export default function WsSignPopup() {
           }}>{request.challenge}</pre>
         </div>
 
-        <div style={{display: 'flex', gap: '1rem', justifyContent: 'flex-end'}}>
-          <button
-            onClick={() => handleResponse(false)}
-            disabled={isProcessing}
-            style={{background: '#f4f4f4', color: '#333', border: '1px solid #ccc'}}
-          >
-            Deny
-          </button>
-          <button
-            onClick={() => handleResponse(true)}
-            disabled={isProcessing}
-            style={{background: '#137333', color: 'white'}}
-          >
-            {isProcessing ? 'Signing...' : 'Approve & Sign'}
-          </button>
+        <div style={{display: 'flex', gap: '1rem', justifyContent: 'space-between', alignItems: 'center'}}>
+          <label style={{fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem'}}>
+            <input
+              type="checkbox"
+              checked={autoSign}
+              onChange={(e) => setAutoSign(e.target.checked)}
+            />
+            Auto-sign (dev)
+          </label>
+          <div style={{display: 'flex', gap: '1rem'}}>
+            <button
+              onClick={() => handleResponse(false)}
+              disabled={isProcessing}
+              style={{background: '#f4f4f4', color: '#333', border: '1px solid #ccc'}}
+            >
+              Deny
+            </button>
+            <button
+              onClick={() => handleResponse(true)}
+              disabled={isProcessing}
+              style={{background: '#137333', color: 'white'}}
+            >
+              {isProcessing ? 'Signing...' : 'Approve & Sign'}
+            </button>
+          </div>
         </div>
       </div>
     </div>
