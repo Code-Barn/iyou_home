@@ -354,6 +354,54 @@ async fn submit_ws_event_response(
     Ok(())
 }
 
+#[tauri::command]
+async fn submit_ws_credential_response(
+    credential_json: String,
+    holder_did: String,
+    approved: bool,
+    app: AppHandle,
+    ws_state: State<'_, WsState>,
+) -> Result<(), String> {
+    let sender = {
+        let guard = ws_state.response_sender.lock().unwrap();
+        guard.clone().ok_or("No WebSocket connected")?
+    };
+
+    if !approved {
+        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        println!("WS credential sign request denied by user");
+        return Ok(());
+    }
+
+    let store = vault::load_identity(&app)?;
+
+    let credential_value: serde_json::Value = serde_json::from_str(&credential_json)
+        .map_err(|e| format!("Failed to parse credential JSON: {}", e))?;
+
+    let credential_envelope = serde_json::json!({
+        "@context": ["https://www.w3.org/2018/credentials/v1"],
+        "type": ["VerifiableCredential"],
+        "issuer": holder_did,
+        "credentialSubject": credential_value
+    });
+
+    let envelope_str = credential_envelope.to_string();
+    let signed_vc = did_rust::issue_vc(&envelope_str, &holder_did, &store.private_key_base58)
+        .map_err(|e| format!("Failed to sign credential: {}", e))?;
+
+    let vc_value: serde_json::Value = serde_json::from_str(&signed_vc)
+        .map_err(|e| format!("Failed to parse signed VC as JSON: {}", e))?;
+
+    let response = serde_json::json!({
+        "type": "signed_credential",
+        "vc": vc_value
+    });
+
+    println!("Sending signed VC back to browser");
+    let _ = sender.send(Message::Text(response.to_string().into()));
+    Ok(())
+}
+
 fn is_websocket_upgrade_request(data: &[u8]) -> bool {
     let text = String::from_utf8_lossy(data);
     let lines: Vec<&str> = text.lines().collect();
@@ -536,6 +584,41 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                     } else {
                         println!("DEBUG: Received sign_event without event object: {}", text);
                     }
+                } else if json["type"] == "sign_credential" {
+                    if json["credential"].is_object() && json["holder_did"].is_string() {
+                        let credential = json["credential"].clone();
+                        let holder_did = json["holder_did"].as_str().unwrap().to_string();
+                        println!("Triggering Credential signing for holder: {}", holder_did);
+
+                        let app_handle = app_handle.clone();
+                        tokio::spawn(async move {
+                            let app = app_handle;
+
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.unminimize();
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+
+                            {
+                                let state = app.state::<WsState>();
+                                let pipe = state.challenge_channel.lock().unwrap();
+                                if let Some(channel) = pipe.as_ref() {
+                                    let msg = serde_json::json!({
+                                        "__type__": "sign_credential",
+                                        "credential": credential,
+                                        "holder_did": holder_did
+                                    });
+                                    let _ = channel.send(msg.to_string());
+                                    println!("!!! CREDENTIAL SENT TO REACT FOR SIGNING !!!");
+                                } else {
+                                    println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
+                                }
+                            }
+                        });
+                    } else {
+                        println!("DEBUG: Received sign_credential without credential object or holder_did: {}", text);
+                    }
                 } else {
                     println!("DEBUG: Received unknown JSON structure: {}", text);
                 }
@@ -644,6 +727,7 @@ pub fn run() {
             get_public_did_document,
             submit_ws_response,
             submit_ws_event_response,
+            submit_ws_credential_response,
             show_main_window,
             register_challenge_pipe,
         ]);
