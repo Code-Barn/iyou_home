@@ -1,64 +1,60 @@
-# iYou Home: Tauri Service Switch Panel
+# iYou Home: Sovereign Local Service Hub
 
-This is a Tauri v2 companion application designed to manage local services like Nostr, Prosody, Blossom, and IPFS via a graphical user interface. The application features a React + TypeScript frontend and a Rust backend.
+A Tauri v2 desktop companion that manages local sovereign services (Nostr relay, Blossom, XMPP) and provides a **Signature Bridge** for browser-based identity providers (WUN, Polly) to sign Verifiable Credentials, Nostr events, and OIDC challenges using a local Ed25519 vault.
 
 ## Features
 
-*   **Service Management:** Start and stop local services.
-*   **Status Indicators:** Visual feedback on the current status of each service (Running, Stopped, Starting).
-*   **WebSocket Bridge:** Accepts signature challenges from a browser-based IdP and signs them using the local Vault identity.
-*   **Cross-Platform:** Built with Tauri for desktop compatibility.
+- **Signature Bridge** (port 9001, always on) — WebSocket gateway for cross-origin signing: `sign`, `sign_event`, `sign_credential`, `ping`.
+- **Nostr Relay** (port 9003) — NIP-01 relay with SQLite storage, Ed25519 signature verification, vault-pubkey whitelist.
+- **Blossom Server** (port 9002) — BUD-01 blob store with SHA-256 content addressing.
+- **XMPP Chat** (port 5222) — Minimal embedded XMPP server with SASL PLAIN, TCP and WebSocket transports.
+- **Auto-Start** — Service preferences persisted to `{app_data}/auto_start.json`, restored on launch.
+- **Vault Identity** — Ed25519 keypair stored locally, never exposed to the frontend context.
+- **PNA Compliant** — `Access-Control-Allow-Private-Network: true` on all preflight responses (required by Safari/Chrome).
+
+## Signature Bridge Protocol
+
+All messages are JSON over WebSocket to `ws://127.0.0.1:9001`.
+
+| Type | Incoming | Outgoing |
+|---|---|---|
+| `sign` | `{"type":"sign","challenge":"..."}` | `{"type":"signature","vp":{...}}` |
+| `sign_event` | `{"type":"sign_event","event":{...}}` | `{"type":"signed_event","event":{...}}` |
+| `sign_credential` | `{"type":"sign_credential","credential":{...},"holder_did":"..."}` | `{"type":"signed_credential","vc":{...}}` |
+| `ping` | `{"type":"ping"}` | `{"type":"pong"}` |
+
+- `holder_did` is optional — defaults to the vault DID when omitted.
+- `sign_credential` credential type array is parsed for a human-readable title (e.g. `"family_membership"` → `"Family Membership Signing Request"`).
+
+## Networking
+
+**All services bind to `127.0.0.1` only.** No public or LAN exposure.
+
+Private Network Access (PNA) headers (`Access-Control-Allow-Private-Network: true`) are injected into every OPTIONS preflight and WebSocket upgrade response, required by Safari and Chrome when a public HTTPS origin connects to a local endpoint.
+
+## Identity Model
+
+**Passwords are deprecated.** The primary authentication flow is the OIDC/DID loop through the Signature Bridge. The XMPP service uses a local auto-generated password file for SASL PLAIN transport auth only — all higher-level identity operations use the vault Ed25519 keypair.
 
 ## Project Structure
 
-*   `src-tauri/`: Contains the Rust backend code and Tauri configuration.
-*   `src/`: Contains the React + TypeScript frontend code.
+```
+src-tauri/src/
+├── lib.rs          — Core: WS dispatcher, Tauri commands, auto-start, shutdown
+├── vault.rs        — Ed25519 keypair persistence (loaded DID)
+├── blossom.rs      — BUD-01 blob server on 127.0.0.1:9002
+├── nostr_relay.rs  — NIP-01 WebSocket relay on 127.0.0.1:9003
+└── prosody.rs      — Minimal XMPP server on 127.0.0.1:5222
 
-## WebSocket Bridge (Port 9001)
-
-The application runs a local WebSocket server on **port 9001** that listens on **both IPv4 (`0.0.0.0`) and IPv6 (`[::]`)** for browser-based identity provider handshakes.
-
-### Dual-Stack Listener
-
-Two concurrent `tokio::net::TcpListener` instances are started via `tokio::join!`:
-
-- `0.0.0.0:9001` — IPv4
-- `[::]:9001` — IPv6
-
-This ensures that browsers resolving `localhost` to `127.0.0.1` or `[::1]` both connect immediately without a 60-second timeout.
-
-### CORS / Private Network Access (PNA)
-
-Chrome and Firefox require a CORS pre-flight (OPTIONS) before allowing a public网站 to connect to a private-network WebSocket. The server:
-
-1. **Peek** reads the first 4 bytes of the TCP stream using `TcpStream::peek()`.
-2. If `b"OPTI"` — responds with HTTP 200 and headers:
-   - `Access-Control-Allow-Origin: *`
-   - `Access-Control-Allow-Private-Network: true`
-3. If `b"GET"` — passes the untouched stream to `tokio_tungstenite::accept_hdr_async()` with a callback that injects the same CORS headers into the 101 Switching Protocols response.
-
-### Signing Flow
-
-1. Browser sends `{"action":"sign","challenge":"..."}` over the WebSocket.
-2. Rust saves the challenge to **Global Managed State** (`WsState.pending_challenge`), emits a `ws-sign-request` event on the `main` window, and brings the app to focus.
-3. React polls `get_pending_ws_challenge` every 1 second as a fallback.
-4. On approval, React calls `submit_ws_response` which signs the challenge and sends the VP back over the WebSocket via an `mpsc::UnboundedSender<Message>` channel.
-
-## State Management Architecture
-
-### State Shadowing Conflict (Historical)
-
-A significant bug was encountered where the WebSocket task and the Tauri IPC commands operated on **different instances** of `WsState`. The dedicated TCP/WebSocket task was writing to a local or shadowed copy, while the React-polled command read from the Tauri-managed singleton — always seeing `None`.
-
-**Fix:** All signing data must be written to the **Global Managed State** via `app_handle.state::<WsState>()`. The `AppHandle` is cloned from the `.setup()` closure and passed into the spawned `handle_connection` task. Both the WebSocket handler and the `get_pending_ws_challenge` command resolve to the same `WsState` instance registered via `.manage(WsState::default())`.
-
-### Pull-Based Synchronization
-
-Events (`ws-sign-request`) are emitted as a fast path, but the reliable path is a **1-second poll** where React calls `invoke('get_pending_ws_challenge')`. This ensures the popup appears even if:
-- The Tauri event is blocked by permissions.
-- The frontend reloads mid-handshake.
-- The event system has a scoping mismatch.
+src/
+├── App.tsx                     — Service switch panel UI
+├── components/
+│   ├── WsSignPopup.tsx         — Signing approval modal
+│   └── SovereignSigner.tsx     — Manual challenge paste UI
+└── __tests__/
+    └── App.test.tsx
+```
 
 ## Getting Started
 
-To get started with development or to run the application, please refer to the `DEVELOPER_GUIDE.md`.
+See [HOME_DEVELOPER_GUIDE.md](./HOME_DEVELOPER_GUIDE.md) for setup instructions, architecture details, and known risks.

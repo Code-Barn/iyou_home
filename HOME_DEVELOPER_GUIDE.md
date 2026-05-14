@@ -39,23 +39,57 @@ The backend is located in the `src-tauri` directory.
     - `ServiceState` — holds service status map and active DID.
     - `WsState` — holds the WebSocket response sender (`mpsc::UnboundedSender<Message>`) for sending signed VPs back, and the `challenge_channel` (`tauri::ipc::Channel<String>`) registered by React. All fields use `Mutex` for interior mutability.
 
-### WebSocket Bridge (Port 9001)
+### Networking & Binding
 
-The application runs a local WebSocket server on port 9001 that binds a single dual-stack `[::]:9001` socket (accepting both IPv4 and IPv6 connections). This is started inside the Tauri `.setup()` hook using `tauri::async_runtime::spawn`.
+All local services bind exclusively to `127.0.0.1` (IPv4 loopback). **No service listens on `0.0.0.0`, `[::]`, or any public interface.** This ensures:
+
+- No accidental exposure to LAN or WAN.
+- Consistent behaviour across macOS, Linux, and Windows.
+- PNA pre-flight is the only cross-origin path — via the Signature Bridge on port 9001.
+
+| Service | Port | Protocol | Bind Address |
+|---|---|---|---|
+| Signature Bridge | 9001 | WebSocket / HTTP | 127.0.0.1 |
+| Blossom (BUD-01) | 9002 | HTTP (GET/PUT/HEAD/OPTIONS) | 127.0.0.1 |
+| Nostr Relay (NIP-01) | 9003 | WebSocket | 127.0.0.1 |
+| XMPP (Chat) | 5222 | TCP / WebSocket | 127.0.0.1 |
+
+### Auto-Start Persistence
+
+Service auto-start preferences are persisted to `{app_data}/auto_start.json` as a flat JSON map (`{"Nostr": true, "Blossom": false}`). On startup, `.setup()` loads this file and spawns any service with `true`. The frontend can query and update these via `get_auto_start_settings` and `set_auto_start` Tauri commands.
+
+### Signature Bridge (Port 9001) — Protocol
+
+The application runs a local WebSocket server on port 9001 that binds `127.0.0.1:9001` (IPv4 only — all local services standardised to 127.0.0.1). This is started inside the Tauri `.setup()` hook using `tauri::async_runtime::spawn`.
+
+The Signature Bridge is **always on** (not togglable) and is the sole cross-origin entry point for browser-based identity providers (WUN, Polly, etc.).
 
 #### CORS / Private Network Access (PNA)
-Chrome and Brave require a PNA pre-flight (OPTIONS) before allowing a public website to connect to a private-network WebSocket. The handler:
+
+Safari, Chrome, and Brave all require a PNA pre-flight (OPTIONS) before a public HTTPS origin is allowed to connect to a private-network WebSocket. The handler implements First-Match-Wins:
+
 1. Peeks the first 4 bytes via `TcpStream::peek()`.
-2. If `b"OPTI"` — responds 200 with `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Private-Network: true`.
-3. If `b"GET"` — passes the untouched stream to `accept_hdr_async` whose callback injects the same headers into the 101 Switching Protocols response.
+2. If `b"OPTI"` — responds 200 with `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Private-Network: true`, and `Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS`.
+3. If `b"GET"` + WebSocket upgrade headers — passes the stream to `accept_hdr_async` whose callback injects the same PNA headers into the 101 Switching Protocols response.
+4. All other connections are silently dropped.
+
+#### Supported Message Types
+
+| Type | Action | Description |
+|---|---|---|
+| `sign` | `"sign"` or `"action":"sign"` | OIDC/VP challenge — returns a Verifiable Presentation signed with the vault Ed25519 key |
+| `sign_event` | `"sign_event"` or `"type":"sign_event"` | Nostr event signing — returns `{"type":"signed_event","event":{...}}` with `id` and `sig` (Ed25519, deviates from NIP-01 secp256k1) |
+| `sign_credential` | `"type":"sign_credential"` | W3C Verifiable Credential issuance — returns `{"type":"signed_credential","vc":{...}}` signed with the vault Ed25519 key |
+| `ping` | `"type":"ping"` | Smoke test — immediately responds `{"type":"pong"}` via the response channel |
 
 #### Signing Flow (v2 Channel Architecture)
-1. React mounts `WsSignPopup.tsx`, creates a `new Channel<string>()`, sets `channel.onmessage`, and registers it with the backend via `invoke('register_challenge_pipe', { channel })`.
-2. Browser sends `{"type":"sign","challenge":"..."}` (or `{"action":"sign",...}`) over the WebSocket.
+1. React mounts `WsSignPopup.tsx`, creates a `new Channel<string>()`, sets `channel.onmessage`, and registers it with the backend via `invoke('register_challenge_pipe', { channel })`. Any queued messages from before registration are flushed to the new channel.
+2. Browser sends a JSON message over the WebSocket.
 3. The read loop spawns a background task via `tokio::spawn` (see *Async Logic Strike* below).
-4. The background task brings the app window to focus, then sends the challenge through the registered `Channel` — this fires `onmessage` in React instantly.
-5. React shows a modal with the challenge text and Approve/Deny buttons.
-6. On approval, React calls `submit_ws_response` which signs the challenge and sends the VP back over the WebSocket via the `mpsc::UnboundedSender<Message>` stored in `WsState.response_sender`.
+4. The background task brings the app window to focus, then sends the request through the registered `Channel` — this fires `onmessage` in React instantly.
+5. React shows a modal with the request details (challenge text, event JSON, or credential body) and Approve/Deny buttons.
+6. On approval, React calls the appropriate command (`submit_ws_response`, `submit_ws_event_response`, or `submit_ws_credential_response`) which signs and sends the response back over the WebSocket via the `mpsc::UnboundedSender<Message>` stored in `WsState.response_sender`.
+7. On denial, a `{"status":"denied"}` message is sent.
 
 #### Critical Pattern: State Shadowing Fix
 The WebSocket TCP task runs in a different async context than Tauri IPC commands. Any reference to managed state captured before a `tokio::spawn` or `tokio::spawn` boundary points to a **local shadow copy**, not the singleton managed by Tauri.
@@ -118,6 +152,17 @@ Current test suites:
 - `test_sign_auth_challenge_logic` — DID generation + VP signing with proof validation
 - `test_vault_encryption_decryption` — vault persistence round-trip
 
+## Identity Model
+
+**Passwords are deprecated.** The primary entry point is the OIDC/DID loop:
+
+1. A browser-based identity provider (IdP) at WUN or Polly initiates the flow by connecting to the local Signature Bridge.
+2. The IdP sends a challenge (`sign`), a Nostr event (`sign_event`), or a credential body (`sign_credential`) over the WebSocket.
+3. The user approves or denies via the React popup (`WsSignPopup`).
+4. The Rust backend signs with the vault Ed25519 key and returns the result over the same WebSocket connection.
+
+There is no password-based authentication for the signing flow. The XMPP (Chat) service uses a locally-generated password file for SASL PLAIN (`{app_data}/xmpp_password.txt`) — this is a transport credential, not an identity credential. All higher-level identity operations go through the DID/Vault+WebSocket path.
+
 ## Frontend (React)
 
 The frontend is a React application located in the `src` directory.
@@ -175,4 +220,4 @@ The `pending_challenge` field, `get_pending_ws_challenge` command, `UpdatePayloa
 
 3. **Heartbeat Ping has no backpressure or retry.** A single failed ping kills the forwarder task and the response path with it.
 
-4. **IPv6 dual-stack assumption.** Binding `[::]:9001` works on Linux/macOS but may fail on systems without IPv6.**
+4. **Forwarder exit race.** The 50ms sleep + explicit flush in the forwarder task mitigates the race where the task exits before the last message reaches the TCP stack, but does not eliminate it entirely under extreme load.

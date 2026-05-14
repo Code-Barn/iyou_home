@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
@@ -32,6 +33,7 @@ pub struct ServiceState {
     pub services: Mutex<HashMap<String, ServiceStatus>>,
     pub active_did: Mutex<Option<String>>,
     pub shutdown_signals: Mutex<HashMap<String, watch::Sender<bool>>>,
+    pub auto_start_settings: Mutex<HashMap<String, bool>>,
 }
 
 // State for WS requests
@@ -459,7 +461,7 @@ async fn handle_options_preflight(mut stream: TcpStream) {
     let response = b"HTTP/1.1 200 OK\r\n\
         Access-Control-Allow-Origin: *\r\n\
         Access-Control-Allow-Private-Network: true\r\n\
-        Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+        Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS\r\n\
         Access-Control-Allow-Headers: *\r\n\
         Content-Length: 0\r\n\
         Connection: keep-alive\r\n\r\n";
@@ -532,6 +534,10 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                         eprintln!("DEBUG: Forwarder exit — ws_sender.send failed: {}", e);
                         break;
                     }
+                    if let Err(e) = ws_sender.flush().await {
+                        eprintln!("DEBUG: Forwarder exit — ws_sender.flush failed: {}", e);
+                        break;
+                    }
                 }
                 _ = heartbeat.tick() => {
                     if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
@@ -541,6 +547,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                 }
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let ws_state = app_clone.state::<WsState>();
         *ws_state.response_sender.lock().unwrap() = None;
         println!("DEBUG: Forwarder Task Exited — response_sender cleared");
@@ -669,7 +676,50 @@ async fn listen_on(addrs: &str, app: AppHandle) {
 }
 
 async fn start_ws_server(app: AppHandle) {
-    listen_on("[::]:9001", app).await;
+    listen_on("127.0.0.1:9001", app).await;
+}
+
+fn auto_start_path(app: &AppHandle) -> PathBuf {
+    let mut path = app.path().app_local_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    path.push("auto_start.json");
+    path
+}
+
+fn load_auto_start_settings(app: &AppHandle) -> HashMap<String, bool> {
+    let path = auto_start_path(app);
+    if !path.exists() {
+        return HashMap::new();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_auto_start_settings(app: &AppHandle, settings: &HashMap<String, bool>) {
+    let path = auto_start_path(app);
+    if let Ok(json) = serde_json::to_string(settings) {
+        let _ = std::fs::write(&path, &json);
+    }
+}
+
+#[tauri::command]
+fn get_auto_start_settings(state: State<'_, ServiceState>) -> HashMap<String, bool> {
+    state.auto_start_settings.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn set_auto_start(
+    name: String,
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<(), String> {
+    state.auto_start_settings.lock().unwrap().insert(name.clone(), enabled);
+    let settings = state.auto_start_settings.lock().unwrap().clone();
+    save_auto_start_settings(&app, &settings);
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -679,6 +729,7 @@ pub fn run() {
         services: Mutex::new(initial_services),
         active_did: Mutex::new(None),
         shutdown_signals: Mutex::new(HashMap::new()),
+        auto_start_settings: Mutex::new(HashMap::new()),
     };
     let ws_state = WsState::default();
 
@@ -690,6 +741,25 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // Load auto-start settings and start enabled services
+            let auto_start = load_auto_start_settings(&app_handle);
+            {
+                let state = app_handle.state::<ServiceState>();
+                *state.auto_start_settings.lock().unwrap() = auto_start.clone();
+            }
+            for (name, enabled) in &auto_start {
+                if *enabled {
+                    let app = app_handle.clone();
+                    let name = name.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<ServiceState>();
+                        if let Err(e) = start_service_internal(&name, &app, &state).await {
+                            eprintln!("Auto-start {} failed: {}", name, e);
+                        }
+                    });
+                }
+            }
 
             let ws_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -750,6 +820,8 @@ pub fn run() {
             submit_ws_credential_response,
             show_main_window,
             register_challenge_pipe,
+            get_auto_start_settings,
+            set_auto_start,
         ]);
 
     builder
@@ -787,6 +859,7 @@ mod tests {
             services: Mutex::new(initial_services),
             active_did: Mutex::new(None),
             shutdown_signals: Mutex::new(HashMap::new()),
+            auto_start_settings: Mutex::new(HashMap::new()),
         }
     }
 
