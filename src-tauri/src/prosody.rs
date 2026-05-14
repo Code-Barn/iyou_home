@@ -60,6 +60,25 @@ enum ConnectionType {
     RawXmpp,
 }
 
+fn is_xmpp_websocket_upgrade(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() || !lines[0].starts_with("GET") {
+        return false;
+    }
+    let lowercase_headers: Vec<String> = lines.iter().map(|l| l.trim().to_lowercase()).collect();
+
+    let has_upgrade = lowercase_headers.iter().any(|l| l.starts_with("upgrade:"));
+    let has_connection_upgrade = lowercase_headers
+        .iter()
+        .any(|l| l.starts_with("connection:") && l.contains("upgrade"));
+    let has_ws_key = lowercase_headers
+        .iter()
+        .any(|l| l.starts_with("sec-websocket-key:"));
+
+    has_upgrade && has_connection_upgrade && has_ws_key
+}
+
 async fn detect_connection_type(stream: &TcpStream) -> ConnectionType {
     let mut peek_buf = [0u8; 1024];
     let n = match stream.peek(&mut peek_buf).await {
@@ -69,19 +88,11 @@ async fn detect_connection_type(stream: &TcpStream) -> ConnectionType {
 
     let data = &peek_buf[..n];
 
-    // Check if this is an HTTP request (starts with "GET") with Upgrade header
-    if data.starts_with(b"GET") {
-        let text = String::from_utf8_lossy(data);
-        let has_upgrade = text.lines().any(|l| {
-            l.trim().to_lowercase().starts_with("upgrade:")
-                || l.trim().to_lowercase().starts_with("sec-websocket-")
-        });
-        if has_upgrade {
-            return ConnectionType::WebSocket;
-        }
+    if is_xmpp_websocket_upgrade(data) {
+        ConnectionType::WebSocket
+    } else {
+        ConnectionType::RawXmpp
     }
-
-    ConnectionType::RawXmpp
 }
 
 // -- WebSocket XMPP handler --

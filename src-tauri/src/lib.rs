@@ -354,7 +354,26 @@ async fn submit_ws_event_response(
     Ok(())
 }
 
-async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
+fn is_websocket_upgrade_request(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() || !lines[0].starts_with("GET") {
+        return false;
+    }
+    let lowercase_headers: Vec<String> = lines.iter().map(|l| l.trim().to_lowercase()).collect();
+
+    let has_upgrade = lowercase_headers.iter().any(|l| l.starts_with("upgrade:"));
+    let has_connection_upgrade = lowercase_headers
+        .iter()
+        .any(|l| l.starts_with("connection:") && l.contains("upgrade"));
+    let has_ws_key = lowercase_headers
+        .iter()
+        .any(|l| l.starts_with("sec-websocket-key:"));
+
+    has_upgrade && has_connection_upgrade && has_ws_key
+}
+
+async fn handle_connection(stream: TcpStream, app_handle: AppHandle) {
     let mut peek_buf = [0u8; 1024];
     let n = match stream.peek(&mut peek_buf).await {
         Ok(0) | Err(_) => return,
@@ -363,54 +382,37 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
 
     let data = &peek_buf[..n];
 
-    // Handle OPTIONS pre-flight
-    if data.starts_with(b"OPTIONS") || (n >= 4 && &data[..4] == b"OPTI") {
-        println!("OPTIONS pre-flight received");
-        let response = b"HTTP/1.1 200 OK\r\n\
-            Access-Control-Allow-Origin: *\r\n\
-            Access-Control-Allow-Private-Network: true\r\n\
-            Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-            Access-Control-Allow-Headers: *\r\n\
-            Content-Length: 0\r\n\
-            Connection: keep-alive\r\n\r\n";
-        let _ = stream.write_all(response).await;
-        return;
+    // First-Match-Wins dispatcher
+    if data.starts_with(b"OPTIONS") {
+        handle_options_preflight(stream).await;
+    } else if is_websocket_upgrade_request(data) {
+        handle_ws_connection(stream, app_handle).await;
     }
+    // else: silently drop non-matching connections (non-GET, non-WS GET, etc.)
+}
 
-    // Only process GET requests
-    if n < 3 || &data[..3] != b"GET" {
-        return;
-    }
+async fn handle_options_preflight(mut stream: TcpStream) {
+    println!("OPTIONS pre-flight received");
+    let response = b"HTTP/1.1 200 OK\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Access-Control-Allow-Private-Network: true\r\n\
+        Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+        Access-Control-Allow-Headers: *\r\n\
+        Content-Length: 0\r\n\
+        Connection: keep-alive\r\n\r\n";
+    let _ = stream.write_all(response).await;
+}
 
-    // Verify this is a WebSocket upgrade request by checking for Upgrade header
-    let request_text = String::from_utf8_lossy(data);
-    let has_ws_upgrade = request_text.lines().any(|l| {
-        let trimmed = l.trim().to_lowercase();
-        trimmed.starts_with("upgrade:") || trimmed.starts_with("sec-websocket-")
-    });
-
-    if !has_ws_upgrade {
-        println!("Non-WebSocket GET request rejected");
-        let response = b"HTTP/1.1 400 Bad Request\r\n\
-            Content-Type: text/plain\r\n\
-            Content-Length: 22\r\n\
-            Connection: close\r\n\r\n\
-            WebSocket upgrade only";
-        let _ = stream.write_all(response).await;
-        return;
-    }
-
+async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
     let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
         println!("DEBUG: Handshake callback triggered");
         println!("DEBUG: Request method: {:?}", req.method());
-        res.headers_mut().insert(
-            "Access-Control-Allow-Origin",
-            tauri::http::HeaderValue::from_static("*"),
-        );
-        res.headers_mut().insert(
-            "Access-Control-Allow-Private-Network",
-            tauri::http::HeaderValue::from_static("true"),
-        );
+        res.headers_mut()
+            .insert("Access-Control-Allow-Origin",
+                tauri::http::HeaderValue::from_static("*"));
+        res.headers_mut()
+            .insert("Access-Control-Allow-Private-Network",
+                tauri::http::HeaderValue::from_static("true"));
         Ok(res)
     };
 
@@ -465,7 +467,6 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         println!("DEBUG: Forwarder Task Exited");
     });
 
-    // WARNING: DO NOT handle logic inside this loop; always spawn a task to prevent protocol deadlocks.
     while let Some(Ok(msg)) = ws_receiver.next().await {
         if msg.is_text() {
             let text = msg.to_text().unwrap().to_string();

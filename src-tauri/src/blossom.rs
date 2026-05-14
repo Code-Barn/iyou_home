@@ -3,7 +3,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{header, StatusCode, Method},
     response::{IntoResponse, Response},
-    routing::{get, head, put},
+    routing::{get, options},
     Router,
 };
 use sha2::{Digest, Sha256};
@@ -33,9 +33,9 @@ pub async fn start_blossom_server(
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
-        .route("/{hash}", get(handle_get))
-        .route("/{hash}", head(handle_head))
-        .route("/{hash}", put(handle_put))
+        .route("/{hash}", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
+        .route("/{hash}/", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
+        .route("/", options(handle_options))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(cors)
         .with_state(state);
@@ -53,6 +53,17 @@ pub async fn start_blossom_server(
         })
         .await
         .expect("Blossom server failed");
+}
+
+async fn handle_options() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, PUT, HEAD, OPTIONS")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization")
+        .header("Access-Control-Allow-Private-Network", "true")
+        .body(Body::default())
+        .unwrap()
 }
 
 async fn handle_get(
