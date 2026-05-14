@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import KeysManager from "./components/KeysManager";
 import SovereignSigner from "./components/SovereignSigner";
@@ -23,6 +23,12 @@ const SERVICES: ServiceInfo[] = [
     { name: "Polly", comingSoon: true },
 ];
 
+const AUTO_START_DEFAULTS: Record<string, boolean> = {
+    Blossom: true,
+    Nostr: true,
+    Chat: true,
+};
+
 function ServiceSwitchPanel() {
     const [serviceStatus, setServiceStatus] = useState<
         Record<string, ServiceStatus>
@@ -36,7 +42,30 @@ function ServiceSwitchPanel() {
             {} as Record<string, ServiceStatus>,
         ),
     });
+    const [autoStart, setAutoStart] = useState<Record<string, boolean>>({});
     const [notification, setNotification] = useState<string | null>(null);
+
+    useEffect(() => {
+        const loadSettings = async () => {
+            try {
+                const settings = await invoke<Record<string, boolean>>("get_auto_start_settings");
+                setAutoStart((prev) => {
+                    const merged = { ...prev };
+                    for (const svc of SERVICES) {
+                        if (svc.name in settings) {
+                            merged[svc.name] = settings[svc.name];
+                        } else if (svc.name in AUTO_START_DEFAULTS) {
+                            merged[svc.name] = AUTO_START_DEFAULTS[svc.name];
+                        }
+                    }
+                    return merged;
+                });
+            } catch (error) {
+                console.error("Failed to load auto-start settings:", error);
+            }
+        };
+        loadSettings();
+    }, []);
 
     const handleToggleService = async (name: string) => {
         const currentStatus = serviceStatus[name];
@@ -50,6 +79,15 @@ function ServiceSwitchPanel() {
             setServiceStatus((prev) => ({ ...prev, [name]: newStatus }));
         } catch (error) {
             console.error(`Failed to toggle service ${name}:`, error);
+        }
+    };
+
+    const handleAutoStartToggle = async (name: string, enabled: boolean) => {
+        setAutoStart((prev) => ({ ...prev, [name]: enabled }));
+        try {
+            await invoke("set_auto_start", { name, enabled });
+        } catch (error) {
+            console.error(`Failed to set auto-start for ${name}:`, error);
         }
     };
 
@@ -84,17 +122,29 @@ function ServiceSwitchPanel() {
                                 </span>
                             )}
                         </div>
-                        {svc.alwaysOn ? (
-                            <span className="always-on-badge">Always On</span>
-                        ) : svc.comingSoon ? (
-                            <span className="coming-soon-badge">Coming Soon</span>
-                        ) : (
-                            <button onClick={() => handleToggleService(svc.name)}>
-                                {serviceStatus[svc.name] === "running"
-                                    ? "Stop"
-                                    : "Start"}
-                            </button>
-                        )}
+                        <div className="service-actions">
+                            {!svc.alwaysOn && !svc.comingSoon && (
+                                <label className="autostart-toggle">
+                                    <input
+                                        type="checkbox"
+                                        checked={autoStart[svc.name] ?? AUTO_START_DEFAULTS[svc.name] ?? false}
+                                        onChange={(e) => handleAutoStartToggle(svc.name, e.target.checked)}
+                                    />
+                                    Autostart
+                                </label>
+                            )}
+                            {svc.alwaysOn ? (
+                                <span className="always-on-badge">Always On</span>
+                            ) : svc.comingSoon ? (
+                                <span className="coming-soon-badge">Coming Soon</span>
+                            ) : (
+                                <button onClick={() => handleToggleService(svc.name)}>
+                                    {serviceStatus[svc.name] === "running"
+                                        ? "Stop"
+                                        : "Start"}
+                                </button>
+                            )}
+                        </div>
                     </div>
                 ))}
             </div>

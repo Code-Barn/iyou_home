@@ -39,8 +39,8 @@ pub async fn start_blossom_server(
     );
 
     let app = Router::new()
-        .route("/{hash}", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
-        .route("/{hash}/", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
+        .route("/:hash", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
+        .route("/:hash/", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
         .route("/", options(handle_options))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(cors)

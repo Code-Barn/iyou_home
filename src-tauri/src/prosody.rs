@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-const XMPP_SERVER: &str = "localhost";
+const XMPP_SERVER: &str = "127.0.0.1";
 const STREAM_NS: &str = "http://etherx.jabber.org/streams";
 const CLIENT_NS: &str = "jabber:client";
 const SASL_NS: &str = "urn:ietf:params:xml:ns:xmpp-sasl";

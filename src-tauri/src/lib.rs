@@ -127,6 +127,8 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
             let app_data = app.path().app_local_data_dir()
                 .map_err(|e| format!("Failed to get app data dir: {}", e))?;
             let blobs_dir = app_data.join("blobs");
+            std::fs::create_dir_all(&blobs_dir)
+                .map_err(|e| format!("Failed to create blobs directory: {}", e))?;
             let (tx, rx) = watch::channel(false);
             tauri::async_runtime::spawn(async move {
                 blossom::start_blossom_server(blobs_dir, rx).await;
