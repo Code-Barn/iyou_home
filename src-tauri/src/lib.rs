@@ -7,9 +7,16 @@ use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
+use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
+use ed25519_dalek::Signer;
+use sha2::{Digest, Sha256};
 mod vault;
+mod blossom;
+mod nostr_relay;
+mod prosody;
 
 // Define the service status enum
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -24,6 +31,7 @@ pub enum ServiceStatus {
 pub struct ServiceState {
     pub services: Mutex<HashMap<String, ServiceStatus>>,
     pub active_did: Mutex<Option<String>>,
+    pub shutdown_signals: Mutex<HashMap<String, watch::Sender<bool>>>,
 }
 
 // State for WS requests
@@ -40,12 +48,21 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-fn toggle_service(
+async fn toggle_service(
     name: String,
     action: String,
+    app: AppHandle,
     state: State<'_, ServiceState>,
 ) -> Result<ServiceStatus, String> {
-    toggle_service_logic(name, action, &state)
+    let status = toggle_service_logic(name.clone(), action.clone(), &state)?;
+
+    match action.as_str() {
+        "start" => start_service_internal(&name, &app, &state).await?,
+        "stop" => stop_service_internal(&name, &state),
+        _ => {}
+    }
+
+    Ok(status)
 }
 
 // Core logic separated for testability
@@ -61,7 +78,6 @@ fn toggle_service_logic(
 
     match action.as_str() {
         "start" => {
-            *status = ServiceStatus::Starting;
             *status = ServiceStatus::Running;
         }
         "stop" => {
@@ -70,6 +86,74 @@ fn toggle_service_logic(
         _ => return Err("Invalid action".to_string()),
     }
     Ok(status.clone())
+}
+
+async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceState) -> Result<(), String> {
+    {
+        let shutdown_signals = state.shutdown_signals.lock().unwrap();
+        if shutdown_signals.contains_key(name) {
+            return Err("Service already running".to_string());
+        }
+    }
+
+    let tx = match name {
+        "Nostr" => {
+            let app_data = app.path().app_local_data_dir()
+                .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+            let store = vault::load_identity(app)?;
+            let pubkey = nostr_relay::derive_vault_pubkey(&store)?;
+            let db_path = app_data.join("nostr_events.db");
+            let listener = TcpListener::bind("127.0.0.1:9003").await
+                .map_err(|e| format!("Failed to bind Nostr relay: {}", e))?;
+            let (tx, rx) = watch::channel(false);
+            tauri::async_runtime::spawn(async move {
+                nostr_relay::start_relay(db_path, listener, rx, pubkey).await;
+            });
+            tx
+        }
+        "Blossom" => {
+            let app_data = app.path().app_local_data_dir()
+                .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+            let blobs_dir = app_data.join("blobs");
+            let (tx, rx) = watch::channel(false);
+            tauri::async_runtime::spawn(async move {
+                blossom::start_blossom_server(blobs_dir, rx).await;
+            });
+            tx
+        }
+        "Chat" => {
+            let app_data = app.path().app_local_data_dir()
+                .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+            let pass_file = app_data.join("xmpp_password.txt");
+            let password = if pass_file.exists() {
+                std::fs::read_to_string(&pass_file)
+                    .map_err(|e| format!("Failed to read password: {}", e))?
+            } else {
+                let pwd = prosody::generate_password();
+                std::fs::write(&pass_file, &pwd)
+                    .map_err(|e| format!("Failed to save password: {}", e))?;
+                pwd
+            };
+            let listener = TcpListener::bind("127.0.0.1:5222").await
+                .map_err(|e| format!("Failed to bind XMPP: {}", e))?;
+            let (tx, rx) = watch::channel(false);
+            tauri::async_runtime::spawn(async move {
+                prosody::start_xmpp_server(listener, rx, password).await;
+            });
+            tx
+        }
+        _ => return Ok(()),
+    };
+
+    state.shutdown_signals.lock().unwrap().insert(name.to_string(), tx);
+    Ok(())
+}
+
+fn stop_service_internal(name: &str, state: &ServiceState) {
+    let mut shutdown_signals = state.shutdown_signals.lock().unwrap();
+    if let Some(tx) = shutdown_signals.remove(name) {
+        let _ = tx.send(true);
+    }
 }
 
 #[tauri::command]
@@ -203,14 +287,84 @@ async fn submit_ws_response(
     Ok(())
 }
 
+#[tauri::command]
+async fn submit_ws_event_response(
+    event_json: String,
+    approved: bool,
+    app: AppHandle,
+    ws_state: State<'_, WsState>,
+) -> Result<(), String> {
+    let sender = {
+        let guard = ws_state.response_sender.lock().unwrap();
+        guard.clone().ok_or("No WebSocket connected")?
+    };
+
+    if !approved {
+        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        println!("WS event sign request denied by user");
+        return Ok(());
+    }
+
+    let store = vault::load_identity(&app)?;
+
+    let mut event: serde_json::Value = serde_json::from_str(&event_json)
+        .map_err(|e| format!("Failed to parse event JSON: {}", e))?;
+
+    let pubkey = event["pubkey"].as_str().unwrap_or("");
+    let created_at = event["created_at"].as_i64().unwrap_or(0);
+    let kind = event["kind"].as_i64().unwrap_or(1);
+    let tags = event.get("tags").cloned().unwrap_or(serde_json::json!([]));
+    let content = event["content"].as_str().unwrap_or("");
+
+    let serialized = serde_json::to_string(&serde_json::json!([
+        0, pubkey, created_at, kind, tags, content
+    ]))
+    .map_err(|e| format!("Failed to serialize event: {}", e))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    let id_bytes = hasher.finalize();
+    let id_b64 = base64.encode(id_bytes);
+
+    let key_bytes = bs58::decode(&store.private_key_base58)
+        .into_vec()
+        .map_err(|_| "Invalid base58 private key".to_string())?;
+
+    if key_bytes.len() != 32 {
+        return Err("Invalid private key length".to_string());
+    }
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&key_bytes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
+    let signature = signing_key.sign(&id_bytes);
+    let sig_bytes = signature.to_bytes();
+    let sig_b64 = base64.encode(sig_bytes);
+
+    event["id"] = serde_json::Value::String(id_b64);
+    event["sig"] = serde_json::Value::String(sig_b64);
+
+    let response = serde_json::json!({
+        "type": "signed_event",
+        "event": event
+    });
+
+    println!("Sending signed Nostr event back to browser");
+    let _ = sender.send(Message::Text(response.to_string().into()));
+    Ok(())
+}
+
 async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
-    let mut peek_buf = [0u8; 4];
+    let mut peek_buf = [0u8; 1024];
     let n = match stream.peek(&mut peek_buf).await {
         Ok(0) | Err(_) => return,
         Ok(n) => n,
     };
 
-    if n >= 4 && &peek_buf[..4] == b"OPTI" {
+    let data = &peek_buf[..n];
+
+    // Handle OPTIONS pre-flight
+    if data.starts_with(b"OPTIONS") || (n >= 4 && &data[..4] == b"OPTI") {
         println!("OPTIONS pre-flight received");
         let response = b"HTTP/1.1 200 OK\r\n\
             Access-Control-Allow-Origin: *\r\n\
@@ -223,7 +377,26 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
         return;
     }
 
-    if n < 3 || &peek_buf[..3] != b"GET" {
+    // Only process GET requests
+    if n < 3 || &data[..3] != b"GET" {
+        return;
+    }
+
+    // Verify this is a WebSocket upgrade request by checking for Upgrade header
+    let request_text = String::from_utf8_lossy(data);
+    let has_ws_upgrade = request_text.lines().any(|l| {
+        let trimmed = l.trim().to_lowercase();
+        trimmed.starts_with("upgrade:") || trimmed.starts_with("sec-websocket-")
+    });
+
+    if !has_ws_upgrade {
+        println!("Non-WebSocket GET request rejected");
+        let response = b"HTTP/1.1 400 Bad Request\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Length: 22\r\n\
+            Connection: close\r\n\r\n\
+            WebSocket upgrade only";
+        let _ = stream.write_all(response).await;
         return;
     }
 
@@ -318,13 +491,50 @@ async fn handle_connection(mut stream: TcpStream, app_handle: AppHandle) {
                             let state = app.state::<WsState>();
                             let pipe = state.challenge_channel.lock().unwrap();
                             if let Some(channel) = pipe.as_ref() {
-                                let _ = channel.send(challenge.clone());
+                                let msg = serde_json::json!({
+                                    "__type__": "sign",
+                                    "challenge": challenge
+                                });
+                                let _ = channel.send(msg.to_string());
                                 println!("!!! SUCCESS: CHALLENGE PIPED TO REACT BACKGROUND TASK !!!");
                             } else {
                                 println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
                             }
                         }
                     });
+                } else if json["type"] == "sign_event" || json["action"] == "sign_event" {
+                    if json["event"].is_object() {
+                        let event = json["event"].clone();
+                        println!("Triggering Nostr Event signing");
+
+                        let app_handle = app_handle.clone();
+                        tokio::spawn(async move {
+                            let app = app_handle;
+
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.unminimize();
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+
+                            {
+                                let state = app.state::<WsState>();
+                                let pipe = state.challenge_channel.lock().unwrap();
+                                if let Some(channel) = pipe.as_ref() {
+                                    let msg = serde_json::json!({
+                                        "__type__": "sign_event",
+                                        "event": event
+                                    });
+                                    let _ = channel.send(msg.to_string());
+                                    println!("!!! NOSTR EVENT SENT TO REACT FOR SIGNING !!!");
+                                } else {
+                                    println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
+                                }
+                            }
+                        });
+                    } else {
+                        println!("DEBUG: Received sign_event without event object: {}", text);
+                    }
                 } else {
                     println!("DEBUG: Received unknown JSON structure: {}", text);
                 }
@@ -364,6 +574,7 @@ pub fn run() {
     let service_state = ServiceState {
         services: Mutex::new(initial_services),
         active_did: Mutex::new(None),
+        shutdown_signals: Mutex::new(HashMap::new()),
     };
     let ws_state = WsState::default();
 
@@ -375,8 +586,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            let ws_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                start_ws_server(app_handle).await;
+                start_ws_server(ws_handle).await;
             });
 
             let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -429,6 +642,7 @@ pub fn run() {
             sign_auth_challenge,
             get_public_did_document,
             submit_ws_response,
+            submit_ws_event_response,
             show_main_window,
             register_challenge_pipe,
         ]);
@@ -448,6 +662,13 @@ pub fn run() {
                     api.prevent_close();
                 }
             }
+            RunEvent::Exit => {
+                let state = app_handle.state::<ServiceState>();
+                let shutdown_signals = state.shutdown_signals.lock().unwrap();
+                for (_, tx) in shutdown_signals.iter() {
+                    let _ = tx.send(true);
+                }
+            }
             _ => {}
         });
 }
@@ -460,6 +681,7 @@ mod tests {
         ServiceState {
             services: Mutex::new(initial_services),
             active_did: Mutex::new(None),
+            shutdown_signals: Mutex::new(HashMap::new()),
         }
     }
 

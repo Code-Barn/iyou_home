@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import { invoke, Channel } from '@tauri-apps/api/core';
 
-interface SignRequest {
-  challenge: string;
-}
+type SignRequest =
+  | { type: 'sign'; challenge: string }
+  | { type: 'sign_event'; event: any };
 
 export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequest | null>(null);
@@ -12,9 +12,20 @@ export default function WsSignPopup() {
 
   useEffect(() => {
     const channel = new Channel<string>();
-    channel.onmessage = (challenge) => {
-      console.log("REACT: Received challenge via direct channel pipe:", challenge);
-      setRequest({ challenge });
+    channel.onmessage = (data) => {
+      console.log("REACT: Received message via direct channel pipe:", data);
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.__type__ === 'sign_event') {
+          setRequest({ type: 'sign_event', event: parsed.event });
+        } else if (parsed.__type__ === 'sign') {
+          setRequest({ type: 'sign', challenge: parsed.challenge });
+        } else {
+          setRequest({ type: 'sign', challenge: data });
+        }
+      } catch {
+        setRequest({ type: 'sign', challenge: data });
+      }
     };
     invoke('register_challenge_pipe', { channel });
     console.log("REACT: Challenge channel registered with backend");
@@ -32,12 +43,20 @@ export default function WsSignPopup() {
     setIsProcessing(true);
 
     try {
-      await invoke('submit_ws_response', {
-        id: '',
-        challenge: request.challenge,
-        approved
-      });
-      console.log("REACT: submit_ws_response succeeded");
+      if (request.type === 'sign_event') {
+        await invoke('submit_ws_event_response', {
+          eventJson: JSON.stringify(request.event),
+          approved
+        });
+        console.log("REACT: submit_ws_event_response succeeded");
+      } else {
+        await invoke('submit_ws_response', {
+          id: '',
+          challenge: request.challenge,
+          approved
+        });
+        console.log("REACT: submit_ws_response succeeded");
+      }
     } catch (err) {
       console.error("Failed to submit WS response:", err);
     } finally {
@@ -58,16 +77,36 @@ export default function WsSignPopup() {
         background: 'white', padding: '2rem', borderRadius: '12px',
         maxWidth: '400px', width: '100%', boxShadow: '0 10px 25px rgba(0,0,0,0.2)'
       }}>
-        <h2 style={{marginTop: 0}}>Signature Request</h2>
-        <p>A local application is requesting a signature from your Vault identity.</p>
+        <h2 style={{marginTop: 0}}>
+          {request.type === 'sign_event' ? 'Nostr Event Signing Request' : 'Signature Request'}
+        </h2>
 
-        <div style={{margin: '1.5rem 0'}}>
-          <strong>Challenge:</strong>
-          <pre style={{
-            background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
-            overflowX: 'auto', fontSize: '0.85em', color: '#333'
-          }}>{request.challenge}</pre>
-        </div>
+        {request.type === 'sign' && (
+          <>
+            <p>A local application is requesting a signature from your Vault identity.</p>
+            <div style={{margin: '1.5rem 0'}}>
+              <strong>Challenge:</strong>
+              <pre style={{
+                background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
+                overflowX: 'auto', fontSize: '0.85em', color: '#333'
+              }}>{request.challenge}</pre>
+            </div>
+          </>
+        )}
+
+        {request.type === 'sign_event' && (
+          <>
+            <p>A local application is requesting to sign a Nostr event with your Vault identity.</p>
+            <div style={{margin: '1.5rem 0'}}>
+              <strong>Event Details:</strong>
+              <pre style={{
+                background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
+                overflowX: 'auto', fontSize: '0.85em', color: '#333',
+                maxHeight: '250px', overflowY: 'auto'
+              }}>{JSON.stringify(request.event, null, 2)}</pre>
+            </div>
+          </>
+        )}
 
         <div style={{display: 'flex', gap: '1rem', justifyContent: 'space-between', alignItems: 'center'}}>
           <label style={{fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem'}}>

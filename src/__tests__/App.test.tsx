@@ -6,70 +6,77 @@ import { invoke } from "@tauri-apps/api/core";
 // Mock the invoke function from Tauri
 vi.mock("@tauri-apps/api/core", () => ({
     invoke: vi.fn(),
+    Channel: vi.fn().mockImplementation(() => ({
+        onmessage: null,
+    })),
 }));
 
 describe("App", () => {
     it("renders the service switch panel", () => {
         render(<App />);
         expect(screen.getByText("Service Switch Panel")).toBeInTheDocument();
+        expect(screen.getByText("SigBridge")).toBeInTheDocument();
         expect(screen.getByText("Nostr")).toBeInTheDocument();
         expect(screen.getByText("Blossom")).toBeInTheDocument();
+        expect(screen.getByText("Chat")).toBeInTheDocument();
         expect(screen.getByText("IPFS")).toBeInTheDocument();
+        expect(screen.getByText("Polly")).toBeInTheDocument();
     });
 
-    it("calls the toggle_service command when a button is clicked", async () => {
+    it("shows ports for active services", () => {
+        render(<App />);
+        expect(screen.getByText(":9001")).toBeInTheDocument();
+        expect(screen.getByText(":9002")).toBeInTheDocument();
+        expect(screen.getByText(":9003")).toBeInTheDocument();
+        expect(screen.getByText(":5222")).toBeInTheDocument();
+    });
+
+    it("calls the toggle_service command when a start button is clicked", async () => {
         (invoke as any).mockResolvedValue("running");
         render(<App />);
 
-        const nostrButton = screen.getAllByRole("button", {
+        const startButtons = screen.getAllByRole("button", {
             name: /start/i,
-        })[0];
-        fireEvent.click(nostrButton);
+        });
+        expect(startButtons.length).toBe(3);
+
+        fireEvent.click(startButtons[0]);
 
         await waitFor(() => {
             expect(invoke).toHaveBeenCalledWith("toggle_service", {
-                name: "Nostr",
+                name: "Blossom",
                 action: "start",
             });
         });
 
-        // Check if the status and button text updated
         expect(await screen.findByText("Stop")).toBeInTheDocument();
     });
 
     it("handles service stop correctly", async () => {
-        // First call for "start" should return "running"
         (invoke as any).mockResolvedValueOnce("running");
-        // Second call for "stop" should return "stopped"
+        (invoke as any).mockResolvedValueOnce("running");
         (invoke as any).mockResolvedValueOnce("stopped");
 
         render(<App />);
 
-        // First, click to "start" the service and update the state
-        const startButton = screen.getAllByRole("button", {
+        const startButtons = screen.getAllByRole("button", {
             name: /start/i,
-        })[0];
-        fireEvent.click(startButton);
+        });
+        fireEvent.click(startButtons[0]);
 
-        // Wait for the button text to change to "Stop"
         const stopButton = await screen.findByText("Stop");
-
-        // Now, click the "Stop" button
         fireEvent.click(stopButton);
 
         await waitFor(() => {
-            // The second call to invoke
             expect(invoke).toHaveBeenCalledWith("toggle_service", {
-                name: "Nostr",
+                name: "Blossom",
                 action: "stop",
             });
         });
 
-        // Check if the button text updated back to "Start"
-        // We need to use getAllByRole because "Start" is present for the other services
-        const startButtons = await screen.findAllByRole("button", {
+        const startButtonsAfter = await screen.findAllByRole("button", {
             name: /start/i,
         });
-        expect(startButtons.length).toBe(3);
+        expect(startButtonsAfter.length).toBe(3);
     });
 });

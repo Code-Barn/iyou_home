@@ -202,6 +202,24 @@ textarea {
     font-weight: 500;
 }
 
+.service-port {
+    color: #888;
+    font-size: 0.85em;
+    font-family: monospace;
+}
+
+.always-on-badge {
+    font-size: 0.8em;
+    color: #666;
+    font-style: italic;
+}
+
+.coming-soon-badge {
+    font-size: 0.8em;
+    color: #999;
+    font-style: italic;
+}
+
 .status {
     display: flex;
     align-items: center;

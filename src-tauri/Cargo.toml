@@ -30,3 +30,11 @@ tokio-tungstenite = "0.21"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+bs58 = "0.5"
+axum = "0.7"
+rusqlite = { version = "0.31", features = ["bundled"] }
+quick-xml = "0.31"
+rand = "0.8"
+tower-http = { version = "0.5", features = ["cors"] }
