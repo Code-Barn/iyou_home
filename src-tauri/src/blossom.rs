@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::sync::watch;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 #[derive(Clone)]
 struct BlossomState {
@@ -32,12 +33,18 @@ pub async fn start_blossom_server(
         .allow_methods([Method::GET, Method::PUT, Method::HEAD, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
+    let pna_layer = SetResponseHeaderLayer::appending(
+        axum::http::header::HeaderName::from_static("access-control-allow-private-network"),
+        axum::http::HeaderValue::from_static("true"),
+    );
+
     let app = Router::new()
         .route("/{hash}", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
         .route("/{hash}/", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
         .route("/", options(handle_options))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(cors)
+        .layer(pna_layer)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:9002")

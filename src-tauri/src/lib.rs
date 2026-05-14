@@ -35,10 +35,20 @@ pub struct ServiceState {
 }
 
 // State for WS requests
-#[derive(Default)]
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
+    pub pending_messages: Mutex<Vec<String>>,
+}
+
+impl Default for WsState {
+    fn default() -> Self {
+        Self {
+            response_sender: Mutex::new(None),
+            challenge_channel: Mutex::new(None),
+            pending_messages: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 // ... existing commands ...
@@ -249,8 +259,13 @@ fn show_main_window(app: AppHandle) {
 
 #[tauri::command]
 fn register_challenge_pipe(channel: tauri::ipc::Channel<String>, state: State<'_, WsState>) {
-    *state.challenge_channel.lock().unwrap() = Some(channel);
-    println!("DEBUG: Challenge channel registered by React");
+    let pending = state.pending_messages.lock().unwrap().drain(..).collect::<Vec<_>>();
+    *state.challenge_channel.lock().unwrap() = Some(channel.clone());
+    let count = pending.len();
+    for msg in &pending {
+        let _ = channel.send(msg.clone());
+    }
+    println!("DEBUG: Challenge channel registered by React (flushed {} queued)", count);
 }
 
 #[tauri::command]
@@ -451,6 +466,19 @@ async fn handle_options_preflight(mut stream: TcpStream) {
     let _ = stream.write_all(response).await;
 }
 
+fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
+    let state = app.state::<WsState>();
+    let serialized = msg_json.to_string();
+    let pipe = state.challenge_channel.lock().unwrap();
+    if let Some(channel) = pipe.as_ref() {
+        let _ = channel.send(serialized);
+        println!("!!! CHALLENGE PIPED TO REACT !!!");
+    } else {
+        state.pending_messages.lock().unwrap().push(serialized);
+        println!("!!! CHALLENGE QUEUED — React pipe not registered yet !!!");
+    }
+}
+
 async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
     let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
         println!("DEBUG: Handshake callback triggered");
@@ -486,6 +514,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
 
     let app_clone = app_handle.clone();
     tokio::spawn(async move {
+        println!("DEBUG: Forwarder Task started");
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
         tokio::pin!(response_rx);
         loop {
@@ -493,26 +522,28 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                 msg = response_rx.recv() => {
                     let msg = match msg {
                         Some(msg) => msg,
-                        None => break,
+                        None => {
+                            println!("DEBUG: Forwarder exit — response_rx channel closed (all senders dropped)");
+                            break;
+                        }
                     };
                     println!("Sending response over WebSocket: {:?}", msg);
                     if let Err(e) = ws_sender.send(msg).await {
-                        eprintln!("Failed to send WS message: {}", e);
+                        eprintln!("DEBUG: Forwarder exit — ws_sender.send failed: {}", e);
                         break;
                     }
                 }
                 _ = heartbeat.tick() => {
                     if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
-                        eprintln!("Failed to send Ping: {}", e);
+                        eprintln!("DEBUG: Forwarder exit — heartbeat ping failed: {}", e);
                         break;
                     }
-                    println!("Heartbeat Ping sent");
                 }
             }
         }
         let ws_state = app_clone.state::<WsState>();
         *ws_state.response_sender.lock().unwrap() = None;
-        println!("DEBUG: Forwarder Task Exited");
+        println!("DEBUG: Forwarder Task Exited — response_sender cleared");
     });
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -520,11 +551,20 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
             let text = msg.to_text().unwrap().to_string();
             println!("Received Message: {:?}", text);
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                println!("DEBUG: Received JSON: {}", json);
+
+                // Ping/Pong smoke test — immediate response via response_tx
+                if json["type"] == "ping" {
+                    println!("DEBUG: Ping received, sending pong via response_tx");
+                    let _ = response_tx.send(Message::Text("{\"type\":\"pong\"}".into()));
+                    continue;
+                }
+
                 let is_sign = json["action"] == "sign" || json["type"] == "sign";
                 if is_sign && json["challenge"].is_string() {
                     let challenge = json["challenge"].as_str().unwrap().to_string();
                     println!("Triggering Signature for Challenge: {}", challenge);
-                    println!("DEBUG: Spawning background task to handle sign challenge...");
+                    println!("DEBUG: Signing with Ed25519 (OIDC/VP compliant)");
 
                     let app_handle = app_handle.clone();
                     tokio::spawn(async move {
@@ -536,25 +576,16 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                             let _ = window.set_focus();
                         }
 
-                        {
-                            let state = app.state::<WsState>();
-                            let pipe = state.challenge_channel.lock().unwrap();
-                            if let Some(channel) = pipe.as_ref() {
-                                let msg = serde_json::json!({
-                                    "__type__": "sign",
-                                    "challenge": challenge
-                                });
-                                let _ = channel.send(msg.to_string());
-                                println!("!!! SUCCESS: CHALLENGE PIPED TO REACT BACKGROUND TASK !!!");
-                            } else {
-                                println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
-                            }
-                        }
+                        pipe_or_queue(&app, serde_json::json!({
+                            "__type__": "sign",
+                            "challenge": challenge
+                        }));
                     });
                 } else if json["type"] == "sign_event" || json["action"] == "sign_event" {
                     if json["event"].is_object() {
                         let event = json["event"].clone();
                         println!("Triggering Nostr Event signing");
+                        println!("DEBUG: Signing Nostr event with Ed25519 (vault key — deviates from NIP-01 secp256k1 standard)");
 
                         let app_handle = app_handle.clone();
                         tokio::spawn(async move {
@@ -566,29 +597,28 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                                 let _ = window.set_focus();
                             }
 
-                            {
-                                let state = app.state::<WsState>();
-                                let pipe = state.challenge_channel.lock().unwrap();
-                                if let Some(channel) = pipe.as_ref() {
-                                    let msg = serde_json::json!({
-                                        "__type__": "sign_event",
-                                        "event": event
-                                    });
-                                    let _ = channel.send(msg.to_string());
-                                    println!("!!! NOSTR EVENT SENT TO REACT FOR SIGNING !!!");
-                                } else {
-                                    println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
-                                }
-                            }
+                            pipe_or_queue(&app, serde_json::json!({
+                                "__type__": "sign_event",
+                                "event": event
+                            }));
                         });
                     } else {
                         println!("DEBUG: Received sign_event without event object: {}", text);
                     }
                 } else if json["type"] == "sign_credential" {
-                    if json["credential"].is_object() && json["holder_did"].is_string() {
+                    if json["credential"].is_object() {
                         let credential = json["credential"].clone();
-                        let holder_did = json["holder_did"].as_str().unwrap().to_string();
+                        let holder_did = if json["holder_did"].is_string() {
+                            json["holder_did"].as_str().unwrap().to_string()
+                        } else {
+                            let did = vault::load_identity(&app_handle)
+                                .map(|s| s.did)
+                                .unwrap_or_else(|_| "did:vault:unknown".to_string());
+                            println!("DEBUG: No holder_did in message, defaulting to vault DID: {}", did);
+                            did
+                        };
                         println!("Triggering Credential signing for holder: {}", holder_did);
+                        println!("DEBUG: Signing VC with Ed25519 (issuer key)");
 
                         let app_handle = app_handle.clone();
                         tokio::spawn(async move {
@@ -600,24 +630,14 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                                 let _ = window.set_focus();
                             }
 
-                            {
-                                let state = app.state::<WsState>();
-                                let pipe = state.challenge_channel.lock().unwrap();
-                                if let Some(channel) = pipe.as_ref() {
-                                    let msg = serde_json::json!({
-                                        "__type__": "sign_credential",
-                                        "credential": credential,
-                                        "holder_did": holder_did
-                                    });
-                                    let _ = channel.send(msg.to_string());
-                                    println!("!!! CREDENTIAL SENT TO REACT FOR SIGNING !!!");
-                                } else {
-                                    println!("!!! CRITICAL ERROR: REACT HAS NOT REGISTERED THE PIPE !!!");
-                                }
-                            }
+                            pipe_or_queue(&app, serde_json::json!({
+                                "__type__": "sign_credential",
+                                "credential": credential,
+                                "holder_did": holder_did
+                            }));
                         });
                     } else {
-                        println!("DEBUG: Received sign_credential without credential object or holder_did: {}", text);
+                        println!("DEBUG: Received sign_credential without credential object: {}", text);
                     }
                 } else {
                     println!("DEBUG: Received unknown JSON structure: {}", text);

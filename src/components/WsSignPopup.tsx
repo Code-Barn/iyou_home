@@ -6,6 +6,24 @@ type SignRequest =
   | { type: 'sign_event'; event: any }
   | { type: 'sign_credential'; credential: any; holder_did: string };
 
+function getCredentialTitle(credential: any): string {
+  const rawTypes = credential?.type;
+  let types: string[] = [];
+  if (Array.isArray(rawTypes)) {
+    types = rawTypes;
+  } else if (typeof rawTypes === 'string') {
+    types = [rawTypes];
+  } else {
+    return 'Credential';
+  }
+  const specific = types.filter(t => t !== 'VerifiableCredential');
+  if (specific.length === 0) return 'Credential';
+  const name = specific[0]
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+  return name;
+}
+
 export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequest | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -89,7 +107,7 @@ export default function WsSignPopup() {
       }}>
         <h2 style={{marginTop: 0}}>
           {request.type === 'sign_event' ? 'Nostr Event Signing Request'
-            : request.type === 'sign_credential' ? 'Credential Signing Request'
+            : request.type === 'sign_credential' ? `${getCredentialTitle(request.credential)} Signing Request`
             : 'Signature Request'}
         </h2>
 
