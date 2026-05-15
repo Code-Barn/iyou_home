@@ -43,12 +43,14 @@ function ServiceSwitchPanel() {
         ),
     });
     const [autoStart, setAutoStart] = useState<Record<string, boolean>>({});
-    const [notification, setNotification] = useState<string | null>(null);
 
     useEffect(() => {
         const loadSettings = async () => {
             try {
-                const settings = await invoke<Record<string, boolean>>("get_auto_start_settings");
+                const [settings, statuses] = await Promise.all([
+                    invoke<Record<string, boolean>>("get_auto_start_settings"),
+                    invoke<Record<string, ServiceStatus>>("get_service_statuses"),
+                ]);
                 setAutoStart((prev) => {
                     const merged = { ...prev };
                     for (const svc of SERVICES) {
@@ -60,8 +62,9 @@ function ServiceSwitchPanel() {
                     }
                     return merged;
                 });
+                setServiceStatus((prev) => ({ ...prev, ...statuses }));
             } catch (error) {
-                console.error("Failed to load auto-start settings:", error);
+                console.error("Failed to load startup settings:", error);
             }
         };
         loadSettings();
@@ -94,19 +97,6 @@ function ServiceSwitchPanel() {
     return (
         <>
             <h2>Service Switch Panel</h2>
-            {notification && (
-                <div
-                    className="vault-badge"
-                    style={{
-                        marginBottom: "1rem",
-                        backgroundColor: "#fff3cd",
-                        color: "#856404",
-                        borderColor: "#ffeeba",
-                    }}
-                >
-                    {notification}
-                </div>
-            )}
             <div className="service-list">
                 {SERVICES.map((svc) => (
                     <div key={svc.name} className="service-item">

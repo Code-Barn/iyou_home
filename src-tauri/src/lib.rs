@@ -159,6 +159,7 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
         _ => return Ok(()),
     };
 
+    state.services.lock().unwrap().insert(name.to_string(), ServiceStatus::Running);
     state.shutdown_signals.lock().unwrap().insert(name.to_string(), tx);
     Ok(())
 }
@@ -168,6 +169,12 @@ fn stop_service_internal(name: &str, state: &ServiceState) {
     if let Some(tx) = shutdown_signals.remove(name) {
         let _ = tx.send(true);
     }
+    state.services.lock().unwrap().insert(name.to_string(), ServiceStatus::Stopped);
+}
+
+#[tauri::command]
+fn get_service_statuses(state: State<'_, ServiceState>) -> HashMap<String, ServiceStatus> {
+    state.services.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -824,6 +831,7 @@ pub fn run() {
             register_challenge_pipe,
             get_auto_start_settings,
             set_auto_start,
+            get_service_statuses,
         ]);
 
     builder
