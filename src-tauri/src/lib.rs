@@ -1,25 +1,22 @@
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 mod vault;
+mod bridge;
 mod blossom;
 mod nostr_relay;
 mod prosody;
 
-// Define the service status enum
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceStatus {
@@ -28,7 +25,6 @@ pub enum ServiceStatus {
     Starting,
 }
 
-// Create a state management struct
 pub struct ServiceState {
     pub services: Mutex<HashMap<String, ServiceStatus>>,
     pub active_did: Mutex<Option<String>>,
@@ -36,7 +32,6 @@ pub struct ServiceState {
     pub auto_start_settings: Mutex<HashMap<String, bool>>,
 }
 
-// State for WS requests
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
@@ -53,7 +48,38 @@ impl Default for WsState {
     }
 }
 
-// ... existing commands ...
+// ---------- signing helpers ----------
+
+fn sign_challenge_with_keypair(
+    signing_key: &ed25519_dalek::SigningKey,
+    did: &str,
+    challenge: &str,
+) -> Result<String, String> {
+    let presentation = serde_json::json!({
+        "@context": ["https://www.w3.org/2018/credentials/v1"],
+        "type": ["VerifiablePresentation"],
+        "holder": did,
+        "challenge": challenge,
+        "verifiableCredential": []
+    });
+    let vp_json = presentation.to_string();
+    let key_b58 = bs58::encode(signing_key.to_bytes()).into_string();
+    did_rust::issue_vc(&vp_json, did, &key_b58)
+        .map_err(|e| format!("Failed to sign presentation: {}", e))
+}
+
+fn resolve_profile_keypair(
+    app: &AppHandle,
+    profile_id: Option<String>,
+) -> Result<(ed25519_dalek::SigningKey, String), String> {
+    let vault = vault::load_vault(app)?;
+    let pid = profile_id.unwrap_or_default();
+    let kp = vault::get_profile_keypair(&vault, &pid)?;
+    Ok((kp.signing_key, kp.did))
+}
+
+// ---------- existing commands ----------
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -77,7 +103,6 @@ async fn toggle_service(
     Ok(status)
 }
 
-// Core logic separated for testability
 fn toggle_service_logic(
     name: String,
     action: String,
@@ -100,7 +125,11 @@ fn toggle_service_logic(
     Ok(status.clone())
 }
 
-async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceState) -> Result<(), String> {
+async fn start_service_internal(
+    name: &str,
+    app: &AppHandle,
+    state: &ServiceState,
+) -> Result<(), String> {
     {
         let shutdown_signals = state.shutdown_signals.lock().unwrap();
         if shutdown_signals.contains_key(name) {
@@ -110,12 +139,16 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
 
     let tx = match name {
         "Nostr" => {
-            let app_data = app.path().app_local_data_dir()
+            let app_data = app
+                .path()
+                .app_local_data_dir()
                 .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-            let store = vault::load_identity(app)?;
-            let pubkey = nostr_relay::derive_vault_pubkey(&store)?;
+            let vault = vault::load_vault(app)?;
+            let kp = vault::get_profile_keypair(&vault, "")?;
+            let pubkey = nostr_relay::derive_vault_pubkey_from_verifying(&kp.verifying_key)?;
             let db_path = app_data.join("nostr_events.db");
-            let listener = TcpListener::bind("127.0.0.1:9003").await
+            let listener = TcpListener::bind("127.0.0.1:9003")
+                .await
                 .map_err(|e| format!("Failed to bind Nostr relay: {}", e))?;
             let (tx, rx) = watch::channel(false);
             tauri::async_runtime::spawn(async move {
@@ -124,7 +157,9 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
             tx
         }
         "Blossom" => {
-            let app_data = app.path().app_local_data_dir()
+            let app_data = app
+                .path()
+                .app_local_data_dir()
                 .map_err(|e| format!("Failed to get app data dir: {}", e))?;
             let blobs_dir = app_data.join("blobs");
             std::fs::create_dir_all(&blobs_dir)
@@ -136,7 +171,9 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
             tx
         }
         "Chat" => {
-            let app_data = app.path().app_local_data_dir()
+            let app_data = app
+                .path()
+                .app_local_data_dir()
                 .map_err(|e| format!("Failed to get app data dir: {}", e))?;
             let pass_file = app_data.join("xmpp_password.txt");
             let password = if pass_file.exists() {
@@ -148,7 +185,8 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
                     .map_err(|e| format!("Failed to save password: {}", e))?;
                 pwd
             };
-            let listener = TcpListener::bind("127.0.0.1:5222").await
+            let listener = TcpListener::bind("127.0.0.1:5222")
+                .await
                 .map_err(|e| format!("Failed to bind XMPP: {}", e))?;
             let (tx, rx) = watch::channel(false);
             tauri::async_runtime::spawn(async move {
@@ -159,8 +197,16 @@ async fn start_service_internal(name: &str, app: &AppHandle, state: &ServiceStat
         _ => return Ok(()),
     };
 
-    state.services.lock().unwrap().insert(name.to_string(), ServiceStatus::Running);
-    state.shutdown_signals.lock().unwrap().insert(name.to_string(), tx);
+    state
+        .services
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), ServiceStatus::Running);
+    state
+        .shutdown_signals
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), tx);
     Ok(())
 }
 
@@ -169,7 +215,11 @@ fn stop_service_internal(name: &str, state: &ServiceState) {
     if let Some(tx) = shutdown_signals.remove(name) {
         let _ = tx.send(true);
     }
-    state.services.lock().unwrap().insert(name.to_string(), ServiceStatus::Stopped);
+    state
+        .services
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), ServiceStatus::Stopped);
 }
 
 #[tauri::command]
@@ -179,18 +229,13 @@ fn get_service_statuses(state: State<'_, ServiceState>) -> HashMap<String, Servi
 
 #[tauri::command]
 fn generate_did(app: AppHandle, state: State<'_, ServiceState>) -> Result<String, String> {
-    let generated_json_str =
-        did_rust::generate_did("key").map_err(|e| format!("Generation failed: {}", e))?;
-    let parsed: serde_json::Value = serde_json::from_str(&generated_json_str)
-        .map_err(|_| "Failed to parse generated DID".to_string())?;
-    let did = parsed["did"].as_str().unwrap_or("").to_string();
-    let priv_key = parsed["private_key_base58"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let vault = if let Ok(v) = vault::load_vault(&app) {
+        v
+    } else {
+        vault::create_vault(&app)?
+    };
 
-    vault::save_identity(&app, did.clone(), priv_key)?;
-
+    let did = vault.profiles[0].did.clone();
     let mut active = state.active_did.lock().unwrap();
     *active = Some(did.clone());
     Ok(did)
@@ -203,9 +248,44 @@ fn import_did(
     private_key: String,
     state: State<'_, ServiceState>,
 ) -> Result<(), String> {
-    vault::save_identity(&app, did.clone(), private_key)?;
-    let mut active = state.active_did.lock().unwrap();
-    *active = Some(did);
+    let mut vault = if let Ok(v) = vault::load_vault(&app) {
+        v
+    } else {
+        let seed = bs58::decode(&private_key)
+            .into_vec()
+            .map_err(|_| "Invalid base58 private key".to_string())?;
+        let mut arr = [0u8; 32];
+        if seed.len() != 32 {
+            return Err("Private key must be 32 bytes".to_string());
+        }
+        arr.copy_from_slice(&seed);
+        let root_seed_base58 = bs58::encode(arr).into_string();
+        let kp = vault::derive_deterministic_keypair(&arr, 0);
+        vault::VaultStore {
+            root_seed_base58,
+            profiles: vec![vault::Profile {
+                profile_id: "primary".to_string(),
+                profile_name: "Primary Identity".to_string(),
+                derivation_index: 0,
+                did: kp.did,
+            }],
+        }
+    };
+
+    if vault::get_profile_by_id(&vault, &did).is_none() {
+        let profile = vault::add_profile(
+            &mut vault,
+            format!("imported_{}", did.chars().take(8).collect::<String>()),
+            "Imported Identity".to_string(),
+        )?;
+        vault::save_vault(&app, &vault)?;
+        let mut active = state.active_did.lock().unwrap();
+        *active = Some(profile.did);
+    } else {
+        let mut active = state.active_did.lock().unwrap();
+        *active = Some(did);
+    }
+
     Ok(())
 }
 
@@ -217,12 +297,38 @@ fn get_active_did(app: AppHandle, state: State<'_, ServiceState>) -> Option<Stri
             return Some(did);
         }
     }
-    if let Ok(store) = vault::load_identity(&app) {
-        let mut active = state.active_did.lock().unwrap();
-        *active = Some(store.did.clone());
-        return Some(store.did);
+    if let Ok(vault) = vault::load_vault(&app) {
+        if let Some(profile) = vault.profiles.first() {
+            let mut active = state.active_did.lock().unwrap();
+            *active = Some(profile.did.clone());
+            return Some(profile.did.clone());
+        }
     }
     None
+}
+
+#[tauri::command]
+fn list_profiles(app: AppHandle) -> Result<Vec<vault::Profile>, String> {
+    let vault = vault::load_vault(&app)?;
+    Ok(vault::list_profiles(&vault))
+}
+
+#[tauri::command]
+fn add_profile(
+    app: AppHandle,
+    profile_name: String,
+    state: State<'_, ServiceState>,
+) -> Result<vault::Profile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let profile_id = profile_name
+        .to_lowercase()
+        .replace(char::is_whitespace, "_")
+        .replace(|c: char| !c.is_alphanumeric() && c != '_', "");
+    let profile = vault::add_profile(&mut vault, profile_id, profile_name)?;
+    vault::save_vault(&app, &vault)?;
+    let mut active = state.active_did.lock().unwrap();
+    *active = Some(profile.did.clone());
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -230,28 +336,13 @@ fn sign_auth_challenge(
     app: AppHandle,
     challenge: String,
     did_id: String,
+    profile_id: Option<String>,
 ) -> Result<String, String> {
-    let store = vault::load_identity(&app)?;
-    if store.did != did_id {
+    let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
+    if !did_id.is_empty() && did != did_id {
         return Err("Requested DID does not match the active Vault identity".to_string());
     }
-    sign_auth_challenge_logic(&store, &challenge)
-}
-
-fn sign_auth_challenge_logic(
-    store: &vault::IdentityStore,
-    challenge: &str,
-) -> Result<String, String> {
-    let presentation = serde_json::json!({
-        "@context": ["https://www.w3.org/2018/credentials/v1"],
-        "type": ["VerifiablePresentation"],
-        "holder": store.did,
-        "challenge": challenge,
-        "verifiableCredential": []
-    });
-    let vp_json = presentation.to_string();
-    did_rust::issue_vc(&vp_json, &store.did, &store.private_key_base58)
-        .map_err(|e| format!("Failed to sign presentation: {}", e))
+    sign_challenge_with_keypair(&signing_key, &did, &challenge)
 }
 
 #[tauri::command]
@@ -270,13 +361,21 @@ fn show_main_window(app: AppHandle) {
 
 #[tauri::command]
 fn register_challenge_pipe(channel: tauri::ipc::Channel<String>, state: State<'_, WsState>) {
-    let pending = state.pending_messages.lock().unwrap().drain(..).collect::<Vec<_>>();
+    let pending = state
+        .pending_messages
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect::<Vec<_>>();
     *state.challenge_channel.lock().unwrap() = Some(channel.clone());
     let count = pending.len();
     for msg in &pending {
         let _ = channel.send(msg.clone());
     }
-    println!("DEBUG: Challenge channel registered by React (flushed {} queued)", count);
+    println!(
+        "DEBUG: Challenge channel registered by React (flushed {} queued)",
+        count
+    );
 }
 
 #[tauri::command]
@@ -286,6 +385,7 @@ async fn submit_ws_response(
     approved: bool,
     app: AppHandle,
     ws_state: State<'_, WsState>,
+    profile_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
         let guard = ws_state.response_sender.lock().unwrap();
@@ -298,8 +398,8 @@ async fn submit_ws_response(
         return Ok(());
     }
 
-    let store = vault::load_identity(&app)?;
-    let signed_vp = sign_auth_challenge_logic(&store, &challenge)?;
+    let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
+    let signed_vp = sign_challenge_with_keypair(&signing_key, &did, &challenge)?;
     let vp_value: serde_json::Value = serde_json::from_str(&signed_vp)
         .map_err(|e| format!("Failed to parse signed VP as JSON: {}", e))?;
 
@@ -319,6 +419,7 @@ async fn submit_ws_event_response(
     approved: bool,
     app: AppHandle,
     ws_state: State<'_, WsState>,
+    profile_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
         let guard = ws_state.response_sender.lock().unwrap();
@@ -331,12 +432,12 @@ async fn submit_ws_event_response(
         return Ok(());
     }
 
-    let store = vault::load_identity(&app)?;
+    let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
 
     let mut event: serde_json::Value = serde_json::from_str(&event_json)
         .map_err(|e| format!("Failed to parse event JSON: {}", e))?;
 
-    let pubkey = event["pubkey"].as_str().unwrap_or("");
+    let pubkey = event["pubkey"].as_str().unwrap_or(&did);
     let created_at = event["created_at"].as_i64().unwrap_or(0);
     let kind = event["kind"].as_i64().unwrap_or(1);
     let tags = event.get("tags").cloned().unwrap_or(serde_json::json!([]));
@@ -352,17 +453,6 @@ async fn submit_ws_event_response(
     let id_bytes = hasher.finalize();
     let id_b64 = base64.encode(id_bytes);
 
-    let key_bytes = bs58::decode(&store.private_key_base58)
-        .into_vec()
-        .map_err(|_| "Invalid base58 private key".to_string())?;
-
-    if key_bytes.len() != 32 {
-        return Err("Invalid private key length".to_string());
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&key_bytes);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
     let signature = signing_key.sign(&id_bytes);
     let sig_bytes = signature.to_bytes();
     let sig_b64 = base64.encode(sig_bytes);
@@ -387,6 +477,7 @@ async fn submit_ws_credential_response(
     approved: bool,
     app: AppHandle,
     ws_state: State<'_, WsState>,
+    profile_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
         let guard = ws_state.response_sender.lock().unwrap();
@@ -399,7 +490,7 @@ async fn submit_ws_credential_response(
         return Ok(());
     }
 
-    let store = vault::load_identity(&app)?;
+    let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
 
     let credential_value: serde_json::Value = serde_json::from_str(&credential_json)
         .map_err(|e| format!("Failed to parse credential JSON: {}", e))?;
@@ -412,8 +503,10 @@ async fn submit_ws_credential_response(
     });
 
     let envelope_str = credential_envelope.to_string();
-    let signed_vc = did_rust::issue_vc(&envelope_str, &holder_did, &store.private_key_base58)
-        .map_err(|e| format!("Failed to sign credential: {}", e))?;
+    let key_b58 = bs58::encode(signing_key.to_bytes()).into_string();
+    let signed_vc =
+        did_rust::issue_vc(&envelope_str, &did, &key_b58)
+            .map_err(|e| format!("Failed to sign credential: {}", e))?;
 
     let vc_value: serde_json::Value = serde_json::from_str(&signed_vc)
         .map_err(|e| format!("Failed to parse signed VC as JSON: {}", e))?;
@@ -428,268 +521,12 @@ async fn submit_ws_credential_response(
     Ok(())
 }
 
-fn is_websocket_upgrade_request(data: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(data);
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() || !lines[0].starts_with("GET") {
-        return false;
-    }
-    let lowercase_headers: Vec<String> = lines.iter().map(|l| l.trim().to_lowercase()).collect();
-
-    let has_upgrade = lowercase_headers.iter().any(|l| l.starts_with("upgrade:"));
-    let has_connection_upgrade = lowercase_headers
-        .iter()
-        .any(|l| l.starts_with("connection:") && l.contains("upgrade"));
-    let has_ws_key = lowercase_headers
-        .iter()
-        .any(|l| l.starts_with("sec-websocket-key:"));
-
-    has_upgrade && has_connection_upgrade && has_ws_key
-}
-
-async fn handle_connection(stream: TcpStream, app_handle: AppHandle) {
-    let mut peek_buf = [0u8; 1024];
-    let n = match stream.peek(&mut peek_buf).await {
-        Ok(0) | Err(_) => return,
-        Ok(n) => n,
-    };
-
-    let data = &peek_buf[..n];
-
-    // First-Match-Wins dispatcher
-    if data.starts_with(b"OPTIONS") {
-        handle_options_preflight(stream).await;
-    } else if is_websocket_upgrade_request(data) {
-        handle_ws_connection(stream, app_handle).await;
-    }
-    // else: silently drop non-matching connections (non-GET, non-WS GET, etc.)
-}
-
-async fn handle_options_preflight(mut stream: TcpStream) {
-    println!("OPTIONS pre-flight received");
-    let response = b"HTTP/1.1 200 OK\r\n\
-        Access-Control-Allow-Origin: *\r\n\
-        Access-Control-Allow-Private-Network: true\r\n\
-        Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS\r\n\
-        Access-Control-Allow-Headers: *\r\n\
-        Content-Length: 0\r\n\
-        Connection: keep-alive\r\n\r\n";
-    let _ = stream.write_all(response).await;
-}
-
-fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
-    let state = app.state::<WsState>();
-    let serialized = msg_json.to_string();
-    let pipe = state.challenge_channel.lock().unwrap();
-    if let Some(channel) = pipe.as_ref() {
-        let _ = channel.send(serialized);
-        println!("!!! CHALLENGE PIPED TO REACT !!!");
-    } else {
-        state.pending_messages.lock().unwrap().push(serialized);
-        println!("!!! CHALLENGE QUEUED — React pipe not registered yet !!!");
-    }
-}
-
-async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
-    let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
-        println!("DEBUG: Handshake callback triggered");
-        println!("DEBUG: Request method: {:?}", req.method());
-        res.headers_mut()
-            .insert("Access-Control-Allow-Origin",
-                tauri::http::HeaderValue::from_static("*"));
-        res.headers_mut()
-            .insert("Access-Control-Allow-Private-Network",
-                tauri::http::HeaderValue::from_static("true"));
-        Ok(res)
-    };
-
-    let ws_stream = match accept_hdr_async(stream, cors_callback).await {
-        Ok(ws) => {
-            println!("DEBUG: WebSocket Upgrade Complete");
-            ws
-        }
-        Err(e) => {
-            eprintln!("WebSocket handshake failed: {}", e);
-            return;
-        }
-    };
-
-    let (response_tx, response_rx) = mpsc::unbounded_channel::<Message>();
-
-    {
-        let ws_state = app_handle.state::<WsState>();
-        *ws_state.response_sender.lock().unwrap() = Some(response_tx.clone());
-    }
-
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-    let app_clone = app_handle.clone();
-    tokio::spawn(async move {
-        println!("DEBUG: Forwarder Task started");
-        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
-        tokio::pin!(response_rx);
-        loop {
-            tokio::select! {
-                msg = response_rx.recv() => {
-                    let msg = match msg {
-                        Some(msg) => msg,
-                        None => {
-                            println!("DEBUG: Forwarder exit — response_rx channel closed (all senders dropped)");
-                            break;
-                        }
-                    };
-                    println!("Sending response over WebSocket: {:?}", msg);
-                    if let Err(e) = ws_sender.send(msg).await {
-                        eprintln!("DEBUG: Forwarder exit — ws_sender.send failed: {}", e);
-                        break;
-                    }
-                    if let Err(e) = ws_sender.flush().await {
-                        eprintln!("DEBUG: Forwarder exit — ws_sender.flush failed: {}", e);
-                        break;
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
-                        eprintln!("DEBUG: Forwarder exit — heartbeat ping failed: {}", e);
-                        break;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let ws_state = app_clone.state::<WsState>();
-        *ws_state.response_sender.lock().unwrap() = None;
-        println!("DEBUG: Forwarder Task Exited — response_sender cleared");
-    });
-
-    while let Some(Ok(msg)) = ws_receiver.next().await {
-        if msg.is_text() {
-            let text = msg.to_text().unwrap().to_string();
-            println!("Received Message: {:?}", text);
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                println!("DEBUG: Received JSON: {}", json);
-
-                // Ping/Pong smoke test — immediate response via response_tx
-                if json["type"] == "ping" {
-                    println!("DEBUG: Ping received, sending pong via response_tx");
-                    let _ = response_tx.send(Message::Text("{\"type\":\"pong\"}".into()));
-                    continue;
-                }
-
-                let is_sign = json["action"] == "sign" || json["type"] == "sign";
-                if is_sign && json["challenge"].is_string() {
-                    let challenge = json["challenge"].as_str().unwrap().to_string();
-                    println!("Triggering Signature for Challenge: {}", challenge);
-                    println!("DEBUG: Signing with Ed25519 (OIDC/VP compliant)");
-
-                    let app_handle = app_handle.clone();
-                    tokio::spawn(async move {
-                        let app = app_handle;
-
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-
-                        pipe_or_queue(&app, serde_json::json!({
-                            "__type__": "sign",
-                            "challenge": challenge
-                        }));
-                    });
-                } else if json["type"] == "sign_event" || json["action"] == "sign_event" {
-                    if json["event"].is_object() {
-                        let event = json["event"].clone();
-                        println!("Triggering Nostr Event signing");
-                        println!("DEBUG: Signing Nostr event with Ed25519 (vault key — deviates from NIP-01 secp256k1 standard)");
-
-                        let app_handle = app_handle.clone();
-                        tokio::spawn(async move {
-                            let app = app_handle;
-
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.unminimize();
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-
-                            pipe_or_queue(&app, serde_json::json!({
-                                "__type__": "sign_event",
-                                "event": event
-                            }));
-                        });
-                    } else {
-                        println!("DEBUG: Received sign_event without event object: {}", text);
-                    }
-                } else if json["type"] == "sign_credential" {
-                    if json["credential"].is_object() {
-                        let credential = json["credential"].clone();
-                        let holder_did = if json["holder_did"].is_string() {
-                            json["holder_did"].as_str().unwrap().to_string()
-                        } else {
-                            let did = vault::load_identity(&app_handle)
-                                .map(|s| s.did)
-                                .unwrap_or_else(|_| "did:vault:unknown".to_string());
-                            println!("DEBUG: No holder_did in message, defaulting to vault DID: {}", did);
-                            did
-                        };
-                        println!("Triggering Credential signing for holder: {}", holder_did);
-                        println!("DEBUG: Signing VC with Ed25519 (issuer key)");
-
-                        let app_handle = app_handle.clone();
-                        tokio::spawn(async move {
-                            let app = app_handle;
-
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.unminimize();
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-
-                            pipe_or_queue(&app, serde_json::json!({
-                                "__type__": "sign_credential",
-                                "credential": credential,
-                                "holder_did": holder_did
-                            }));
-                        });
-                    } else {
-                        println!("DEBUG: Received sign_credential without credential object: {}", text);
-                    }
-                } else {
-                    println!("DEBUG: Received unknown JSON structure: {}", text);
-                }
-            }
-        } else if msg.is_pong() {
-            println!("Heartbeat Pong received");
-        }
-    }
-    println!("DEBUG: WebSocket Read Loop Exited");
-
-    let ws_state = app_handle.state::<WsState>();
-    *ws_state.response_sender.lock().unwrap() = None;
-}
-
-async fn listen_on(addrs: &str, app: AppHandle) {
-    let listener = TcpListener::bind(addrs).await.unwrap_or_else(|e| {
-        panic!("Failed to bind WS on {}: {}", addrs, e);
-    });
-    println!("WebSocket server listening on ws://{}", addrs);
-
-    while let Ok((stream, peer)) = listener.accept().await {
-        println!("TCP Connection received from: {:?}", peer);
-        let app_handle = app.clone();
-        tokio::spawn(async move {
-            handle_connection(stream, app_handle).await;
-        });
-    }
-}
-
-async fn start_ws_server(app: AppHandle) {
-    listen_on("127.0.0.1:9001", app).await;
-}
+// ---------- auto-start settings ----------
 
 fn auto_start_path(app: &AppHandle) -> PathBuf {
-    let mut path = app.path().app_local_data_dir()
+    let mut path = app
+        .path()
+        .app_local_data_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
     path.push("auto_start.json");
     path
@@ -725,11 +562,17 @@ fn set_auto_start(
     app: AppHandle,
     state: State<'_, ServiceState>,
 ) -> Result<(), String> {
-    state.auto_start_settings.lock().unwrap().insert(name.clone(), enabled);
+    state
+        .auto_start_settings
+        .lock()
+        .unwrap()
+        .insert(name.clone(), enabled);
     let settings = state.auto_start_settings.lock().unwrap().clone();
     save_auto_start_settings(&app, &settings);
     Ok(())
 }
+
+// ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -751,7 +594,6 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            // Load auto-start settings and start enabled services
             let auto_start = load_auto_start_settings(&app_handle);
             {
                 let state = app_handle.state::<ServiceState>();
@@ -772,10 +614,11 @@ pub fn run() {
 
             let ws_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                start_ws_server(ws_handle).await;
+                bridge::start_ws_server(ws_handle).await;
             });
 
-            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let quit_i =
+                tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let show_i =
                 tauri::menu::MenuItem::with_id(app, "show", "Show Hub", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
@@ -822,6 +665,8 @@ pub fn run() {
             generate_did,
             import_did,
             get_active_did,
+            list_profiles,
+            add_profile,
             sign_auth_challenge,
             get_public_did_document,
             submit_ws_response,
@@ -860,9 +705,13 @@ pub fn run() {
         });
 }
 
+// ---------- tests ----------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::temp_dir;
+
     fn create_test_state() -> ServiceState {
         let initial_services = HashMap::new();
         ServiceState {
@@ -894,28 +743,28 @@ mod tests {
 
     #[test]
     fn test_sign_auth_challenge_logic() {
-        // Generate a real DID for testing the signing logic
-        let generated_json_str = did_rust::generate_did("key").expect("Should generate DID");
-        let parsed: serde_json::Value = serde_json::from_str(&generated_json_str).unwrap();
+        let mut path = temp_dir();
+        path.push("test_vault_sign_logic.json");
 
-        let store = vault::IdentityStore {
-            did: parsed["did"].as_str().unwrap().to_string(),
-            private_key_base58: parsed["private_key_base58"].as_str().unwrap().to_string(),
-        };
+        let vault_store =
+            vault::create_vault_at_path(&path).expect("Should create vault");
+        let kp = vault::get_profile_keypair(&vault_store, "primary")
+            .expect("Should derive keypair");
 
         let challenge = "test-challenge-uuid-1234";
-
         let vp_json_str =
-            sign_auth_challenge_logic(&store, challenge).expect("Should sign successfully");
-
+            sign_challenge_with_keypair(&kp.signing_key, &kp.did, challenge)
+                .expect("Should sign successfully");
         let vp: serde_json::Value =
             serde_json::from_str(&vp_json_str).expect("Should be valid JSON");
 
         assert_eq!(vp["challenge"].as_str().unwrap(), challenge);
-        assert_eq!(vp["holder"].as_str().unwrap(), store.did);
+        assert_eq!(vp["holder"].as_str().unwrap(), kp.did);
         assert!(
             vp.get("proof").is_some(),
             "VP should contain a proof object"
         );
+
+        let _ = std::fs::remove_file(path);
     }
 }

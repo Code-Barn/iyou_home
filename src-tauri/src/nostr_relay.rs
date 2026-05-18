@@ -336,26 +336,8 @@ fn query_events(
     .collect()
 }
 
-fn get_vault_pubkey_bytes(
-    private_key_base58: &str,
-) -> Result<String, String> {
-    let key_bytes = bs58::decode(private_key_base58)
-        .into_vec()
-        .map_err(|_| "Invalid base58 private key".to_string())?;
-
-    if key_bytes.len() != 32 {
-        return Err("Invalid private key length".to_string());
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&key_bytes);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
-    let pubkey_bytes = signing_key.verifying_key().to_bytes();
-    Ok(base64.encode(pubkey_bytes))
-}
-
-/// Derive the vault's base64-encoded public key from the stored identity.
+/// Derive the vault's base64-encoded public key from a VerifyingKey.
 /// Exposed for use by the Tauri command layer.
-pub fn derive_vault_pubkey(store: &crate::vault::IdentityStore) -> Result<String, String> {
-    get_vault_pubkey_bytes(&store.private_key_base58)
+pub fn derive_vault_pubkey_from_verifying(vk: &VerifyingKey) -> Result<String, String> {
+    Ok(base64.encode(vk.to_bytes()))
 }

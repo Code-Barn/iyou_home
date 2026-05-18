@@ -2,9 +2,9 @@ import { useState, useEffect } from 'react';
 import { invoke, Channel } from '@tauri-apps/api/core';
 
 type SignRequest =
-  | { type: 'sign'; challenge: string }
-  | { type: 'sign_event'; event: any }
-  | { type: 'sign_credential'; credential: any; holder_did: string };
+  | { type: 'sign'; challenge: string; profile_id?: string }
+  | { type: 'sign_event'; event: any; profile_id?: string }
+  | { type: 'sign_credential'; credential: any; holder_did: string; profile_id?: string };
 
 function getCredentialTitle(credential: any): string {
   const rawTypes = credential?.type;
@@ -35,14 +35,15 @@ export default function WsSignPopup() {
       console.log("REACT: Received message via direct channel pipe:", data);
       try {
         const parsed = JSON.parse(data);
+        const profile_id = parsed.profile_id || undefined;
         if (parsed.__type__ === 'sign_event') {
-          setRequest({ type: 'sign_event', event: parsed.event });
+          setRequest({ type: 'sign_event', event: parsed.event, profile_id });
         } else if (parsed.__type__ === 'sign_credential') {
-          setRequest({ type: 'sign_credential', credential: parsed.credential, holder_did: parsed.holder_did });
+          setRequest({ type: 'sign_credential', credential: parsed.credential, holder_did: parsed.holder_did, profile_id });
         } else if (parsed.__type__ === 'sign') {
-          setRequest({ type: 'sign', challenge: parsed.challenge });
+          setRequest({ type: 'sign', challenge: parsed.challenge, profile_id });
         } else {
-          setRequest({ type: 'sign', challenge: data });
+          setRequest({ type: 'sign', challenge: data, profile_id });
         }
       } catch {
         setRequest({ type: 'sign', challenge: data });
@@ -67,21 +68,24 @@ export default function WsSignPopup() {
       if (request.type === 'sign_event') {
         await invoke('submit_ws_event_response', {
           eventJson: JSON.stringify(request.event),
-          approved
+          approved,
+          profileId: request.profile_id || null,
         });
         console.log("REACT: submit_ws_event_response succeeded");
       } else if (request.type === 'sign_credential') {
         await invoke('submit_ws_credential_response', {
           credentialJson: JSON.stringify(request.credential),
           holderDid: request.holder_did,
-          approved
+          approved,
+          profileId: request.profile_id || null,
         });
         console.log("REACT: submit_ws_credential_response succeeded");
       } else {
         await invoke('submit_ws_response', {
           id: '',
           challenge: request.challenge,
-          approved
+          approved,
+          profileId: request.profile_id || null,
         });
         console.log("REACT: submit_ws_response succeeded");
       }
