@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Vault / keystore / seed artifacts
+*.vault
+*.key
+*.p12
+*.jks
+test_seed*.json
