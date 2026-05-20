@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -53,10 +53,7 @@ fn ed25519_multibase(pubkey: &[u8]) -> String {
     format!("z{}", bs58::encode(multicodec).into_string())
 }
 
-pub fn derive_deterministic_keypair(
-    root_seed: &[u8],
-    derivation_index: u32,
-) -> DerivedKeypair {
+pub fn derive_deterministic_keypair(root_seed: &[u8], derivation_index: u32) -> DerivedKeypair {
     let mut hasher = Sha256::new();
     hasher.update(root_seed);
     hasher.update(&derivation_index.to_le_bytes());
@@ -119,16 +116,13 @@ pub fn load_vault_from_path(path: &Path) -> Result<VaultStore, String> {
         return Err("No vault found".to_string());
     }
 
-    let encrypted =
-        fs::read_to_string(path).map_err(|e| format!("Failed to read vault: {}", e))?;
+    let encrypted = fs::read_to_string(path).map_err(|e| format!("Failed to read vault: {}", e))?;
     let decoded = base64
         .decode(encrypted.trim())
         .map_err(|e| format!("Base64 decode error: {}", e))?;
-    let json =
-        String::from_utf8(decoded).map_err(|e| format!("UTF-8 error: {}", e))?;
+    let json = String::from_utf8(decoded).map_err(|e| format!("UTF-8 error: {}", e))?;
 
-    serde_json::from_str::<VaultStore>(&json)
-        .map_err(|e| format!("Failed to parse vault: {}", e))
+    serde_json::from_str::<VaultStore>(&json).map_err(|e| format!("Failed to parse vault: {}", e))
 }
 
 fn save_vault_inner(path: &Path, vault: &VaultStore) -> Result<(), String> {
@@ -137,8 +131,7 @@ fn save_vault_inner(path: &Path, vault: &VaultStore) -> Result<(), String> {
             .map_err(|e| format!("Failed to create vault directory: {}", e))?;
     }
 
-    let json =
-        serde_json::to_string(vault).map_err(|e| format!("Serialization error: {}", e))?;
+    let json = serde_json::to_string(vault).map_err(|e| format!("Serialization error: {}", e))?;
     let encrypted = base64.encode(json);
     fs::write(path, encrypted).map_err(|e| format!("Failed to write vault: {}", e))?;
     Ok(())
@@ -148,10 +141,7 @@ pub fn save_vault(app: &AppHandle, vault: &VaultStore) -> Result<(), String> {
     save_vault_inner(&get_storage_path(app), vault)
 }
 
-pub fn get_profile_by_id<'a>(
-    vault: &'a VaultStore,
-    profile_id: &str,
-) -> Option<&'a Profile> {
+pub fn get_profile_by_id<'a>(vault: &'a VaultStore, profile_id: &str) -> Option<&'a Profile> {
     if profile_id.is_empty() {
         vault.profiles.first()
     } else {
@@ -159,10 +149,7 @@ pub fn get_profile_by_id<'a>(
     }
 }
 
-pub fn get_profile_keypair(
-    vault: &VaultStore,
-    profile_id: &str,
-) -> Result<DerivedKeypair, String> {
+pub fn get_profile_keypair(vault: &VaultStore, profile_id: &str) -> Result<DerivedKeypair, String> {
     let profile = get_profile_by_id(vault, profile_id)
         .ok_or_else(|| format!("Profile not found: '{}'", profile_id))?;
 
@@ -170,7 +157,10 @@ pub fn get_profile_keypair(
         .into_vec()
         .map_err(|_| "Invalid root seed encoding".to_string())?;
 
-    Ok(derive_deterministic_keypair(&seed, profile.derivation_index))
+    Ok(derive_deterministic_keypair(
+        &seed,
+        profile.derivation_index,
+    ))
 }
 
 pub fn add_profile(
@@ -235,10 +225,7 @@ mod tests {
         let kp1 = derive_deterministic_keypair(&seed, 42);
         let kp2 = derive_deterministic_keypair(&seed, 42);
         assert_eq!(kp1.did, kp2.did);
-        assert_eq!(
-            kp1.signing_key.to_bytes(),
-            kp2.signing_key.to_bytes()
-        );
+        assert_eq!(kp1.signing_key.to_bytes(), kp2.signing_key.to_bytes());
     }
 
     #[test]

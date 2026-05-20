@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -190,7 +190,15 @@ async fn handle_xmpp_connection(
         };
         input.push_str(&String::from_utf8_lossy(&buf[..n]));
 
-        process_xmpp_buffer_tcp(&mut input, &mut authenticated, &mut bound_jid, &mut stream, &password, &clients).await;
+        process_xmpp_buffer_tcp(
+            &mut input,
+            &mut authenticated,
+            &mut bound_jid,
+            &mut stream,
+            &password,
+            &clients,
+        )
+        .await;
     }
 
     // Clean up client
@@ -390,8 +398,7 @@ fn extract_xml_element(input: &str) -> Option<(String, &str)> {
     let tag_name = &after_lt[..tag_end];
 
     // Self-closing: <tag ... />
-    if rest.contains("/>") && !rest[..rest.find("/>")? + 2].contains(&format!("</{}", tag_name))
-    {
+    if rest.contains("/>") && !rest[..rest.find("/>")? + 2].contains(&format!("</{}", tag_name)) {
         let end = rest.find("/>")? + 2;
         return Some((input[start..start + end].to_string(), &input[start + end..]));
     }
@@ -436,7 +443,8 @@ fn extract_xml_element(input: &str) -> Option<(String, &str)> {
             } else {
                 let tag_start = abs_pos + 1;
                 let after_lt2 = &rest[tag_start..];
-                let next_tag_end = after_lt2.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
+                let next_tag_end =
+                    after_lt2.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
                 if after_lt2.get(..next_tag_end).map_or(false, |name| {
                     !name.starts_with('/') && !name.starts_with('?') && !name.starts_with('!')
                 }) {

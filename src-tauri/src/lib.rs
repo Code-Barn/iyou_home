@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,7 +15,10 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
+use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -25,14 +28,11 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
-use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
-use ed25519_dalek::Signer;
-use sha2::{Digest, Sha256};
-mod vault;
-mod bridge;
 mod blossom;
+mod bridge;
 mod nostr_relay;
 mod prosody;
+mod vault;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -521,9 +521,8 @@ async fn submit_ws_credential_response(
 
     let envelope_str = credential_envelope.to_string();
     let key_b58 = bs58::encode(signing_key.to_bytes()).into_string();
-    let signed_vc =
-        did_rust::issue_vc(&envelope_str, &did, &key_b58)
-            .map_err(|e| format!("Failed to sign credential: {}", e))?;
+    let signed_vc = did_rust::issue_vc(&envelope_str, &did, &key_b58)
+        .map_err(|e| format!("Failed to sign credential: {}", e))?;
 
     let vc_value: serde_json::Value = serde_json::from_str(&signed_vc)
         .map_err(|e| format!("Failed to parse signed VC as JSON: {}", e))?;
@@ -634,8 +633,7 @@ pub fn run() {
                 bridge::start_ws_server(ws_handle).await;
             });
 
-            let quit_i =
-                tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let show_i =
                 tauri::menu::MenuItem::with_id(app, "show", "Show Hub", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
@@ -763,15 +761,13 @@ mod tests {
         let mut path = temp_dir();
         path.push("test_vault_sign_logic.json");
 
-        let vault_store =
-            vault::create_vault_at_path(&path).expect("Should create vault");
-        let kp = vault::get_profile_keypair(&vault_store, "primary")
-            .expect("Should derive keypair");
+        let vault_store = vault::create_vault_at_path(&path).expect("Should create vault");
+        let kp =
+            vault::get_profile_keypair(&vault_store, "primary").expect("Should derive keypair");
 
         let challenge = "test-challenge-uuid-1234";
-        let vp_json_str =
-            sign_challenge_with_keypair(&kp.signing_key, &kp.did, challenge)
-                .expect("Should sign successfully");
+        let vp_json_str = sign_challenge_with_keypair(&kp.signing_key, &kp.did, challenge)
+            .expect("Should sign successfully");
         let vp: serde_json::Value =
             serde_json::from_str(&vp_json_str).expect("Should be valid JSON");
 

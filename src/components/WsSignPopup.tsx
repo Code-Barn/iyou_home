@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,29 +15,34 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect } from 'react';
-import { invoke, Channel } from '@tauri-apps/api/core';
+import { useState, useEffect } from "react";
+import { invoke, Channel } from "@tauri-apps/api/core";
 
 type SignRequest =
-  | { type: 'sign'; challenge: string; profile_id?: string }
-  | { type: 'sign_event'; event: any; profile_id?: string }
-  | { type: 'sign_credential'; credential: any; holder_did: string; profile_id?: string };
+  | { type: "sign"; challenge: string; profile_id?: string }
+  | { type: "sign_event"; event: any; profile_id?: string }
+  | {
+      type: "sign_credential";
+      credential: any;
+      holder_did: string;
+      profile_id?: string;
+    };
 
 function getCredentialTitle(credential: any): string {
   const rawTypes = credential?.type;
   let types: string[] = [];
   if (Array.isArray(rawTypes)) {
     types = rawTypes;
-  } else if (typeof rawTypes === 'string') {
+  } else if (typeof rawTypes === "string") {
     types = [rawTypes];
   } else {
-    return 'Credential';
+    return "Credential";
   }
-  const specific = types.filter(t => t !== 'VerifiableCredential');
-  if (specific.length === 0) return 'Credential';
+  const specific = types.filter((t) => t !== "VerifiableCredential");
+  if (specific.length === 0) return "Credential";
   const name = specific[0]
-    .replace(/[-_]/g, ' ')
-    .replace(/\b\w/g, c => c.toUpperCase());
+    .replace(/[-_]/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
   return name;
 }
 
@@ -53,20 +58,25 @@ export default function WsSignPopup() {
       try {
         const parsed = JSON.parse(data);
         const profile_id = parsed.profile_id || undefined;
-        if (parsed.__type__ === 'sign_event') {
-          setRequest({ type: 'sign_event', event: parsed.event, profile_id });
-        } else if (parsed.__type__ === 'sign_credential') {
-          setRequest({ type: 'sign_credential', credential: parsed.credential, holder_did: parsed.holder_did, profile_id });
-        } else if (parsed.__type__ === 'sign') {
-          setRequest({ type: 'sign', challenge: parsed.challenge, profile_id });
+        if (parsed.__type__ === "sign_event") {
+          setRequest({ type: "sign_event", event: parsed.event, profile_id });
+        } else if (parsed.__type__ === "sign_credential") {
+          setRequest({
+            type: "sign_credential",
+            credential: parsed.credential,
+            holder_did: parsed.holder_did,
+            profile_id,
+          });
+        } else if (parsed.__type__ === "sign") {
+          setRequest({ type: "sign", challenge: parsed.challenge, profile_id });
         } else {
-          setRequest({ type: 'sign', challenge: data, profile_id });
+          setRequest({ type: "sign", challenge: data, profile_id });
         }
       } catch {
-        setRequest({ type: 'sign', challenge: data });
+        setRequest({ type: "sign", challenge: data });
       }
     };
-    invoke('register_challenge_pipe', { channel });
+    invoke("register_challenge_pipe", { channel });
     console.log("REACT: Challenge channel registered with backend");
   }, []);
 
@@ -82,15 +92,15 @@ export default function WsSignPopup() {
     setIsProcessing(true);
 
     try {
-      if (request.type === 'sign_event') {
-        await invoke('submit_ws_event_response', {
+      if (request.type === "sign_event") {
+        await invoke("submit_ws_event_response", {
           eventJson: JSON.stringify(request.event),
           approved,
           profileId: request.profile_id || null,
         });
         console.log("REACT: submit_ws_event_response succeeded");
-      } else if (request.type === 'sign_credential') {
-        await invoke('submit_ws_credential_response', {
+      } else if (request.type === "sign_credential") {
+        await invoke("submit_ws_credential_response", {
           credentialJson: JSON.stringify(request.credential),
           holderDid: request.holder_did,
           approved,
@@ -98,8 +108,8 @@ export default function WsSignPopup() {
         });
         console.log("REACT: submit_ws_credential_response succeeded");
       } else {
-        await invoke('submit_ws_response', {
-          id: '',
+        await invoke("submit_ws_response", {
+          id: "",
           challenge: request.challenge,
           approved,
           profileId: request.profile_id || null,
@@ -117,68 +127,145 @@ export default function WsSignPopup() {
   if (!request) return null;
 
   return (
-    <div className="popup-overlay" style={{
-      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-      backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex',
-      alignItems: 'center', justifyContent: 'center', zIndex: 1000
-    }}>
-      <div className="popup-content" style={{
-        background: 'white', padding: '2rem', borderRadius: '12px',
-        maxWidth: '500px', width: '100%', boxShadow: '0 10px 25px rgba(0,0,0,0.2)'
-      }}>
-        <h2 style={{marginTop: 0}}>
-          {request.type === 'sign_event' ? 'Nostr Event Signing Request'
-            : request.type === 'sign_credential' ? `${getCredentialTitle(request.credential)} Signing Request`
-            : 'Signature Request'}
+    <div
+      className="popup-overlay"
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        backgroundColor: "rgba(0,0,0,0.5)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 1000,
+      }}
+    >
+      <div
+        className="popup-content"
+        style={{
+          background: "white",
+          padding: "2rem",
+          borderRadius: "12px",
+          maxWidth: "500px",
+          width: "100%",
+          boxShadow: "0 10px 25px rgba(0,0,0,0.2)",
+        }}
+      >
+        <h2 style={{ marginTop: 0 }}>
+          {request.type === "sign_event"
+            ? "Nostr Event Signing Request"
+            : request.type === "sign_credential"
+              ? `${getCredentialTitle(request.credential)} Signing Request`
+              : "Signature Request"}
         </h2>
 
-        {request.type === 'sign' && (
+        {request.type === "sign" && (
           <>
-            <p>A local application is requesting a signature from your Vault identity.</p>
-            <div style={{margin: '1.5rem 0'}}>
+            <p>
+              A local application is requesting a signature from your Vault
+              identity.
+            </p>
+            <div style={{ margin: "1.5rem 0" }}>
               <strong>Challenge:</strong>
-              <pre style={{
-                background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
-                overflowX: 'auto', fontSize: '0.85em', color: '#333'
-              }}>{request.challenge}</pre>
+              <pre
+                style={{
+                  background: "#f4f4f4",
+                  padding: "1rem",
+                  borderRadius: "6px",
+                  overflowX: "auto",
+                  fontSize: "0.85em",
+                  color: "#333",
+                }}
+              >
+                {request.challenge}
+              </pre>
             </div>
           </>
         )}
 
-        {request.type === 'sign_event' && (
+        {request.type === "sign_event" && (
           <>
-            <p>A local application is requesting to sign a Nostr event with your Vault identity.</p>
-            <div style={{margin: '1.5rem 0'}}>
+            <p>
+              A local application is requesting to sign a Nostr event with your
+              Vault identity.
+            </p>
+            <div style={{ margin: "1.5rem 0" }}>
               <strong>Event Details:</strong>
-              <pre style={{
-                background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
-                overflowX: 'auto', fontSize: '0.85em', color: '#333',
-                maxHeight: '250px', overflowY: 'auto'
-              }}>{JSON.stringify(request.event, null, 2)}</pre>
+              <pre
+                style={{
+                  background: "#f4f4f4",
+                  padding: "1rem",
+                  borderRadius: "6px",
+                  overflowX: "auto",
+                  fontSize: "0.85em",
+                  color: "#333",
+                  maxHeight: "250px",
+                  overflowY: "auto",
+                }}
+              >
+                {JSON.stringify(request.event, null, 2)}
+              </pre>
             </div>
           </>
         )}
 
-        {request.type === 'sign_credential' && (
+        {request.type === "sign_credential" && (
           <>
-            <p>A local application is requesting to issue a Verifiable Credential with your Vault identity as issuer.</p>
-            <div style={{margin: '1.5rem 0'}}>
+            <p>
+              A local application is requesting to issue a Verifiable Credential
+              with your Vault identity as issuer.
+            </p>
+            <div style={{ margin: "1.5rem 0" }}>
               <strong>Issuer DID:</strong>
-              <span style={{fontFamily: 'monospace', fontSize: '0.85em', display: 'block', marginTop: '0.3rem'}}>{request.holder_did}</span>
+              <span
+                style={{
+                  fontFamily: "monospace",
+                  fontSize: "0.85em",
+                  display: "block",
+                  marginTop: "0.3rem",
+                }}
+              >
+                {request.holder_did}
+              </span>
             </div>
-            <div style={{margin: '1rem 0'}}>
+            <div style={{ margin: "1rem 0" }}>
               <strong>Credential Body:</strong>
-              <pre style={{
-                background: '#f4f4f4', padding: '1rem', borderRadius: '6px',
-                overflowX: 'auto', fontSize: '0.85em', color: '#333',
-                maxHeight: '250px', overflowY: 'auto'
-              }}>{JSON.stringify(request.credential, null, 2)}</pre>
+              <pre
+                style={{
+                  background: "#f4f4f4",
+                  padding: "1rem",
+                  borderRadius: "6px",
+                  overflowX: "auto",
+                  fontSize: "0.85em",
+                  color: "#333",
+                  maxHeight: "250px",
+                  overflowY: "auto",
+                }}
+              >
+                {JSON.stringify(request.credential, null, 2)}
+              </pre>
             </div>
           </>
         )}
 
-        <div style={{display: 'flex', gap: '1rem', justifyContent: 'space-between', alignItems: 'center'}}>
-          <label style={{fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem'}}>
+        <div
+          style={{
+            display: "flex",
+            gap: "1rem",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <label
+            style={{
+              fontSize: "0.8rem",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.3rem",
+            }}
+          >
             <input
               type="checkbox"
               checked={autoSign}
@@ -186,20 +273,24 @@ export default function WsSignPopup() {
             />
             Auto-sign (dev)
           </label>
-          <div style={{display: 'flex', gap: '1rem'}}>
+          <div style={{ display: "flex", gap: "1rem" }}>
             <button
               onClick={() => handleResponse(false)}
               disabled={isProcessing}
-              style={{background: '#f4f4f4', color: '#333', border: '1px solid #ccc'}}
+              style={{
+                background: "#f4f4f4",
+                color: "#333",
+                border: "1px solid #ccc",
+              }}
             >
               Deny
             </button>
             <button
               onClick={() => handleResponse(true)}
               disabled={isProcessing}
-              style={{background: '#137333', color: 'white'}}
+              style={{ background: "#137333", color: "white" }}
             >
-              {isProcessing ? 'Signing...' : 'Approve & Sign'}
+              {isProcessing ? "Signing..." : "Approve & Sign"}
             </button>
           </div>
         </div>

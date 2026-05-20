@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -190,24 +190,12 @@ fn verify_and_store_event(
         .as_str()
         .ok_or("Missing pubkey")?
         .to_string();
-    let kind = event["kind"]
-        .as_i64()
-        .ok_or("Missing kind")?;
-    let created_at = event["created_at"]
-        .as_i64()
-        .ok_or("Missing created_at")?;
-    let tags = event["tags"]
-        .as_array()
-        .ok_or("Missing tags")?;
-    let content = event["content"]
-        .as_str()
-        .ok_or("Missing content")?;
-    let event_id = event["id"]
-        .as_str()
-        .ok_or("Missing id")?;
-    let sig = event["sig"]
-        .as_str()
-        .ok_or("Missing sig")?;
+    let kind = event["kind"].as_i64().ok_or("Missing kind")?;
+    let created_at = event["created_at"].as_i64().ok_or("Missing created_at")?;
+    let tags = event["tags"].as_array().ok_or("Missing tags")?;
+    let content = event["content"].as_str().ok_or("Missing content")?;
+    let event_id = event["id"].as_str().ok_or("Missing id")?;
+    let sig = event["sig"].as_str().ok_or("Missing sig")?;
 
     if pubkey != vault_pubkey_b64 {
         return Err("Event pubkey does not match vault identity".to_string());
@@ -270,10 +258,7 @@ fn verify_and_store_event(
     Ok(event_id.to_string())
 }
 
-fn query_events(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-    filters: &[Value],
-) -> Vec<String> {
+fn query_events(db: &Arc<Mutex<rusqlite::Connection>>, filters: &[Value]) -> Vec<String> {
     let db = match db.lock() {
         Ok(d) => d,
         Err(_) => return vec![],
@@ -295,9 +280,8 @@ fn query_events(
         .filter_map(|k| k.as_i64())
         .collect();
 
-    let mut query = String::from(
-        "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events",
-    );
+    let mut query =
+        String::from("SELECT id, pubkey, created_at, kind, tags, content, sig FROM events");
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if !kinds.is_empty() {
@@ -326,17 +310,15 @@ fn query_events(
         let tags: String = row.get(4)?;
         let content: String = row.get(5)?;
         let sig: String = row.get(6)?;
-        Ok((
-            id, pubkey, created_at, kind, tags, content, sig,
-        ))
+        Ok((id, pubkey, created_at, kind, tags, content, sig))
     }) {
         Ok(r) => r,
         Err(_) => return vec![],
     };
 
     rows.filter_map(|r| {
-        r.ok().map(
-            |(id, pubkey, created_at, kind, tags, content, sig)| {
+        r.ok()
+            .map(|(id, pubkey, created_at, kind, tags, content, sig)| {
                 let event = serde_json::json!({
                     "id": id,
                     "pubkey": pubkey,
@@ -347,8 +329,7 @@ fn query_events(
                     "sig": sig,
                 });
                 event.to_string()
-            },
-        )
+            })
     })
     .collect()
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{header, StatusCode, Method},
+    http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, options},
     Router,
@@ -35,10 +35,7 @@ struct BlossomState {
     blobs_dir: PathBuf,
 }
 
-pub async fn start_blossom_server(
-    blobs_dir: PathBuf,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Receiver<bool>) {
     fs::create_dir_all(&blobs_dir)
         .await
         .expect("Failed to create blobs directory");
@@ -56,8 +53,20 @@ pub async fn start_blossom_server(
     );
 
     let app = Router::new()
-        .route("/:hash", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
-        .route("/:hash/", get(handle_get).head(handle_head).put(handle_put).options(handle_options))
+        .route(
+            "/:hash",
+            get(handle_get)
+                .head(handle_head)
+                .put(handle_put)
+                .options(handle_options),
+        )
+        .route(
+            "/:hash/",
+            get(handle_get)
+                .head(handle_head)
+                .put(handle_put)
+                .options(handle_options),
+        )
         .route("/", options(handle_options))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(cors)
@@ -83,8 +92,14 @@ async fn handle_options() -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, PUT, HEAD, OPTIONS")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization")
+        .header(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, PUT, HEAD, OPTIONS",
+        )
+        .header(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            "Content-Type, Authorization",
+        )
         .header("Access-Control-Allow-Private-Network", "true")
         .body(Body::default())
         .unwrap()
@@ -163,11 +178,7 @@ async fn handle_put(
     let computed = format!("{:x}", hasher.finalize());
 
     if computed != hash {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("Hash mismatch"),
-        )
-            .into_response();
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("Hash mismatch")).into_response();
     }
 
     let file_path = state.blobs_dir.join(&hash);

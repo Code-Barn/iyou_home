@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -146,10 +146,7 @@ export default function KeysManager() {
         <h3>Active Identity</h3>
         {activeDid ? (
           <div>
-            <code
-              className="did-display"
-              style={{ marginBottom: "1rem" }}
-            >
+            <code className="did-display" style={{ marginBottom: "1rem" }}>
               {activeDid}
             </code>
             <button onClick={handleExportDocument}>
@@ -180,8 +177,7 @@ export default function KeysManager() {
                   padding: "0.5rem 0.75rem",
                   margin: "0.25rem 0",
                   borderRadius: "6px",
-                  background:
-                    p.did === activeDid ? "#e8f5e9" : "transparent",
+                  background: p.did === activeDid ? "#e8f5e9" : "transparent",
                   border:
                     p.did === activeDid
                       ? "1px solid #4caf50"

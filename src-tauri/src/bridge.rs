@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Byers Brands, LLC
+ * Copyright (C) 2026 David Byers dba Byers Brands
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -46,8 +46,7 @@ fn is_websocket_upgrade_request(data: &[u8]) -> bool {
     if lines.is_empty() || !lines[0].starts_with("GET") {
         return false;
     }
-    let lowercase_headers: Vec<String> =
-        lines.iter().map(|l| l.trim().to_lowercase()).collect();
+    let lowercase_headers: Vec<String> = lines.iter().map(|l| l.trim().to_lowercase()).collect();
 
     let has_upgrade = lowercase_headers.iter().any(|l| l.starts_with("upgrade:"));
     let has_connection_upgrade = lowercase_headers
@@ -73,20 +72,19 @@ async fn handle_options_preflight(mut stream: TcpStream) {
 }
 
 async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
-    let cors_callback =
-        |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
-            println!("DEBUG: Handshake callback triggered");
-            println!("DEBUG: Request method: {:?}", req.method());
-            res.headers_mut().insert(
-                "Access-Control-Allow-Origin",
-                tauri::http::HeaderValue::from_static("*"),
-            );
-            res.headers_mut().insert(
-                "Access-Control-Allow-Private-Network",
-                tauri::http::HeaderValue::from_static("true"),
-            );
-            Ok(res)
-        };
+    let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
+        println!("DEBUG: Handshake callback triggered");
+        println!("DEBUG: Request method: {:?}", req.method());
+        res.headers_mut().insert(
+            "Access-Control-Allow-Origin",
+            tauri::http::HeaderValue::from_static("*"),
+        );
+        res.headers_mut().insert(
+            "Access-Control-Allow-Private-Network",
+            tauri::http::HeaderValue::from_static("true"),
+        );
+        Ok(res)
+    };
 
     let ws_stream = match accept_hdr_async(stream, cors_callback).await {
         Ok(ws) => {
@@ -156,8 +154,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
 
                 if json["type"] == "ping" {
                     println!("DEBUG: Ping received, sending pong via response_tx");
-                    let _ =
-                        response_tx.send(Message::Text("{\"type\":\"pong\"}".into()));
+                    let _ = response_tx.send(Message::Text("{\"type\":\"pong\"}".into()));
                     continue;
                 }
 
@@ -192,9 +189,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                             }),
                         );
                     });
-                } else if json["type"] == "sign_event"
-                    || json["action"] == "sign_event"
-                {
+                } else if json["type"] == "sign_event" || json["action"] == "sign_event" {
                     if json["event"].is_object() {
                         let event = json["event"].clone();
                         println!("Triggering Nostr Event signing");
@@ -220,10 +215,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                             );
                         });
                     } else {
-                        println!(
-                            "DEBUG: Received sign_event without event object: {}",
-                            text
-                        );
+                        println!("DEBUG: Received sign_event without event object: {}", text);
                     }
                 } else if json["type"] == "sign_credential" {
                     if json["credential"].is_object() {
@@ -242,10 +234,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                             );
                             default_did
                         };
-                        println!(
-                            "Triggering Credential signing for holder: {}",
-                            holder_did
-                        );
+                        println!("Triggering Credential signing for holder: {}", holder_did);
                         println!("DEBUG: Signing VC with Ed25519 (issuer key)");
 
                         let app_handle = app_handle.clone();
