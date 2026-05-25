@@ -18,6 +18,13 @@
 import { useState, useEffect } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 
+interface Profile {
+  profile_id: string;
+  profile_name: string;
+  derivation_index: number;
+  did: string;
+}
+
 type SignRequest =
   | { type: "sign"; challenge: string; profile_id?: string }
   | { type: "sign_event"; event: any; profile_id?: string }
@@ -50,6 +57,8 @@ export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequest | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [autoSign, setAutoSign] = useState(false);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState<string>("primary");
 
   useEffect(() => {
     const channel = new Channel<string>();
@@ -78,7 +87,31 @@ export default function WsSignPopup() {
     };
     invoke("register_challenge_pipe", { channel });
     console.log("REACT: Challenge channel registered with backend");
+
+    // Load profiles and active profile
+    loadProfiles();
   }, []);
+
+  const loadProfiles = async () => {
+    try {
+      const [profilesList, activeDid] = await Promise.all([
+        invoke<Profile[]>("list_profiles"),
+        invoke<string | null>("get_active_did"),
+      ]);
+
+      setProfiles(profilesList);
+
+      // Find the active profile
+      if (activeDid) {
+        const activeProfile = profilesList.find((p) => p.did === activeDid);
+        if (activeProfile) {
+          setActiveProfileId(activeProfile.profile_id);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load profiles:", err);
+    }
+  };
 
   useEffect(() => {
     if (autoSign && request && !isProcessing) {
@@ -160,6 +193,30 @@ export default function WsSignPopup() {
               ? `${getCredentialTitle(request.credential)} Signing Request`
               : "Signature Request"}
         </h2>
+
+        {/* Persona Context Display */}
+        {profiles.length > 0 && (
+          <div
+            style={{
+              background: "#e3f2fd",
+              padding: "0.75rem 1rem",
+              borderRadius: "6px",
+              margin: "1rem 0",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.5rem",
+            }}
+          >
+            <span>👤</span>
+            <strong>Signing as:</strong>
+            <span>
+              {profiles.find(
+                (p) => p.profile_id === (request.profile_id || activeProfileId),
+              )?.profile_name || "Unknown Profile"}
+              {request.profile_id && ` (Profile ID: ${request.profile_id})`}
+            </span>
+          </div>
+        )}
 
         {request.type === "sign" && (
           <>

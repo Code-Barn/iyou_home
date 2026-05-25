@@ -19,11 +19,20 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 
+interface Profile {
+  profile_id: string;
+  profile_name: string;
+  derivation_index: number;
+  did: string;
+}
+
 // Note: In the future, we can import init, { verify_vp } from '../lib/did_rust_wasm/did_rust.js'
 // to locally verify the created VP in WASM before returning it to the user.
 
 export default function SovereignSigner() {
   const [activeDid, setActiveDid] = useState<string | null>(null);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [selectedProfileId, setSelectedProfileId] = useState<string>("");
   const [challenge, setChallenge] = useState("");
   const [presentation, setPresentation] = useState<string | null>(null);
   const [isSigning, setIsSigning] = useState(false);
@@ -31,6 +40,7 @@ export default function SovereignSigner() {
 
   useEffect(() => {
     fetchActiveDid();
+    fetchProfiles();
   }, []);
 
   const fetchActiveDid = async () => {
@@ -39,6 +49,21 @@ export default function SovereignSigner() {
       setActiveDid(did);
     } catch (err: any) {
       console.error("Failed to fetch active DID:", err);
+    }
+  };
+
+  const fetchProfiles = async () => {
+    try {
+      const list = await invoke<Profile[]>("list_profiles");
+      setProfiles(list);
+      // Set default selected profile to active one if available
+      if (list.length > 0) {
+        const activeProfile = list.find((p) => p.did === activeDid) || list[0];
+        setSelectedProfileId(activeProfile.profile_id);
+      }
+    } catch (err: any) {
+      console.error("Failed to fetch profiles:", err);
+      setError(`Failed to load profiles: ${err.toString()}`);
     }
   };
 
@@ -90,6 +115,7 @@ export default function SovereignSigner() {
       const vpJson = await invoke<string>("sign_auth_challenge", {
         challenge: challenge,
         didId: activeDid,
+        profileId: selectedProfileId,
       });
       // Format the returned JSON for nice display
       const parsedVp = JSON.parse(vpJson);
@@ -115,6 +141,30 @@ export default function SovereignSigner() {
             {activeDid ? activeDid : "No active identity (Check Keys tab)"}
           </div>
         </div>
+
+        {profiles.length > 0 && (
+          <div className="form-group">
+            <label>Signing Profile</label>
+            <select
+              value={selectedProfileId}
+              onChange={(e) => setSelectedProfileId(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "0.5rem",
+                borderRadius: "4px",
+                border: "1px solid #ccc",
+                fontSize: "0.9rem",
+                marginTop: "0.5rem",
+              }}
+            >
+              {profiles.map((profile) => (
+                <option key={profile.profile_id} value={profile.profile_id}>
+                  {profile.profile_name} (Index: {profile.derivation_index})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <div className="form-group">
           <div

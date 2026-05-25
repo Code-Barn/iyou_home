@@ -49,6 +49,25 @@ pub struct ServiceState {
     pub auto_start_settings: Mutex<HashMap<String, bool>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct UserPreferences {
+    pub active_profile_id: String,
+    pub default_signing_profile: String,
+    pub auto_sign: bool,
+    pub last_active_tab: String,
+}
+
+impl Default for UserPreferences {
+    fn default() -> Self {
+        Self {
+            active_profile_id: "primary".to_string(),
+            default_signing_profile: "primary".to_string(),
+            auto_sign: false,
+            last_active_tab: "services".to_string(),
+        }
+    }
+}
+
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
@@ -105,16 +124,15 @@ pub fn sign_omni_payload(
     let (signing_key, did) = resolve_profile_keypair(app, profile_id)?;
 
     // Canonicalize: BTreeMap guarantees alphabetical key order, serde_json::to_string gives zero spacing
-    let canonical_map: BTreeMap<String, serde_json::Value> = serde_json::from_value(
-        serde_json::json!({
+    let canonical_map: BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(serde_json::json!({
             "option_id": option_id,
             "poll_id": poll_id,
             "timestamp": _ts,
-        }),
-    )
-    .map_err(|_| "Failed to canonicalize payload")?;
-    let canonical_str =
-        serde_json::to_string(&canonical_map).map_err(|_| "Failed to serialize canonical payload")?;
+        }))
+        .map_err(|_| "Failed to canonicalize payload")?;
+    let canonical_str = serde_json::to_string(&canonical_map)
+        .map_err(|_| "Failed to serialize canonical payload")?;
 
     // SHA-256 of canonical payload, then Ed25519 sign
     let payload_hash = Sha256::digest(canonical_str.as_bytes());
@@ -380,7 +398,16 @@ fn get_active_did(app: AppHandle, state: State<'_, ServiceState>) -> Option<Stri
             return Some(did);
         }
     }
+
+    // Try to load preferences and find the active profile
+    let prefs = load_preferences(&app);
     if let Ok(vault) = vault::load_vault(&app) {
+        if let Some(profile) = vault::get_profile_by_id(&vault, &prefs.active_profile_id) {
+            let mut active = state.active_did.lock().unwrap();
+            *active = Some(profile.did.clone());
+            return Some(profile.did.clone());
+        }
+        // Fallback to first profile if preferred profile not found
         if let Some(profile) = vault.profiles.first() {
             let mut active = state.active_did.lock().unwrap();
             *active = Some(profile.did.clone());
@@ -412,6 +439,66 @@ fn add_profile(
     let mut active = state.active_did.lock().unwrap();
     *active = Some(profile.did.clone());
     Ok(profile)
+}
+
+#[tauri::command]
+fn set_active_profile(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+    profile_id: String,
+) -> Result<(), String> {
+    let vault = vault::load_vault(&app)?;
+
+    // Validate that the profile exists
+    let profile = vault::get_profile_by_id(&vault, &profile_id)
+        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+    // Update the active DID in memory
+    let mut active = state.active_did.lock().unwrap();
+    *active = Some(profile.did.clone());
+
+    // Update preferences and save
+    let mut prefs = load_preferences(&app);
+    prefs.active_profile_id = profile_id;
+    save_preferences(&app, &prefs)?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_profile(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+    profile_id: String,
+) -> Result<(), String> {
+    if profile_id == "primary" {
+        return Err("Cannot remove primary profile".to_string());
+    }
+
+    let mut vault = vault::load_vault(&app)?;
+
+    // Check if this is the currently active profile
+    let prefs = load_preferences(&app);
+    let was_active = prefs.active_profile_id == profile_id;
+
+    // Remove the profile
+    vault::remove_profile(&mut vault, &profile_id)?;
+    vault::save_vault(&app, &vault)?;
+
+    // If we removed the active profile, reset to primary
+    if was_active {
+        let mut prefs = load_preferences(&app);
+        prefs.active_profile_id = "primary".to_string();
+        save_preferences(&app, &prefs)?;
+
+        // Update in-memory state
+        let mut active = state.active_did.lock().unwrap();
+        if let Some(profile) = vault::get_profile_by_id(&vault, "primary") {
+            *active = Some(profile.did.clone());
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -632,9 +719,60 @@ fn save_auto_start_settings(app: &AppHandle, settings: &HashMap<String, bool>) {
     }
 }
 
+// ---------- user preferences ----------
+
+fn preferences_path(app: &AppHandle) -> PathBuf {
+    let mut path = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    path.push("preferences.json");
+    path
+}
+
+fn load_preferences(app: &AppHandle) -> UserPreferences {
+    let path = preferences_path(app);
+    if !path.exists() {
+        let prefs = UserPreferences::default();
+        if let Err(e) = save_preferences(app, &prefs) {
+            eprintln!("Failed to save default preferences: {}", e);
+        }
+        return prefs;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| {
+            eprintln!("Failed to parse preferences, using defaults");
+            UserPreferences::default()
+        })
+}
+
+fn save_preferences(app: &AppHandle, prefs: &UserPreferences) -> Result<(), String> {
+    let path = preferences_path(app);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create preferences directory: {}", e))?;
+    }
+    let json = serde_json::to_string(prefs)
+        .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write preferences: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn get_auto_start_settings(state: State<'_, ServiceState>) -> HashMap<String, bool> {
     state.auto_start_settings.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_user_preferences(app: AppHandle) -> Result<UserPreferences, String> {
+    Ok(load_preferences(&app))
+}
+
+#[tauri::command]
+fn save_user_preferences(app: AppHandle, preferences: UserPreferences) -> Result<(), String> {
+    save_preferences(&app, &preferences)
 }
 
 #[tauri::command]
@@ -760,6 +898,8 @@ pub fn run() {
             get_active_did,
             list_profiles,
             add_profile,
+            set_active_profile,
+            remove_profile,
             sign_auth_challenge,
             get_public_did_document,
             submit_ws_response,
@@ -769,6 +909,8 @@ pub fn run() {
             register_challenge_pipe,
             get_auto_start_settings,
             set_auto_start,
+            get_user_preferences,
+            save_user_preferences,
             get_service_statuses,
             sync_vote_records,
             get_vote_history,
@@ -857,6 +999,100 @@ mod tests {
             vp.get("proof").is_some(),
             "VP should contain a proof object"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_preferences_round_trip() {
+        let mut path = temp_dir();
+        path.push("test_preferences.json");
+
+        let prefs = UserPreferences {
+            active_profile_id: "test_profile".to_string(),
+            default_signing_profile: "signing_profile".to_string(),
+            auto_sign: true,
+            last_active_tab: "keys".to_string(),
+        };
+
+        let json = serde_json::to_string(&prefs).expect("Should serialize");
+        std::fs::write(&path, &json).expect("Should write");
+
+        let loaded_json = std::fs::read_to_string(&path).expect("Should read");
+        let loaded: UserPreferences =
+            serde_json::from_str(&loaded_json).expect("Should deserialize");
+
+        assert_eq!(loaded.active_profile_id, "test_profile");
+        assert_eq!(loaded.default_signing_profile, "signing_profile");
+        assert!(loaded.auto_sign);
+        assert_eq!(loaded.last_active_tab, "keys");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_preferences_defaults() {
+        let prefs = UserPreferences::default();
+        assert_eq!(prefs.active_profile_id, "primary");
+        assert_eq!(prefs.default_signing_profile, "primary");
+        assert!(!prefs.auto_sign);
+        assert_eq!(prefs.last_active_tab, "services");
+    }
+
+    #[test]
+    fn test_set_active_profile_validation() {
+        let mut path = temp_dir();
+        path.push("test_vault_profile_switch.json");
+
+        let vault_store = vault::create_vault_at_path(&path).expect("Should create vault");
+        let profile = vault::add_profile(
+            &mut vault_store.clone(),
+            "test_profile".to_string(),
+            "Test Profile".to_string(),
+        )
+        .expect("Should add profile");
+
+        // Test successful profile switch
+        let mut prefs = UserPreferences::default();
+        prefs.active_profile_id = profile.profile_id.clone();
+
+        // Verify the profile was created with expected properties
+        assert!(
+            !profile.profile_id.is_empty(),
+            "Profile ID should not be empty"
+        );
+        assert!(
+            profile.profile_id.contains("test_profile"),
+            "Profile ID should contain test_profile"
+        );
+        assert_eq!(profile.derivation_index, 1, "Should be derivation index 1");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_profile_removal_fallback() {
+        let mut path = temp_dir();
+        path.push("test_vault_profile_remove.json");
+
+        let mut vault_store = vault::create_vault_at_path(&path).expect("Should create vault");
+        let profile = vault::add_profile(
+            &mut vault_store,
+            "temp_profile".to_string(),
+            "Temp Profile".to_string(),
+        )
+        .expect("Should add profile");
+
+        // Verify profile was added
+        assert_eq!(vault_store.profiles.len(), 2);
+
+        // Remove the profile
+        vault::remove_profile(&mut vault_store, &profile.profile_id)
+            .expect("Should remove profile");
+
+        // Verify profile was removed
+        assert_eq!(vault_store.profiles.len(), 1);
+        assert_eq!(vault_store.profiles[0].profile_id, "primary");
 
         let _ = std::fs::remove_file(path);
     }

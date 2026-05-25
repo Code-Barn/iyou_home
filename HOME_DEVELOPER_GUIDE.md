@@ -253,9 +253,34 @@ pub struct Profile {
 
 **Zero UI Leakage:** Private key bytes never cross the Rust/TypeScript boundary. All signing happens inside the compiled Rust process using `ed25519-dalek` via the derived keypair. The frontend sees only `did:key:` strings.
 
-### Greenfield Resets
+### Greenfield Resets & Backward Compatibility Policy
 
-If `vault.json` is missing, corrupt, or fails to deserialize as a valid `VaultStore`, `load_vault` immediately generates a fresh 32-byte root seed, creates a "Primary Identity" profile at index 0, and overwrites the file. No legacy format migration is attempted — the old single-key `IdentityStore` schema has been permanently removed.
+**Architectural Decision**: This application has dropped all backward compatibility support in favor of a clean, greenfield-only approach. This decision eliminates technical debt and simplifies the codebase since the application is currently in pre-release with a single user base.
+
+#### Reset Behavior
+
+If `vault.json` is missing, corrupt, or fails to deserialize as a valid `VaultStore`, `load_vault` immediately:
+
+1. Generates a fresh 32-byte root seed
+2. Creates a "Primary Identity" profile at derivation index 0
+3. Overwrites the existing file with the new schema
+
+**No legacy format migration is attempted** — the old single-key `IdentityStore` schema has been permanently removed.
+
+#### Benefits of Greenfield-Only Approach
+
+- **Simplified Code**: No migration logic, version checks, or schema compatibility layers
+- **Predictable Testing**: Single code path for initialization
+- **Clean State**: Users always start with known-good configuration
+- **Easy Reset**: Delete `vault.json` to start fresh at any time
+
+#### User Impact
+
+- **Existing Users**: Delete `vault.json` to migrate to v3 schema (one-time operation)
+- **New Users**: Automatic clean initialization on first run
+- **Multi-User Systems**: Each OS user gets independent greenfield initialization
+
+This approach aligns with the Level 2 Secure Enclave model by ensuring all users start with a cryptographically sound, deterministic configuration.
 
 There is no password-based authentication for the signing flow. The XMPP (Chat) service uses a locally-generated password file for SASL PLAIN (`{app_data}/xmpp_password.txt`) — this is a transport credential, not an identity credential. All higher-level identity operations go through the DID/Vault+WebSocket path.
 
@@ -345,6 +370,48 @@ The vault was upgraded from a single `IdentityStore { did, private_key_base58 }`
 | **Wire protocol** | All signing frames (`sign`, `sign_event`, `sign_credential`, `OMNI_SIGN_REQUEST`) accept `"profile_id"`. Absent/empty → defaults to index 0. |
 | **Legacy removal** | `LegacyStore`, `migrate_from_legacy()`, `test_legacy_migration` — permanently deleted. Greenfield reset on any deserialization failure. |
 | **Frontend awareness** | `KeysManager.tsx` displays all personas with truncated DIDs. `WsSignPopup.tsx` threads `profile_id` from the WS frame through to the Tauri signing command. |
+
+## v3 Multi-Persona Configuration & Preference Persistence
+
+The application maintains user state and settings globally inside `{app_data}/preferences.json` which is mapped dynamically per OS user account to enforce strict local environment security and multi-user isolation.
+
+### State Persistence Layout
+
+```json
+{
+  "activeProfileId": "primary",
+  "defaultSigningProfile": "",
+  "autoSign": false,
+  "lastActiveTab": "services"
+}
+```
+
+### Critical Behavioral Patterns
+
+#### Active DID Resolution Hierarchy
+
+When fetching the current identity via `get_active_did`, the system:
+
+1. Polls the active runtime memory structure.
+2. Falls back to looking up `active_profile_id` inside `preferences.json`.
+3. Defaults cleanly to derivation index 0 (Primary Identity) if preferences are uninitialized or corrupt.
+
+#### Persona Deletion & Safety Fallbacks
+
+- The absolute Primary Identity (`profile_id: "primary"`, derivation index 0) is protected from deletion at both the frontend UI boundary and backend core validation layer.
+- If an active custom persona is explicitly deleted, the state automatically cascades back to resetting the global active reference to the Primary Identity.
+
+#### Headless Bridge Processing Limitations
+
+**CRITICAL**: Headless protocol requests (`OMNI_SIGN_REQUEST` / `POLLY_V2`) bypass the React context state. If an incoming message contains an empty `profile_id`, the signing bridge continues to default strictly to derivation index 0 (Primary Identity) **regardless of what is currently selected inside the UI's user preference layer**. 
+
+This is a **cryptographic distinction** that external applications must understand:
+
+- **Empty/absent `profile_id`** → Always defaults to Primary Identity (Index 0)
+- **Explicit `profile_id`** → Uses the specified persona
+- **UI active profile preference** → Only applies to interactive React-based signing flows
+
+Portals must provide explicit profile identifiers to target alternative identities. The headless bridge does not consult `preferences.json` and operates independently of the UI's active profile selection.
 
 ## Known Risks
 
