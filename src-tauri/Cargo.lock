@@ -2069,6 +2069,7 @@ dependencies = [
  "did_rust",
  "ed25519-dalek",
  "futures-util",
+ "hex",
  "quick-xml 0.31.0",
  "rand",
  "rusqlite",

@@ -263,6 +263,8 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                             text
                         );
                     }
+                } else if json["type"] == "OMNI_SIGN_REQUEST" {
+                    handle_omni_sign_request(json, &app_handle, &response_tx).await;
                 } else {
                     println!("DEBUG: Received unknown JSON structure: {}", text);
                 }
@@ -306,6 +308,61 @@ async fn listen_on(addrs: &str, app: AppHandle) {
             handle_connection(stream, app_handle).await;
         });
     }
+}
+
+async fn handle_omni_sign_request(
+    json: serde_json::Value,
+    app_handle: &AppHandle,
+    response_tx: &mpsc::UnboundedSender<Message>,
+) {
+    let protocol = json["protocol"].as_str().unwrap_or("");
+    if protocol != "POLLY_V2" {
+        println!("OMNI_SIGN_REQUEST rejected: unknown protocol '{}'", protocol);
+        let _ = response_tx.send(Message::Text(
+            "{\"status\":\"error\",\"reason\":\"unsupported_protocol\"}".into(),
+        ));
+        return;
+    }
+
+    let payload = match json.get("payload").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => {
+            let _ = response_tx.send(Message::Text(
+                "{\"status\":\"error\",\"reason\":\"missing_payload\"}".into(),
+            ));
+            return;
+        }
+    };
+
+    let payload_value = serde_json::Value::Object(payload.clone());
+    let profile_id = json
+        .get("profile_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let app = app_handle.clone();
+    let tx = response_tx.clone();
+    tokio::spawn(async move {
+        match crate::sign_omni_payload(&app, &payload_value, profile_id) {
+            Ok(envelope) => {
+                let response = serde_json::json!({
+                    "type": "OMNI_SIGN_RESPONSE",
+                    "protocol": "POLLY_V2",
+                    "envelope": envelope,
+                });
+                println!("OMNI_SIGN_REQUEST signed successfully");
+                let _ = tx.send(Message::Text(response.to_string().into()));
+            }
+            Err(e) => {
+                eprintln!("OMNI_SIGN_REQUEST signing failed: {}", e);
+                let err = serde_json::json!({
+                    "status": "error",
+                    "reason": e,
+                });
+                let _ = tx.send(Message::Text(err.to_string().into()));
+            }
+        }
+    });
 }
 
 pub async fn start_ws_server(app: AppHandle) {

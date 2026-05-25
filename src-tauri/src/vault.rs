@@ -214,6 +214,64 @@ pub fn list_profiles(vault: &VaultStore) -> Vec<Profile> {
     vault.profiles.clone()
 }
 
+// ---------- Stream B: Poll Vote Ledger ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteRecord {
+    pub poll_id: String,
+    pub option_id: String,
+    pub client_signature: String,
+    pub voter_did: String,
+    pub network_timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PollLedger {
+    pub records: Vec<VoteRecord>,
+}
+
+fn get_ledger_path(app: &AppHandle) -> PathBuf {
+    let mut path = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    path.push("poll_ledger.json");
+    path
+}
+
+pub fn load_ledger(app: &AppHandle) -> PollLedger {
+    let path = get_ledger_path(app);
+    if !path.exists() {
+        return PollLedger::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_ledger(app: &AppHandle, ledger: &PollLedger) -> Result<(), String> {
+    let path = get_ledger_path(app);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create ledger directory: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(ledger)
+        .map_err(|e| format!("Serialization error: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write ledger: {}", e))?;
+    Ok(())
+}
+
+pub fn append_vote_records(app: &AppHandle, records: Vec<VoteRecord>) -> Result<(), String> {
+    let mut ledger = load_ledger(app);
+    ledger.records.extend(records);
+    save_ledger(app, &ledger)
+}
+
+pub fn get_vote_records(app: &AppHandle) -> Result<Vec<VoteRecord>, String> {
+    Ok(load_ledger(app).records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +371,45 @@ mod tests {
         assert_eq!(kp2.did, vault.profiles[0].did);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_vote_record_round_trip() {
+        let dir = temp_dir();
+        let ledger_path = dir.join("poll_ledger.json");
+
+        let records = vec![
+            VoteRecord {
+                poll_id: "poll_abc".into(),
+                option_id: "opt_1".into(),
+                client_signature: "sig_hex_value".into(),
+                voter_did: "did:key:zabc123".into(),
+                network_timestamp: 1715000000,
+            },
+            VoteRecord {
+                poll_id: "poll_abc".into(),
+                option_id: "opt_2".into(),
+                client_signature: "sig_hex_value_2".into(),
+                voter_did: "did:key:zdef456".into(),
+                network_timestamp: 1715000060,
+            },
+        ];
+
+        let ledger = PollLedger {
+            records: records.clone(),
+        };
+        let json = serde_json::to_string_pretty(&ledger).expect("Should serialize");
+        std::fs::write(&ledger_path, &json).expect("Should write");
+
+        let loaded_json = std::fs::read_to_string(&ledger_path).expect("Should read");
+        let loaded: PollLedger =
+            serde_json::from_str(&loaded_json).expect("Should deserialize");
+
+        assert_eq!(loaded.records.len(), 2);
+        assert_eq!(loaded.records[0].poll_id, "poll_abc");
+        assert_eq!(loaded.records[0].option_id, "opt_1");
+        assert_eq!(loaded.records[1].network_timestamp, 1715000060);
+
+        let _ = std::fs::remove_file(&ledger_path);
     }
 }

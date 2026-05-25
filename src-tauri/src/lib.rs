@@ -19,7 +19,7 @@ use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -83,6 +83,72 @@ fn sign_challenge_with_keypair(
     let key_b58 = bs58::encode(signing_key.to_bytes()).into_string();
     did_rust::issue_vc(&vp_json, did, &key_b58)
         .map_err(|e| format!("Failed to sign presentation: {}", e))
+}
+
+pub fn sign_omni_payload(
+    app: &AppHandle,
+    payload: &serde_json::Value,
+    profile_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let poll_id = payload["poll_id"]
+        .as_str()
+        .ok_or("Missing poll_id")?
+        .to_string();
+    let option_id = payload["option_id"]
+        .as_str()
+        .ok_or("Missing option_id")?
+        .to_string();
+    let _ts = payload["timestamp"]
+        .as_i64()
+        .ok_or("Missing or invalid timestamp")?;
+
+    let (signing_key, did) = resolve_profile_keypair(app, profile_id)?;
+
+    // Canonicalize: BTreeMap guarantees alphabetical key order, serde_json::to_string gives zero spacing
+    let canonical_map: BTreeMap<String, serde_json::Value> = serde_json::from_value(
+        serde_json::json!({
+            "option_id": option_id,
+            "poll_id": poll_id,
+            "timestamp": _ts,
+        }),
+    )
+    .map_err(|_| "Failed to canonicalize payload")?;
+    let canonical_str =
+        serde_json::to_string(&canonical_map).map_err(|_| "Failed to serialize canonical payload")?;
+
+    // SHA-256 of canonical payload, then Ed25519 sign
+    let payload_hash = Sha256::digest(canonical_str.as_bytes());
+    let signature = signing_key.sign(&payload_hash);
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    // id = SHA-256(canonical payload)
+    let id_hex = hex::encode(payload_hash);
+
+    // pubkey as lowercase hex
+    let pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+    // created_at = current wall-clock UNIX epoch
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Time went backwards")?
+        .as_secs() as i64;
+
+    let tags: Vec<serde_json::Value> = vec![
+        serde_json::json!(["poll", poll_id]),
+        serde_json::json!(["p", did]),
+    ];
+
+    let envelope = serde_json::json!({
+        "kind": 1112,
+        "pubkey": pubkey_hex,
+        "created_at": created_at,
+        "tags": tags,
+        "content": canonical_str,
+        "id": id_hex,
+        "sig": sig_hex,
+    });
+
+    Ok(envelope)
 }
 
 fn resolve_profile_keypair(
@@ -588,6 +654,18 @@ fn set_auto_start(
     Ok(())
 }
 
+// ---------- Stream B: Vote Ledger Commands ----------
+
+#[tauri::command]
+fn sync_vote_records(app: AppHandle, records: Vec<vault::VoteRecord>) -> Result<(), String> {
+    vault::append_vote_records(&app, records)
+}
+
+#[tauri::command]
+fn get_vote_history(app: AppHandle) -> Result<Vec<vault::VoteRecord>, String> {
+    vault::get_vote_records(&app)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -692,6 +770,8 @@ pub fn run() {
             get_auto_start_settings,
             set_auto_start,
             get_service_statuses,
+            sync_vote_records,
+            get_vote_history,
         ]);
 
     builder

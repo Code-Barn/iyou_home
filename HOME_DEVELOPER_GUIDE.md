@@ -31,12 +31,12 @@ This guide provides instructions for setting up the development environment, run
 
 ## Backend (Rust)
 
-The backend is located in the `src-tauri` directory and is organised into five modules:
+The backend is located in the `src-tauri` directory and is organised into five source modules plus a build script:
 
 | Module | File | Responsibility |
 |---|---|---|
-| **vault** | `src/vault.rs` | Encrypted profile registry, root seed management, deterministic Ed25519 key derivation |
-| **bridge** | `src/bridge.rs` | WebSocket server on port 9001 — parses inbound frames, routes by `profile_id`, pipes signing requests to React |
+| **vault** | `src/vault.rs` | Encrypted profile registry, root seed management, deterministic Ed25519 key derivation, **Poll Vote Ledger** (`PollLedger` / `VoteRecord`) |
+| **bridge** | `src/bridge.rs` | WebSocket server on port 9001 — parses inbound frames (incl. `OMNI_SIGN_REQUEST` / `POLLY_V2`), routes by `profile_id`, pipes signing requests to React |
 | **nostr_relay** | `src/nostr_relay.rs` | NIP-01 Nostr relay (port 9003) |
 | **blossom** | `src/blossom.rs` | BUD-01 blob server (port 9002) |
 | **prosody** | `src/prosody.rs` | XMPP server (port 5222) |
@@ -82,13 +82,12 @@ Safari, Chrome, and Brave all require a PNA pre-flight (OPTIONS) before a public
 
 #### Supported Message Types
 
-| Type | Action | Description |
-|---|---|---|
 | Type | Action | Description | Optional Fields |
 |---|---|---|---|---|
 | `sign` | `"sign"` or `"action":"sign"` | OIDC/VP challenge — returns a Verifiable Presentation signed with the derived Ed25519 key | `profile_id` |
 | `sign_event` | `"sign_event"` or `"type":"sign_event"` | Nostr event signing — returns `{"type":"signed_event","event":{...}}` with `id` and `sig` (Ed25519, deviates from NIP-01 secp256k1) | `profile_id` |
 | `sign_credential` | `"type":"sign_credential"` | W3C Verifiable Credential issuance — returns `{"type":"signed_credential","vc":{...}}` | `profile_id` |
+| `OMNI_SIGN_REQUEST` | `"type":"OMNI_SIGN_REQUEST"` with `"protocol":"POLLY_V2"` | Polly V2 poll vote — canonicalises the inner `payload` (alphabetical key order, zero spacing), hashes with SHA-256, signs with vault Ed25519 key, returns a Nostr Kind 1112 envelope | `profile_id` |
 | `ping` | `"type":"ping"` | Smoke test — immediately responds `{"type":"pong"}` via the response channel | — |
 
 All signing message types accept an optional `"profile_id"` string. If present, the bridge looks up the matching persona in the vault registry and derives its keypair at the profile's `derivation_index`. If absent or empty, the bridge defaults to derivation index 0 (Primary Identity).
@@ -102,6 +101,50 @@ All signing message types accept an optional `"profile_id"` string. If present, 
 6. On approval, React calls the appropriate command (`submit_ws_response`, `submit_ws_event_response`, or `submit_ws_credential_response`) passing the `profile_id` back to Rust.
 7. The Rust command calls `resolve_profile_keypair` which loads the vault, looks up the profile (or defaults to index 0), derives the deterministic Ed25519 keypair from the root seed + derivation index, signs the payload, and sends the response back over the WebSocket via the `mpsc::UnboundedSender<Message>` stored in `WsState.response_sender`.
 8. On denial, a `{"status":"denied"}` message is sent.
+
+#### OMNI_SIGN_REQUEST / POLLY_V2 Auto-Signing Flow
+
+The `OMNI_SIGN_REQUEST`/`POLLY_V2` message type is designed for headless poll-vote signing from external portal applications (iyou_wun, Polly). Unlike the user-facing `sign`/`sign_event`/`sign_credential` types, the entire signing cycle is handled **entirely within the Rust bridge** — no React popup is involved, keeping the critical path fast and automatic.
+
+**Incoming schema:**
+```json
+{
+  "type": "OMNI_SIGN_REQUEST",
+  "protocol": "POLLY_V2",
+  "payload": {
+    "poll_id": "string",
+    "option_id": "string",
+    "timestamp": 1234567890
+  },
+  "profile_id": "optional"
+}
+```
+
+**Signing pipeline (`handle_omni_sign_request` → `sign_omni_payload`):**
+1. Validate that `protocol == "POLLY_V2"` and the payload contains `poll_id`, `option_id`, and a valid `timestamp`.
+2. Resolve the vault Ed25519 keypair via `resolve_profile_keypair` (profile defaults to index 0 if absent).
+3. **Canonicalise** the inner `{option_id, poll_id, timestamp}` object using a `BTreeMap<String, Value>` — guarantees alphabetical key order — then serialise with `serde_json::to_string` (zero spacing, no newlines).
+4. Hash the canonical string with SHA-256 and produce an Ed25519 signature over the digest.
+5. Wrap the result in a **Nostr Kind 1112** envelope with lowercase-hex-encoded `pubkey`, `id`, and `sig` fields (matching NIP-01 formatting conventions) and the wall-clock Unix epoch as `created_at`.
+
+**Response sent back over the same WebSocket:**
+```json
+{
+  "type": "OMNI_SIGN_RESPONSE",
+  "protocol": "POLLY_V2",
+  "envelope": {
+    "kind": 1112,
+    "pubkey": "<64-char lowercase hex>",
+    "created_at": 1748130000,
+    "tags": [["poll", "<poll_id>"], ["p", "<voter_did>"]],
+    "content": "{\"option_id\":\"...\",\"poll_id\":\"...\",\"timestamp\":1234567890}",
+    "id": "<64-char lowercase hex>",
+    "sig": "<128-char lowercase hex>"
+  }
+}
+```
+
+The response envelope can be double-broadcast or proxied as a valid Nostr event. The `id` is the SHA-256 hash of the canonical content string; `sig` is the Ed25519 signature over the same hash. Verification: recover the content, hash it, and verify the Ed25519 signature against the voter's `did:key:` public key.
 
 #### Critical Pattern: State Shadowing Fix
 The WebSocket TCP task runs in a different async context than Tauri IPC commands. Any reference to managed state captured before a `tokio::spawn` or `tokio::spawn` boundary points to a **local shadow copy**, not the singleton managed by Tauri.
@@ -166,6 +209,7 @@ Current test suites — **vault**:
 - `test_add_remove_profile` — profile CRUD operations on `VaultStore`
 - `test_get_profile_by_id_defaults_to_first` — empty `profile_id` resolves to index 0
 - `test_get_profile_keypair` — `get_profile_keypair` returns correct DID for a profile
+- `test_vote_record_round_trip` — serialise/deserialise cycle for `PollLedger` / `VoteRecord`
 
 Current test suites — **commands**:
 - `test_toggle_service_start` / `test_toggle_service_stop` — service state transitions
@@ -176,9 +220,9 @@ Current test suites — **commands**:
 **Passwords are deprecated.** The primary entry point is the OIDC/DID loop:
 
 1. A browser-based identity provider (IdP) at WUN or Polly initiates the flow by connecting to the local Signature Bridge.
-2. The IdP sends a challenge (`sign`), a Nostr event (`sign_event`), or a credential body (`sign_credential`) over the WebSocket, optionally specifying a `"profile_id"` to select which persona performs the signing.
-3. The user approves or denies via the React popup (`WsSignPopup`).
-4. The Rust backend loads the vault, looks up the profile (or defaults to derivation index 0), derives the deterministic Ed25519 keypair from the root seed + `derivation_index`, signs, and returns the result over the same WebSocket connection.
+2. The IdP sends a challenge (`sign`), a Nostr event (`sign_event`), a credential body (`sign_credential`), or a poll vote (`OMNI_SIGN_REQUEST` / `POLLY_V2`) over the WebSocket, optionally specifying a `"profile_id"` to select which persona performs the signing.
+3. For user-facing types (`sign`/`sign_event`/`sign_credential`), the user approves or denies via the React popup (`WsSignPopup`). For the headless `OMNI_SIGN_REQUEST` type, signing is fully automatic within the Rust bridge — no React popup appears.
+4. The Rust backend loads the vault, looks up the profile (or defaults to derivation index 0), derives the deterministic Ed25519 keypair from the root seed + `derivation_index`, signs, and returns the result over the same WebSocket connection. For `OMNI_SIGN_REQUEST` responses, the signed payload is wrapped in a Nostr Kind 1112 envelope.
 
 ### Multi-Persona Architecture
 
@@ -189,10 +233,12 @@ Ed25519 keypair = SHA-256(root_seed || LE(derivation_index))
 ```
 
 | Tauri Command | Description |
-|---|---|
+|---|---|---|
 | `list_profiles` | Returns all profiles (public DID only, no private material) |
 | `add_profile(profileName)` | Creates a new persona at the next unused `derivation_index` |
 | `get_active_did` | Returns the DID of the currently active profile |
+| `sync_vote_records(records)` | Ingests and appends an array of `VoteRecord` objects to the local Poll Vote Ledger |
+| `get_vote_history` | Returns the full array of stored `VoteRecord` entries from the local Poll Vote Ledger |
 
 The `Profile` struct is safe to send to the frontend (no private key material):
 
@@ -212,6 +258,30 @@ pub struct Profile {
 If `vault.json` is missing, corrupt, or fails to deserialize as a valid `VaultStore`, `load_vault` immediately generates a fresh 32-byte root seed, creates a "Primary Identity" profile at index 0, and overwrites the file. No legacy format migration is attempted — the old single-key `IdentityStore` schema has been permanently removed.
 
 There is no password-based authentication for the signing flow. The XMPP (Chat) service uses a locally-generated password file for SASL PLAIN (`{app_data}/xmpp_password.txt`) — this is a transport credential, not an identity credential. All higher-level identity operations go through the DID/Vault+WebSocket path.
+
+### Poll Vote Ledger
+
+A local audit trail for poll voting history is maintained as a JSON file at `{app_data}/poll_ledger.json`. This creates a permanent, immutable, un-deplatformable offline audit trail on the user's local machine.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteRecord {
+    pub poll_id: String,
+    pub option_id: String,
+    pub client_signature: String,
+    pub voter_did: String,
+    pub network_timestamp: i64,
+}
+```
+
+| Function | Description |
+|---|---|
+| `load_ledger(app)` | Reads and deserialises `poll_ledger.json`; returns an empty `PollLedger` if the file is missing |
+| `save_ledger(app, ledger)` | Serialises (pretty-printed JSON) and writes to `poll_ledger.json` |
+| `append_vote_records(app, records)` | Loads the ledger, appends an array of `VoteRecord`, and persists the result |
+| `get_vote_records(app)` | Loads and returns the full `Vec<VoteRecord>` from the ledger |
+
+The ledger file is stored as plain (unencrypted) JSON — unlike `vault.json` which is base64-encoded — to remain human-readable and machine-portable as an immutable local audit trail.
 
 ## Frontend (React)
 
@@ -245,10 +315,11 @@ Creates a standalone executable in `src-tauri/target/release/bundle/`.
 This application strictly employs a Level 2 (Sovereign) security posture using a "Secure Enclave" model:
 
 1.  **The Vault (Rust Backend):** A 32-byte root seed and a vector of profile descriptors are persisted in base64-encrypted JSON at `{app_data}/vault.json`. All access is managed exclusively by Rust (`src-tauri/src/vault.rs`). **No private key material — derived or stored — is ever exposed to the JavaScript frontend context.** The frontend receives only `did:key:` strings via `Profile.did`.
-2.  **Deterministic Derivation:** Per-persona Ed25519 keypairs are derived inside the Rust process via `SHA-256(root_seed || LE(derivation_index))`. Individual profile private keys are never stored.
-3.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge`, `submit_ws_response`, etc.). The `profile_id` is threaded from the WebSocket frame through the React popup and back to the signing command.
-4.  **Backend Cryptography:** VP signing and DID resolution is performed natively in Rust by the `did_rust` library.
-5.  **WASM Utilities:** `did_rust` is compiled to WebAssembly (`src/lib/did_rust_wasm/`) only for non-sensitive parsing and validation in the frontend.
+2.  **Poll Vote Ledger (Rust Backend):** An immutable local audit trail of poll voting history is persisted as plain JSON at `{app_data}/poll_ledger.json`. The ledger is managed by the same `vault.rs` module and exposed to the frontend via `sync_vote_records` and `get_vote_history` Tauri commands. No private key material is stored in the ledger — only Ed25519 signatures over canonicalised poll payloads.
+3.  **Deterministic Derivation:** Per-persona Ed25519 keypairs are derived inside the Rust process via `SHA-256(root_seed || LE(derivation_index))`. Individual profile private keys are never stored.
+4.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge`, `submit_ws_response`, etc.). The `profile_id` is threaded from the WebSocket frame through the React popup and back to the signing command. Vote history retrieval is handled via `get_vote_history` / `sync_vote_records`. Headless `OMNI_SIGN_REQUEST` / `POLLY_V2` signing bypasses the React layer entirely and is handled directly in the Rust bridge.
+5.  **Backend Cryptography:** VP signing, DID resolution, and OMNI payload canonicalisation + signing are performed natively in Rust by the combined `ed25519-dalek`, `sha2`, and `did_rust` libraries.
+6.  **WASM Utilities:** `did_rust` is compiled to WebAssembly (`src/lib/did_rust_wasm/`) only for non-sensitive parsing and validation in the frontend.
 
 ---
 
@@ -271,7 +342,7 @@ The vault was upgraded from a single `IdentityStore { did, private_key_base58 }`
 |---|---|
 | **Single key → root seed + profiles** | One 32-byte seed, N derived personas. No per-profile private keys stored. |
 | **Deterministic derivation** | `derive_deterministic_keypair(root_seed, derivation_index)` — tested, same seed+index → same DID every time. |
-| **Wire protocol** | All signing frames accept `"profile_id"`. Absent/empty → defaults to index 0. |
+| **Wire protocol** | All signing frames (`sign`, `sign_event`, `sign_credential`, `OMNI_SIGN_REQUEST`) accept `"profile_id"`. Absent/empty → defaults to index 0. |
 | **Legacy removal** | `LegacyStore`, `migrate_from_legacy()`, `test_legacy_migration` — permanently deleted. Greenfield reset on any deserialization failure. |
 | **Frontend awareness** | `KeysManager.tsx` displays all personas with truncated DIDs. `WsSignPopup.tsx` threads `profile_id` from the WS frame through to the Tauri signing command. |
 
