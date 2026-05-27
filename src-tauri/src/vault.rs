@@ -32,6 +32,18 @@ pub struct Profile {
     pub profile_name: String,
     pub derivation_index: u32,
     pub did: String,
+    pub credentials: Vec<VaultCredential>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultCredential {
+    pub vc_id: String,
+    pub issuer_did: String,
+    pub subject_did: String,
+    pub credential_type: String,
+    pub fidelity_score: Option<f64>,
+    pub expiration_date: Option<String>,
+    pub raw_payload: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +111,7 @@ pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
             profile_name: "Primary Identity".to_string(),
             derivation_index: 0,
             did: kp.did,
+            credentials: vec![],
         }],
     };
 
@@ -191,6 +204,7 @@ pub fn add_profile(
         profile_name,
         derivation_index: next_index,
         did: kp.did,
+        credentials: vec![],
     };
 
     vault.profiles.push(profile.clone());
@@ -411,5 +425,155 @@ mod tests {
         assert_eq!(loaded.records[1].network_timestamp, 1715000060);
 
         let _ = std::fs::remove_file(&ledger_path);
+    }
+
+    #[test]
+    fn test_credential_storage_fidelity() {
+        let mut path = temp_dir();
+        path.push("test_vault_creds.json");
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let cred1 = VaultCredential {
+            vc_id: "vc-001".to_string(),
+            issuer_did: "did:key:zissuer1".to_string(),
+            subject_did: "did:key:zsubject1".to_string(),
+            credential_type: "UniversityDegree".to_string(),
+            fidelity_score: Some(0.95),
+            expiration_date: Some("2027-06-01T00:00:00Z".to_string()),
+            raw_payload: r#"{"@context":["https://www.w3.org/2018/credentials/v1"],"id":"vc-001","type":["VerifiableCredential","UniversityDegree"],"issuer":"did:key:zissuer1","issuanceDate":"2025-01-01T00:00:00Z","credentialSubject":{"id":"did:key:zsubject1","degree":"BSc"}}"#.to_string(),
+        };
+
+        let cred2 = VaultCredential {
+            vc_id: "vc-002".to_string(),
+            issuer_did: "did:key:zissuer2".to_string(),
+            subject_did: "did:key:zsubject1".to_string(),
+            credential_type: "Membership".to_string(),
+            fidelity_score: None,
+            expiration_date: None,
+            raw_payload: r#"{"@context":["https://www.w3.org/2018/credentials/v1"],"id":"vc-002","type":["VerifiableCredential","Membership"],"issuer":"did:key:zissuer2","issuanceDate":"2025-03-15T00:00:00Z","credentialSubject":{"id":"did:key:zsubject1","memberSince":"2025"}}"#.to_string(),
+        };
+
+        // Add a second profile and push credentials to both
+        let _p2 = add_profile(&mut vault, "alt".to_string(), "Alt Persona".to_string())
+            .expect("Should add profile");
+
+        vault.profiles[0].credentials.push(cred1.clone());
+        vault.profiles[0].credentials.push(cred2.clone());
+
+        save_vault_inner(&path, &vault).expect("Should save vault with credentials");
+
+        // Reload and verify fields
+        let mut loaded = load_vault_from_path(&path).expect("Should reload vault");
+        let primary = &loaded.profiles[0];
+        assert_eq!(primary.credentials.len(), 2);
+
+        let c1 = &primary.credentials[0];
+        assert_eq!(c1.vc_id, "vc-001");
+        assert_eq!(c1.issuer_did, "did:key:zissuer1");
+        assert_eq!(c1.subject_did, "did:key:zsubject1");
+        assert_eq!(c1.credential_type, "UniversityDegree");
+        assert_eq!(c1.fidelity_score, Some(0.95));
+        assert_eq!(
+            c1.expiration_date,
+            Some("2027-06-01T00:00:00Z".to_string())
+        );
+        assert!(c1.raw_payload.contains("vc-001"));
+
+        let c2 = &primary.credentials[1];
+        assert_eq!(c2.vc_id, "vc-002");
+        assert!(c2.fidelity_score.is_none());
+        assert!(c2.expiration_date.is_none());
+        assert_eq!(c2.credential_type, "Membership");
+
+        // Verify alt profile has empty credentials
+        assert!(loaded.profiles[1].credentials.is_empty());
+
+        // --- Upsert: replace existing vc-001 with updated payload ---
+        let cred1_updated = VaultCredential {
+            vc_id: "vc-001".to_string(),
+            issuer_did: "did:key:zissuer1".to_string(),
+            subject_did: "did:key:zsubject1".to_string(),
+            credential_type: "UniversityDegree".to_string(),
+            fidelity_score: Some(0.98),
+            expiration_date: Some("2028-06-01T00:00:00Z".to_string()),
+            raw_payload: r#"{"@context":["https://www.w3.org/2018/credentials/v1"],"id":"vc-001","type":["VerifiableCredential","UniversityDegree"],"issuer":"did:key:zissuer1","issuanceDate":"2025-06-01T00:00:00Z","credentialSubject":{"id":"did:key:zsubject1","degree":"MSc"}}"#.to_string(),
+        };
+
+        if let Some(existing) = loaded.profiles[0]
+            .credentials
+            .iter_mut()
+            .find(|c| c.vc_id == "vc-001")
+        {
+            *existing = cred1_updated;
+        }
+
+        save_vault_inner(&path, &loaded).expect("Should save after upsert");
+        let reloaded = load_vault_from_path(&path).expect("Should reload after upsert");
+
+        // Length should still be 2 (replaced, not appended)
+        assert_eq!(reloaded.profiles[0].credentials.len(), 2);
+        let replaced = &reloaded.profiles[0].credentials[0];
+        assert_eq!(replaced.vc_id, "vc-001");
+        assert_eq!(replaced.fidelity_score, Some(0.98));
+        assert_eq!(
+            replaced.expiration_date,
+            Some("2028-06-01T00:00:00Z".to_string())
+        );
+
+        // --- Push a new unique credential ---
+        let cred3 = VaultCredential {
+            vc_id: "vc-003".to_string(),
+            issuer_did: "did:key:zissuer3".to_string(),
+            subject_did: "did:key:zsubject2".to_string(),
+            credential_type: "Badge".to_string(),
+            fidelity_score: None,
+            expiration_date: None,
+            raw_payload: r#"{"@context":["https://www.w3.org/2018/credentials/v1"],"id":"vc-003","type":["VerifiableCredential","Badge"],"issuer":"did:key:zissuer3","credentialSubject":{"id":"did:key:zsubject2","badge":"Contributor"}}"#.to_string(),
+        };
+
+        // Reload fresh from disk to test append
+        let mut final_vault = load_vault_from_path(&path).expect("Should reload");
+        final_vault.profiles[0].credentials.push(cred3);
+        save_vault_inner(&path, &final_vault).expect("Should save after append");
+        let final_loaded = load_vault_from_path(&path).expect("Should reload final");
+
+        assert_eq!(final_loaded.profiles[0].credentials.len(), 3);
+        assert_eq!(final_loaded.profiles[0].credentials[2].vc_id, "vc-003");
+
+        // --- Zero regression: key derivation still works ---
+        let kp = get_profile_keypair(&final_loaded, "primary")
+            .expect("Key derivation should still work");
+        assert_eq!(kp.did, final_loaded.profiles[0].did);
+        let kp2 = get_profile_keypair(&final_loaded, "")
+            .expect("Empty profile_id should default to first");
+        assert_eq!(kp2.did, kp.did);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_legacy_vault_without_credentials_defaults_to_empty() {
+        let mut path = temp_dir();
+        path.push("test_vault_legacy.json");
+
+        let _vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let raw_json = {
+            let encrypted = std::fs::read_to_string(&path).expect("Should read");
+            let decoded =
+                base64::Engine::decode(&base64, encrypted.trim()).expect("Should decode");
+            String::from_utf8(decoded).expect("Should be UTF-8")
+        };
+
+        let legacy: serde_json::Value =
+            serde_json::from_str(&raw_json).expect("Should parse");
+        let profile0 = &legacy["profiles"][0];
+        assert!(
+            profile0.get("credentials").is_some(),
+            "New serialization must include credentials field"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

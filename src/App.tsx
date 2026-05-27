@@ -19,6 +19,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import KeysManager from "./components/KeysManager";
 import SovereignSigner from "./components/SovereignSigner";
+import TrustAssets from "./components/TrustAssets";
 import WsSignPopup from "./components/WsSignPopup";
 import "./App.css";
 
@@ -160,7 +161,7 @@ function ServiceSwitchPanel() {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState<"services" | "keys" | "signer">(
+  const [activeTab, setActiveTab] = useState<"services" | "keys" | "signer" | "assets">(
     "services",
   );
 
@@ -189,12 +190,19 @@ function App() {
           >
             Signer
           </button>
+          <button
+            className={activeTab === "assets" ? "active" : ""}
+            onClick={() => setActiveTab("assets")}
+          >
+            Assets
+          </button>
         </div>
 
         <div className="tab-content">
           {activeTab === "services" && <ServiceSwitchPanel />}
           {activeTab === "keys" && <KeysManager />}
           {activeTab === "signer" && <SovereignSigner />}
+          {activeTab === "assets" && <TrustAssets />}
         </div>
       </main>
     </>

@@ -316,3 +316,166 @@ textarea {
         border-color: #285038;
     }
 }
+
+/* Trust Assets Dashboard */
+.credential-card {
+    position: relative;
+    transition: opacity 0.2s;
+}
+
+.credential-card.expired {
+    opacity: 0.55;
+    filter: grayscale(0.7);
+}
+
+.credential-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.fidelity-badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 12px;
+    font-size: 0.75em;
+    font-weight: 600;
+}
+
+.fidelity-badge.tier1 {
+    background: #e3f2fd;
+    color: #1565c0;
+    border: 1px solid #90caf9;
+}
+
+.fidelity-badge.tier2 {
+    background: #f3e5f5;
+    color: #7b1fa2;
+    border: 1px solid #ce93d8;
+}
+
+.fidelity-badge.tier3 {
+    background: #fff8e1;
+    color: #f57f17;
+    border: 1px solid #ffe082;
+}
+
+.expired-badge {
+    display: inline-block;
+    background: #fce8e6;
+    color: #c5221f;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.75em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.expired-banner {
+    background: #fce8e6;
+    color: #c5221f;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.85em;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+    border: 1px solid #fad2cf;
+}
+
+.critical-alert {
+    background: #fff3e0;
+    color: #e65100;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.85em;
+    margin-bottom: 0.75rem;
+    border: 1px solid #ffe0b2;
+    word-break: break-all;
+}
+
+.critical-alert small {
+    display: block;
+    margin-top: 0.3rem;
+    opacity: 0.85;
+    word-break: break-all;
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+.credential-meta {
+    font-size: 0.85em;
+    line-height: 1.8;
+    margin-bottom: 1rem;
+}
+
+.credential-meta code {
+    font-size: 0.9em;
+    word-break: break-all;
+}
+
+.muted {
+    color: #888;
+    font-style: italic;
+}
+
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background: white;
+    padding: 2rem;
+    border-radius: 12px;
+    max-width: 700px;
+    width: 90%;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+}
+
+.modal-content h3 {
+    margin-top: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+    .fidelity-badge.tier1 {
+        background: #1a237e;
+        color: #90caf9;
+        border-color: #1565c0;
+    }
+    .fidelity-badge.tier2 {
+        background: #311b92;
+        color: #ce93d8;
+        border-color: #7b1fa2;
+    }
+    .fidelity-badge.tier3 {
+        background: #3e2723;
+        color: #ffe082;
+        border-color: #f57f17;
+    }
+    .modal-content {
+        background: #2f2f2f;
+    }
+    .expired-banner {
+        background: #3e1a1a;
+        color: #ef9a9a;
+        border-color: #5c2a2a;
+    }
+    .critical-alert {
+        background: #3e2723;
+        color: #ffcc80;
+        border-color: #5c3a2a;
+    }
+}

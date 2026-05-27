@@ -369,6 +369,7 @@ fn import_did(
                 profile_name: "Primary Identity".to_string(),
                 derivation_index: 0,
                 did: kp.did,
+                credentials: vec![],
             }],
         }
     };
@@ -804,6 +805,91 @@ fn get_vote_history(app: AppHandle) -> Result<Vec<vault::VoteRecord>, String> {
     vault::get_vote_records(&app)
 }
 
+// ---------- Credential Vault Commands ----------
+
+#[tauri::command]
+fn save_credential(
+    app: AppHandle,
+    profile_id: String,
+    vc_json: String,
+) -> Result<(), String> {
+    if profile_id.is_empty() {
+        return Err("profile_id must not be empty".to_string());
+    }
+
+    let verification = did_rust::verify_vc(&vc_json);
+    let result: serde_json::Value = serde_json::from_str(&verification)
+        .map_err(|_| "Failed to parse verification result".to_string())?;
+    if !result["valid"].as_bool().unwrap_or(false) {
+        return Err(format!(
+            "Credential verification failed: {}",
+            result["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
+
+    let vc: serde_json::Value = serde_json::from_str(&vc_json)
+        .map_err(|_| "Invalid VC JSON".to_string())?;
+
+    let vc_id = vc["id"].as_str().unwrap_or("").to_string();
+    if vc_id.is_empty() {
+        return Err("VC missing required 'id' field".to_string());
+    }
+
+    let vault_credential = vault::VaultCredential {
+        vc_id: vc_id.clone(),
+        issuer_did: vc["issuer"].as_str().unwrap_or("").to_string(),
+        subject_did: vc["credentialSubject"]["id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        credential_type: vc["type"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|t| t.as_str())
+            .unwrap_or("VerifiableCredential")
+            .to_string(),
+        fidelity_score: None,
+        expiration_date: vc["expirationDate"].as_str().map(String::from),
+        raw_payload: vc_json,
+    };
+
+    let mut vault = vault::load_vault(&app)?;
+    let profile = vault
+        .profiles
+        .iter_mut()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+    if let Some(existing) = profile
+        .credentials
+        .iter_mut()
+        .find(|c| c.vc_id == vc_id)
+    {
+        *existing = vault_credential;
+    } else {
+        profile.credentials.push(vault_credential);
+    }
+
+    vault::save_vault(&app, &vault)
+}
+
+#[tauri::command]
+fn get_credentials(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<Vec<vault::VaultCredential>, String> {
+    if profile_id.is_empty() {
+        return Err("profile_id must not be empty".to_string());
+    }
+    let vault = vault::load_vault(&app)?;
+    let profile = vault
+        .profiles
+        .iter()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+    Ok(profile.credentials.clone())
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -914,6 +1000,8 @@ pub fn run() {
             get_service_statuses,
             sync_vote_records,
             get_vote_history,
+            save_credential,
+            get_credentials,
         ]);
 
     builder
