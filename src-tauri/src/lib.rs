@@ -16,6 +16,7 @@
  */
 
 use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
+use chrono::{DateTime, Utc};
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,6 +73,7 @@ pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
     pub pending_messages: Mutex<Vec<String>>,
+    pub popup_active: Mutex<bool>,
 }
 
 impl Default for WsState {
@@ -80,6 +82,7 @@ impl Default for WsState {
             response_sender: Mutex::new(None),
             challenge_channel: Mutex::new(None),
             pending_messages: Mutex::new(Vec::new()),
+            popup_active: Mutex::new(false),
         }
     }
 }
@@ -691,6 +694,171 @@ async fn submit_ws_credential_response(
     Ok(())
 }
 
+// ---------- POLLY_CREDENTIAL_REQUEST response ----------
+
+struct PopupGuard {
+    ws: *const WsState,
+    cleared: bool,
+}
+
+impl PopupGuard {
+    fn acquire(ws: &WsState) -> Result<Self, String> {
+        let mut popup = ws.popup_active.lock().unwrap();
+        if *popup {
+            return Err("A popup request is already being processed".to_string());
+        }
+        *popup = true;
+        Ok(Self { ws: ws as *const WsState, cleared: false })
+    }
+
+    fn release(&mut self) {
+        if !self.cleared {
+            let ws = unsafe { &*self.ws };
+            let mut popup = ws.popup_active.lock().unwrap();
+            *popup = false;
+            self.cleared = true;
+            let pending = ws.pending_messages.lock().unwrap().clone();
+            if let Some(channel) = ws.challenge_channel.lock().unwrap().as_ref() {
+                for msg in &pending {
+                    let _ = channel.send(msg.clone());
+                }
+                ws.pending_messages.lock().unwrap().clear();
+                if !pending.is_empty() {
+                    println!("!!! FLUSHED {} queued messages after popup release !!!", pending.len());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PopupGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[tauri::command]
+async fn submit_ws_credential_presentation(
+    credential_type: String,
+    challenge: String,
+    approved: bool,
+    app: AppHandle,
+    ws_state: State<'_, WsState>,
+    profile_id: Option<String>,
+) -> Result<(), String> {
+    if credential_type.is_empty() {
+        return Err("credential_type must not be empty".to_string());
+    }
+    if challenge.is_empty() {
+        return Err("challenge must not be empty".to_string());
+    }
+
+    let mut guard = PopupGuard::acquire(&*ws_state)?;
+
+    let sender = {
+        let guard = ws_state.response_sender.lock().unwrap();
+        guard.clone().ok_or("No WebSocket connected")?
+    };
+
+    if !approved {
+        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        println!("WS credential presentation denied by user");
+        guard.release();
+        return Ok(());
+    }
+
+    let (signing_key, did) = resolve_profile_keypair(&app, profile_id.clone())?;
+
+    let vault = vault::load_vault(&app)?;
+    let pid = profile_id.unwrap_or_default();
+    let profile = vault
+        .profiles
+        .iter()
+        .find(|p| p.profile_id == pid)
+        .ok_or_else(|| format!("Profile '{}' not found", pid))?;
+
+    let mut candidates: Vec<&vault::VaultCredential> = profile
+        .credentials
+        .iter()
+        .filter(|c| c.credential_type == credential_type)
+        .collect();
+
+    if candidates.is_empty() {
+        let err = serde_json::json!({
+            "status": "error",
+            "reason": "no_matching_credential",
+            "credential_type": credential_type
+        });
+        let _ = sender.send(Message::Text(err.to_string().into()));
+        guard.release();
+        return Ok(());
+    }
+
+    // Prefer non-expired credentials; sort by fidelity descending
+    candidates.sort_by(|a, b| {
+        let a_expired = a.expiration_date.as_ref().map_or(false, |exp| {
+            DateTime::parse_from_rfc3339(exp)
+                .map(|t| Utc::now() > t.with_timezone(&Utc))
+                .unwrap_or(false)
+        });
+        let b_expired = b.expiration_date.as_ref().map_or(false, |exp| {
+            DateTime::parse_from_rfc3339(exp)
+                .map(|t| Utc::now() > t.with_timezone(&Utc))
+                .unwrap_or(false)
+        });
+        a_expired.cmp(&b_expired).then(
+            b.fidelity_score.unwrap_or(0.0)
+                .partial_cmp(&a.fidelity_score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    let chosen = candidates[0];
+
+    // Reject if all candidates are expired
+    if chosen.expiration_date.as_ref().map_or(false, |exp| {
+            DateTime::parse_from_rfc3339(exp)
+                .map(|t| Utc::now() > t.with_timezone(&Utc))
+            .unwrap_or(false)
+    }) {
+        let err = serde_json::json!({
+            "status": "error",
+            "reason": "all_credentials_expired",
+            "credential_type": credential_type
+        });
+        let _ = sender.send(Message::Text(err.to_string().into()));
+        guard.release();
+        return Ok(());
+    }
+
+    // Parse raw_payload as structured JSON — mod req #2
+    let vc_value: serde_json::Value = serde_json::from_str(&chosen.raw_payload)
+        .map_err(|e| format!("Failed to parse stored credential JSON: {}", e))?;
+
+    let key_b58 = bs58::encode(signing_key.to_bytes()).into_string();
+    let signed_vp = did_rust::issue_vp(
+        &vc_value.to_string(),
+        &did,
+        &challenge,
+        &key_b58,
+    )
+    .map_err(|e| format!("Failed to sign VP: {}", e))?;
+
+    let vp_value: serde_json::Value = serde_json::from_str(&signed_vp)
+        .map_err(|e| format!("Failed to parse signed VP as JSON: {}", e))?;
+
+    let response = serde_json::json!({
+        "type": "POLLY_CREDENTIAL_PRESENTATION",
+        "vp": vp_value,
+        "challenge": challenge
+    });
+
+    println!("Signed credential presentation for type: {}", credential_type);
+    let _ = sender.send(Message::Text(response.to_string().into()));
+
+    guard.release();
+    Ok(())
+}
+
 // ---------- auto-start settings ----------
 
 fn auto_start_path(app: &AppHandle) -> PathBuf {
@@ -1002,6 +1170,7 @@ pub fn run() {
             get_vote_history,
             save_credential,
             get_credentials,
+            submit_ws_credential_presentation,
         ]);
 
     builder

@@ -30,6 +30,13 @@ use crate::WsState;
 fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
     let state = app.state::<WsState>();
     let serialized = msg_json.to_string();
+    let popup = state.popup_active.lock().unwrap();
+    if *popup {
+        state.pending_messages.lock().unwrap().push(serialized);
+        println!("!!! CHALLENGE QUEUED — Popup already active !!!");
+        return;
+    }
+    drop(popup);
     let pipe = state.challenge_channel.lock().unwrap();
     if let Some(channel) = pipe.as_ref() {
         let _ = channel.send(serialized);
@@ -263,6 +270,43 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                             text
                         );
                     }
+                } else if json["type"] == "POLLY_CREDENTIAL_REQUEST" {
+                    let required_type = json["required_credential_type"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let challenge = json["challenge"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    if required_type.is_empty() || challenge.is_empty() {
+                        println!("DEBUG: POLLY_CREDENTIAL_REQUEST missing required_credential_type or challenge");
+                        let _ = response_tx.send(Message::Text(
+                            "{\"status\":\"error\",\"reason\":\"missing_required_fields\"}".into(),
+                        ));
+                        continue;
+                    }
+                    println!("Triggering Credential Presentation for type: {}", required_type);
+                    let app_handle = app_handle.clone();
+                    tokio::spawn(async move {
+                        let app = app_handle;
+
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+
+                        pipe_or_queue(
+                            &app,
+                            serde_json::json!({
+                                "__type__": "POLLY_CREDENTIAL_REQUEST",
+                                "required_credential_type": required_type,
+                                "challenge": challenge,
+                                "profile_id": profile_id
+                            }),
+                        );
+                    });
                 } else if json["type"] == "OMNI_SIGN_REQUEST" {
                     handle_omni_sign_request(json, &app_handle, &response_tx).await;
                 } else {

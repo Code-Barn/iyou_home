@@ -33,6 +33,12 @@ type SignRequest =
       credential: any;
       holder_did: string;
       profile_id?: string;
+    }
+  | {
+      type: "POLLY_CREDENTIAL_REQUEST";
+      required_credential_type: string;
+      challenge: string;
+      profile_id?: string;
     };
 
 function getCredentialTitle(credential: any): string {
@@ -74,6 +80,13 @@ export default function WsSignPopup() {
             type: "sign_credential",
             credential: parsed.credential,
             holder_did: parsed.holder_did,
+            profile_id,
+          });
+        } else if (parsed.__type__ === "POLLY_CREDENTIAL_REQUEST") {
+          setRequest({
+            type: "POLLY_CREDENTIAL_REQUEST",
+            required_credential_type: parsed.required_credential_type,
+            challenge: parsed.challenge,
             profile_id,
           });
         } else if (parsed.__type__ === "sign") {
@@ -140,6 +153,14 @@ export default function WsSignPopup() {
           profileId: request.profile_id || null,
         });
         console.log("REACT: submit_ws_credential_response succeeded");
+      } else if (request.type === "POLLY_CREDENTIAL_REQUEST") {
+        await invoke("submit_ws_credential_presentation", {
+          credentialType: request.required_credential_type,
+          challenge: request.challenge,
+          approved,
+          profileId: request.profile_id || null,
+        });
+        console.log("REACT: submit_ws_credential_presentation succeeded");
       } else {
         await invoke("submit_ws_response", {
           id: "",
@@ -191,7 +212,9 @@ export default function WsSignPopup() {
             ? "Nostr Event Signing Request"
             : request.type === "sign_credential"
               ? `${getCredentialTitle(request.credential)} Signing Request`
-              : "Signature Request"}
+              : request.type === "POLLY_CREDENTIAL_REQUEST"
+                ? "Credential Sharing Request"
+                : "Signature Request"}
         </h2>
 
         {/* Persona Context Display */}
@@ -307,6 +330,51 @@ export default function WsSignPopup() {
           </>
         )}
 
+        {request.type === "POLLY_CREDENTIAL_REQUEST" && (
+          <>
+            <p>
+              A local application is requesting proof of{" "}
+              <strong>{request.required_credential_type}</strong> from your
+              vault.
+            </p>
+            <div
+              style={{
+                background: "#fff3e0",
+                padding: "0.75rem 1rem",
+                borderRadius: "6px",
+                margin: "1rem 0",
+              }}
+            >
+              <strong>Requested Credential Type:</strong>
+              <span
+                style={{
+                  display: "block",
+                  fontFamily: "monospace",
+                  fontSize: "1.1em",
+                  marginTop: "0.3rem",
+                }}
+              >
+                {request.required_credential_type}
+              </span>
+            </div>
+            <div style={{ margin: "1rem 0" }}>
+              <strong>Challenge (anti-replay):</strong>
+              <pre
+                style={{
+                  background: "#f4f4f4",
+                  padding: "0.5rem",
+                  borderRadius: "4px",
+                  fontSize: "0.8em",
+                  color: "#555",
+                  overflowX: "auto",
+                }}
+              >
+                {request.challenge}
+              </pre>
+            </div>
+          </>
+        )}
+
         <div
           style={{
             display: "flex",
@@ -347,7 +415,11 @@ export default function WsSignPopup() {
               disabled={isProcessing}
               style={{ background: "#137333", color: "white" }}
             >
-              {isProcessing ? "Signing..." : "Approve & Sign"}
+              {isProcessing
+                ? "Signing..."
+                : request.type === "POLLY_CREDENTIAL_REQUEST"
+                  ? "Share Asset"
+                  : "Approve & Sign"}
             </button>
           </div>
         </div>
