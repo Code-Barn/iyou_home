@@ -268,6 +268,39 @@ while let Some(Ok(msg)) = ws_receiver.next().await {
 }
 ```
 
+#### Critical Pattern: Forwarder Drain Race
+
+The forwarder task (`bridge.rs`, spawned alongside every WebSocket connection) reads from an `mpsc::UnboundedReceiver<Message>` and writes each message to the TCP socket via `ws_sender.send(msg).await` followed by `ws_sender.flush().await`. A race exists between **React unmounting the signing popup** and **the forwarder finishing its async write**:
+
+1. User approves — React calls `invoke("submit_ws_response", ...)`.
+2. Rust command synchronously pushes the message into the mpsc channel and returns.
+3. React receives the response and immediately unmounts the popup (`setRequest(null)`).
+4. The forwarder task may not have picked up the message yet — the async write to the TCP stack is still in-flight.
+5. If the iyou_idp WebSocket client times out or the popup teardown causes the browser to close the connection, the response is lost.
+
+**Fix — dual 100ms drain window:**
+
+**Frontend** (`src/components/WsSignPopup.tsx`): After a successful `invoke`, delay popup teardown by 100ms via `setTimeout` instead of clearing state immediately. Error paths still clear instantly (no data to flush).
+
+```typescript
+await invoke("submit_ws_response", { profileId, challenge, approved });
+// Mitigate unmount/connection-drop race: allow Rust forwarder task
+// to drain the TCP buffer before tearing down the popup context.
+setTimeout(() => {
+    closePopupModalOrResetState();
+}, 100);
+```
+
+**Backend** (`src-tauri/src/bridge.rs`): The forwarder task's exit sleep increased from 50ms → 100ms, giving the TCP stack an extra drain window before `response_sender` is cleared.
+
+```rust
+tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+let ws_state = app_clone.state::<WsState>();
+*ws_state.response_sender.lock().unwrap() = None;
+```
+
+The flush after every `send()` inside the forwarder loop remains the primary write-completion guarantee; the exit sleep is a secondary guard against premature sender-reference cleanup under load.
+
 ### Testing the Backend
 
 Unit tests are in `src-tauri/src/lib.rs` and `src-tauri/src/vault.rs`.
@@ -587,13 +620,13 @@ Portals must provide explicit profile identifiers to target alternative identiti
 
 ## Known Risks
 
-1. **`submit_ws_response` sender race.** A concurrent `handle_connection` exit could clear `response_sender` between the clone and the send, dropping the signed VP silently.
+1. **`submit_ws_response` sender race.** A concurrent `handle_connection` exit could clear `response_sender` between the clone and the send, dropping the signed VP silently. *Mitigated*: the forwarder task now sleeps 100ms before clearing `response_sender`, and the React popup delays teardown by 100ms after a successful invoke (see **Forwarder Drain Race** pattern above).
 
 2. **No channel re-registration.** If React unmounts and remounts `WsSignPopup`, it creates a new `Channel` and re-registers it. The old channel in the backend `Mutex` is simply replaced — the WebSocket task always reads the latest.
 
 3. **Heartbeat Ping has no backpressure or retry.** A single failed ping kills the forwarder task and the response path with it.
 
-4. **Forwarder exit race.** The 50ms sleep + explicit flush in the forwarder task mitigates the race where the task exits before the last message reaches the TCP stack, but does not eliminate it entirely under extreme load.
+4. **Forwarder exit race.** The 100ms sleep + explicit flush in the forwarder task mitigates the race where the task exits before the last message reaches the TCP stack, paired with a 100ms `setTimeout` drain window on the frontend before the popup unmounts. Under extreme load the window may still be insufficient.
 
 5. **PopupGuard pointer safety.** The guard uses a raw pointer `*const WsState` to bypass borrow-checker lifetime constraints. The pointer is valid for the command's duration because `WsState` is managed by Tauri (static lifetime). If `WsState` is ever dropped before the guard, dereferencing the raw pointer would be UB.
 
