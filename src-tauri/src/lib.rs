@@ -1092,6 +1092,67 @@ fn get_credentials(
     Ok(profile.credentials.clone())
 }
 
+#[tauri::command]
+fn store_credential(
+    app: AppHandle,
+    profile_id: String,
+    credential: vault::VaultCredential,
+) -> Result<(), String> {
+    if profile_id.is_empty() {
+        return Err("profile_id must not be empty".to_string());
+    }
+    let mut vault = vault::load_vault(&app)?;
+    let profile = vault
+        .profiles
+        .iter_mut()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+    if let Some(existing) = profile
+        .credentials
+        .iter_mut()
+        .find(|c| c.vc_id == credential.vc_id)
+    {
+        *existing = credential;
+    } else {
+        profile.credentials.push(credential);
+    }
+
+    vault::save_vault(&app, &vault)
+}
+
+#[tauri::command]
+fn delete_credential(
+    app: AppHandle,
+    profile_id: String,
+    vc_id: String,
+) -> Result<(), String> {
+    if profile_id.is_empty() {
+        return Err("profile_id must not be empty".to_string());
+    }
+    if vc_id.is_empty() {
+        return Err("vc_id must not be empty".to_string());
+    }
+    let mut vault = vault::load_vault(&app)?;
+    let profile = vault
+        .profiles
+        .iter_mut()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+    let len_before = profile.credentials.len();
+    profile.credentials.retain(|c| c.vc_id != vc_id);
+
+    if profile.credentials.len() == len_before {
+        return Err(format!(
+            "Credential '{}' not found in profile '{}'",
+            vc_id, profile_id
+        ));
+    }
+
+    vault::save_vault(&app, &vault)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1210,6 +1271,8 @@ pub fn run() {
             sync_poll_ledger,
             save_credential,
             get_credentials,
+            store_credential,
+            delete_credential,
             submit_ws_credential_presentation,
         ]);
 

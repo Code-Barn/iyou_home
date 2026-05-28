@@ -332,6 +332,8 @@ Ed25519 keypair = SHA-256(root_seed || LE(derivation_index))
 | `get_vote_history` | Returns the full array of stored `VoteRecord` entries from the local Poll Vote Ledger |
 | `save_credential(profile_id, vc_json)` | Validates a VC signature, then upserts it into the profile's credential store |
 | `get_credentials(profile_id)` | Returns the full credential vector for a profile |
+| `store_credential(profile_id, credential)` | Upserts a pre-built `VaultCredential` struct directly (no VC signature verification — for protocol parity) |
+| `delete_credential(profile_id, vc_id)` | Removes a credential by `vc_id` from the target profile |
 | `calculate_vote_merkle_root(records)` | Builds a second-preimage resistant SHA-256 Merkle tree from `VoteRecord` signatures; returns 64-char lowercase hex root. Empty input → empty string. Single leaf → `SHA-256(0x00 \|\| sig)`. Odd layers duplicate final node. Used by the IPFS Cloud Archive tab to audit server-side governance anchors. |
 | `sync_poll_ledger(poll, records)` | Offline poll sync: filters `VoteRecord` entries through `LocalPoll::validate_vote_timeline`, computes Merkle root over the valid subset, and returns the hex root as a success checkpoint. Timestamps before `starts_at` or after `ends_at` are rejected unless `is_ongoing` is set. |
 
@@ -374,7 +376,9 @@ pub struct VaultCredential {
 
 **Credential management commands:**
 - `save_credential(profile_id, vc_json)` — validates the VC signature via `did_rust::verify_vc`, then upserts by `vc_id` into the profile's credential vector.
+- `store_credential(profile_id, credential)` — bare struct insertion with upsert-by-`vc_id` dedup; does **not** perform VC signature verification (designed for protocol parity / direct insert flows).
 - `get_credentials(profile_id)` — returns the full `Vec<VaultCredential>` for the given profile.
+- `delete_credential(profile_id, vc_id)` — loads vault, locates profile, prunes the credential matching `vc_id`, and persists. Returns an error if `vc_id` is not found.
 
 **UI:** The "Trust Assets" dashboard (`src/components/TrustAssets.tsx`) displays stored credentials with fidelity tier badges, expiration awareness (grayscale + banner for expired), subject DID mismatch alerts against the active profile, and a raw payload inspection modal.
 
@@ -510,7 +514,7 @@ This application strictly employs a Level 2 (Sovereign) security posture using a
 1.  **The Vault (Rust Backend):** A 32-byte root seed, a vector of profile descriptors, and per-profile Verifiable Credentials are persisted in base64-encrypted JSON at `{app_data}/vault.json`. All access is managed exclusively by Rust (`src-tauri/src/vault.rs`). **No private key material — derived or stored — is ever exposed to the JavaScript frontend context.** The frontend receives only `did:key:` strings via `Profile.did` and credential payloads via `get_credentials`.
 2.  **Poll Vote Ledger (Rust Backend):** An immutable local audit trail of poll voting history is persisted as plain JSON at `{app_data}/poll_ledger.json`. The ledger is managed by the same `vault.rs` module and exposed to the frontend via `sync_vote_records` and `get_vote_history` Tauri commands. No private key material is stored in the ledger — only Ed25519 signatures over canonicalised poll payloads.
 3.  **Deterministic Derivation:** Per-persona Ed25519 keypairs are derived inside the Rust process via `SHA-256(root_seed || LE(derivation_index))`. Individual profile private keys are never stored.
-4.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge`, `submit_ws_response`, etc.). The `profile_id` is threaded from the WebSocket frame through the React popup and back to the signing command. Vote history retrieval is handled via `get_vote_history` / `sync_vote_records`. Credential storage is managed via `save_credential` / `get_credentials` and displayed in the Trust Assets dashboard. Headless `OMNI_SIGN_REQUEST` / `POLLY_V2` signing bypasses the React layer entirely and is handled directly in the Rust bridge. User-gated `POLLY_CREDENTIAL_REQUEST` credential sharing routes through the React popup.
+4.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge`, `submit_ws_response`, etc.). The `profile_id` is threaded from the WebSocket frame through the React popup and back to the signing command. Vote history retrieval is handled via `get_vote_history` / `sync_vote_records`. Credential storage is managed via `save_credential` / `store_credential` / `get_credentials` / `delete_credential` and displayed in the Trust Assets dashboard. Headless `OMNI_SIGN_REQUEST` / `POLLY_V2` signing bypasses the React layer entirely and is handled directly in the Rust bridge. User-gated `POLLY_CREDENTIAL_REQUEST` credential sharing routes through the React popup.
 5.  **Backend Cryptography:** VP signing, DID resolution, and OMNI payload canonicalisation + signing are performed natively in Rust by the combined `ed25519-dalek`, `sha2`, and `did_rust` libraries.
 6.  **WASM Utilities:** `did_rust` is compiled to WebAssembly (`src/lib/did_rust_wasm/`) only for non-sensitive parsing and validation in the frontend.
 
