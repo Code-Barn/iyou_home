@@ -15,6 +15,30 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+// ---------------------------------------------------------------------------
+// Blossom / BUD-01 Local Blob Server (Primary Data Plane)
+//
+// This module implements a minimal, database-free Blossom-compatible server
+// bound to 127.0.0.1:9002. It is the exclusive local personal blob storage
+// tier for iyou_home — a lean Personal Data Store (PDS).
+//
+// Architectural invariants enforced here:
+//   • No embedded Postgres or SQLite — all blobs are written directly to
+//     the local filesystem under {app_local_data_dir}/blobs/{sha256_hex}.
+//   • Content-addressed via SHA-256 — the upload path IS the hex digest
+//     of the body; the server re-computes and validates this on PUT.
+//   • No IPFS node, DHT discovery, or P2P transport layer is embedded.
+//     IPFS belongs strictly at cloud boundaries (iyou_idp downloads,
+//     server-side governance anchors).
+//   • Private Network Access (PNA) headers are mandatory for browser
+//     pre-flight compliance (Safari/Chrome require
+//     Access-Control-Allow-Private-Network: true when a public HTTPS
+//     portal fetches from a loopback origin).
+//
+// References:
+//   BUD-01: https://github.com/hzrd149/blossom/blob/master/bud-01.md
+// ---------------------------------------------------------------------------
+
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, State},

@@ -860,6 +860,16 @@ async fn submit_ws_credential_presentation(
 }
 
 // ---------- auto-start settings ----------
+//
+// IMPORTANT — PDS Boundary Invariant:
+// This client application is a lean Personal Data Store (PDS). It MUST
+// NOT initialize or spawn any IPFS node, DHT discovery service, or
+// heavy P2P transport process. IPFS belongs strictly at cloud/server
+// boundaries (iyou_idp downloads, server-side governance anchors).
+//
+// Only lightweight local services (Blossom on :9002, Nostr relay on
+// :9003, Chat/XMPP on :5222) are valid auto-start targets. Do NOT add
+// IPFS or other P2P daemon entries to this list.
 
 fn auto_start_path(app: &AppHandle) -> PathBuf {
     let mut path = app
@@ -971,6 +981,30 @@ fn sync_vote_records(app: AppHandle, records: Vec<vault::VoteRecord>) -> Result<
 #[tauri::command]
 fn get_vote_history(app: AppHandle) -> Result<Vec<vault::VoteRecord>, String> {
     vault::get_vote_records(&app)
+}
+
+// ---------- Cold Governance Anchoring ----------
+
+#[tauri::command]
+fn calculate_vote_merkle_root(records: Vec<vault::VoteRecord>) -> String {
+    vault::calculate_vote_merkle_root(&records)
+}
+
+// ---------- Local Poll Sync & Ingestion ----------
+
+#[tauri::command]
+fn sync_poll_ledger(
+    poll: vault::LocalPoll,
+    records: Vec<vault::VoteRecord>,
+) -> Result<String, String> {
+    let valid_records: Vec<vault::VoteRecord> = records
+        .into_iter()
+        .filter(|r| {
+            poll.validate_vote_timeline(r.network_timestamp as u64)
+                .is_ok()
+        })
+        .collect();
+    Ok(vault::calculate_vote_merkle_root(&valid_records))
 }
 
 // ---------- Credential Vault Commands ----------
@@ -1085,6 +1119,10 @@ pub fn run() {
                 let state = app_handle.state::<ServiceState>();
                 *state.auto_start_settings.lock().unwrap() = auto_start.clone();
             }
+            // Auto-start configured local services. This loop intentionally
+            // only starts lightweight PDS services (Blossom, Nostr relay,
+            // Chat).  IPFS node/DHT initialization must NEVER be added here
+            // — that responsibility belongs to server-side infrastructure.
             for (name, enabled) in &auto_start {
                 if *enabled {
                     let app = app_handle.clone();
@@ -1168,6 +1206,8 @@ pub fn run() {
             get_service_statuses,
             sync_vote_records,
             get_vote_history,
+            calculate_vote_merkle_root,
+            sync_poll_ledger,
             save_credential,
             get_credentials,
             submit_ws_credential_presentation,

@@ -17,6 +17,7 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import IpfsArchiveViewer from "./components/IpfsArchiveViewer";
 import KeysManager from "./components/KeysManager";
 import SovereignSigner from "./components/SovereignSigner";
 import TrustAssets from "./components/TrustAssets";
@@ -37,7 +38,10 @@ const SERVICES: ServiceInfo[] = [
   { name: "Blossom", port: 9002 },
   { name: "Nostr", port: 9003 },
   { name: "Chat", port: 5222 },
-  { name: "IPFS", comingSoon: true },
+  // IPFS belongs strictly at cloud/server boundaries (iyou_idp downloads,
+  // governance anchors). No local IPFS node or DHT daemon will be embedded
+  // in this PDS client; this entry merely tracks remote archive availability.
+  { name: "IPFS Cloud Archive", comingSoon: true },
   { name: "Polly", comingSoon: true },
 ];
 
@@ -161,7 +165,7 @@ function ServiceSwitchPanel() {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState<"services" | "keys" | "signer" | "assets">(
+  const [activeTab, setActiveTab] = useState<"services" | "keys" | "signer" | "assets" | "archive">(
     "services",
   );
 
@@ -196,6 +200,12 @@ function App() {
           >
             Assets
           </button>
+          <button
+            className={activeTab === "archive" ? "active" : ""}
+            onClick={() => setActiveTab("archive")}
+          >
+            IPFS Cloud Archive
+          </button>
         </div>
 
         <div className="tab-content">
@@ -203,6 +213,7 @@ function App() {
           {activeTab === "keys" && <KeysManager />}
           {activeTab === "signer" && <SovereignSigner />}
           {activeTab === "assets" && <TrustAssets />}
+          {activeTab === "archive" && <IpfsArchiveViewer />}
         </div>
       </main>
     </>

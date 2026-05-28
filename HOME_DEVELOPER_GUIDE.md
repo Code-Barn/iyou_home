@@ -34,8 +34,8 @@ This guide provides instructions for setting up the development environment, run
 The backend is located in the `src-tauri` directory and is organised into five source modules plus a build script:
 
 | Module | File | Responsibility |
-|---|---|---|
-| **vault** | `src/vault.rs` | Encrypted profile registry, root seed management, deterministic Ed25519 key derivation, **Poll Vote Ledger** (`PollLedger` / `VoteRecord`), **Credential Vault** (`VaultCredential`) |
+|---|---|---|---|
+| **vault** | `src/vault.rs` | Encrypted profile registry, root seed management, deterministic Ed25519 key derivation, **Poll Vote Ledger** (`PollLedger` / `VoteRecord`), **Credential Vault** (`VaultCredential`), **Merkle Root** (`calculate_vote_merkle_root` — second-preimage resistant SHA-256 tree for cold governance anchoring) |
 | **bridge** | `src/bridge.rs` | WebSocket server on port 9001 — parses inbound frames (incl. `OMNI_SIGN_REQUEST` / `POLLY_V2`), routes by `profile_id`, pipes signing requests to React |
 | **nostr_relay** | `src/nostr_relay.rs` | NIP-01 Nostr relay (port 9003) |
 | **blossom** | `src/blossom.rs` | BUD-01 blob server (port 9002) |
@@ -286,10 +286,21 @@ Current test suites — **vault**:
 - `test_get_profile_by_id_defaults_to_first` — empty `profile_id` resolves to index 0
 - `test_get_profile_keypair` — `get_profile_keypair` returns correct DID for a profile
 - `test_vote_record_round_trip` — serialise/deserialise cycle for `PollLedger` / `VoteRecord`
+- `test_merkle_root_two_records_deterministic` — same inputs → same root
+- `test_merkle_root_single_record` — leaf = `SHA-256(0x00 \|\| sig)`
+- `test_merkle_root_changing_signature_changes_root` — different sig → different root
+- `test_merkle_root_empty_records_returns_empty` — empty input → `""`
+- `test_merkle_root_three_records_odd_duplication` — odd leaf count duplicates final node
 
 Current test suites — **credentials**:
 - `test_credential_storage_fidelity` — upsert by `vc_id` replaces previous entries; `get_credentials` returns live vault data
 - `test_legacy_vault_without_credentials_defaults_to_empty` — legacy files (no `credentials` field) deserialize with an empty `Vec`
+
+Current test suites — **timeline validation**:
+- `test_vote_before_starts_at_rejected` — vote timestamp before `starts_at` returns `Err`
+- `test_vote_after_ends_at_rejected` — vote timestamp after `ends_at` returns `Err`
+- `test_vote_within_window_accepted` — boundary values (`starts_at`, `ends_at`, midpoint) pass cleanly
+- `test_is_ongoing_permits_out_of_bounds` — `is_ongoing: true` bypasses all bounds checks
 
 Current test suites — **commands**:
 - `test_toggle_service_start` / `test_toggle_service_stop` — service state transitions
@@ -321,6 +332,8 @@ Ed25519 keypair = SHA-256(root_seed || LE(derivation_index))
 | `get_vote_history` | Returns the full array of stored `VoteRecord` entries from the local Poll Vote Ledger |
 | `save_credential(profile_id, vc_json)` | Validates a VC signature, then upserts it into the profile's credential store |
 | `get_credentials(profile_id)` | Returns the full credential vector for a profile |
+| `calculate_vote_merkle_root(records)` | Builds a second-preimage resistant SHA-256 Merkle tree from `VoteRecord` signatures; returns 64-char lowercase hex root. Empty input → empty string. Single leaf → `SHA-256(0x00 \|\| sig)`. Odd layers duplicate final node. Used by the IPFS Cloud Archive tab to audit server-side governance anchors. |
+| `sync_poll_ledger(poll, records)` | Offline poll sync: filters `VoteRecord` entries through `LocalPoll::validate_vote_timeline`, computes Merkle root over the valid subset, and returns the hex root as a success checkpoint. Timestamps before `starts_at` or after `ends_at` are rejected unless `is_ongoing` is set. |
 
 The `Profile` struct is safe to send to the frontend (no private key material):
 
@@ -414,13 +427,35 @@ pub struct VoteRecord {
 ```
 
 | Function | Description |
-|---|---|
+|---|---|---|
 | `load_ledger(app)` | Reads and deserialises `poll_ledger.json`; returns an empty `PollLedger` if the file is missing |
 | `save_ledger(app, ledger)` | Serialises (pretty-printed JSON) and writes to `poll_ledger.json` |
 | `append_vote_records(app, records)` | Loads the ledger, appends an array of `VoteRecord`, and persists the result |
 | `get_vote_records(app)` | Loads and returns the full `Vec<VoteRecord>` from the ledger |
 
-The ledger file is stored as plain (unencrypted) JSON — unlike `vault.json` which is base64-encoded — to remain human-readable and machine-portable as an immutable local audit trail.
+**Local Poll Ingestion:** The `LocalPoll` struct carries poll schedule metadata for offline timeline validation:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalPoll {
+    pub poll_id: String,
+    pub title: String,
+    pub poll_type: String,  // e.g. "public", "family_scoped"
+    pub starts_at: u64,     // UNIX timestamp
+    pub ends_at: u64,       // UNIX timestamp
+    pub is_ongoing: bool,   // Overrides ends_at checks if true
+}
+```
+
+`LocalPoll::validate_vote_timeline(vote_timestamp)` enforces offline schedule rules:
+- Vote before `starts_at` → `Err("not initialized")`
+- Vote after `ends_at` → `Err("closed/locked")`
+- Vote within `[starts_at, ends_at]` → `Ok(())`
+- `is_ongoing: true` → all timestamps pass (bypasses bounds checks)
+
+The `sync_poll_ledger` Tauri command accepts a `LocalPoll` and vector of `VoteRecord`, filters records through `validate_vote_timeline`, computes a Merkle root over the survivors, and returns the hex root. This enables iyou_poly to synchronise offline and produce verifiable checkpoints without querying any cloud database.
+
+**Cold Governance Anchoring:** `calculate_vote_merkle_root` builds a Merkle tree over `VoteRecord.client_signature` fields using second-preimage resistant domain separation (`0x00` leaf prefix, `0x01` internal prefix). The resulting root hex string can be compared against `ipfs_cid` hashes published by server-side Polly governance anchors, enabling users to audit that their local vote history matches the immutable archive. The frontend `IpfsArchiveViewer` component provides a UI for this audit — fetch a CID from IPFS, compute the local root, and display match/mismatch.
 
 ## Frontend (React)
 
@@ -431,6 +466,7 @@ The frontend is a React application located in the `src` directory.
 *   **WebSocket Sign Popup:** `src/components/WsSignPopup.tsx` creates a `Channel<string>` on mount, sets `channel.onmessage` to show the challenge modal, and registers it via `invoke('register_challenge_pipe', { channel })`. Shows a modal with challenge text, Approve/Deny buttons, and an auto-sign checkbox for development. This is the **only** delivery path — polling and event-based approaches have been removed. Supports four request types: `sign` (challenge), `sign_event` (Nostr), `sign_credential` (VC issuance), and `POLLY_CREDENTIAL_REQUEST` (credential sharing).
 *   **Trust Assets Dashboard:** `src/components/TrustAssets.tsx` displays the credential vault — credential cards with fidelity tier badges, expired/grayscale state, subject DID mismatch alerts against the active profile, and a raw payload inspection modal.
 *   **Sovereign Signer:** `src/components/SovereignSigner.tsx` provides a manual challenge paste UI as an alternative to the WebSocket flow.
+*   **IPFS Cloud Archive Viewer:** `src/components/IpfsArchiveViewer.tsx` provides a CID input with gateway selection, fetches poll snapshots from IPFS gateways, and audits the asserted Merkle root against the local `calculate_vote_merkle_root` command — match (green) or mismatch (red) UI.
 *   **Styling:** CSS is located in `src/App.css`.
 
 ### Testing the Frontend
@@ -450,6 +486,14 @@ npm run coverage  # run tests with coverage
 - Expired credential: grayscale CSS class + warning banner
 - Subject DID mismatch against active profile: critical alert
 - Raw payload inspection modal: open and close
+
+**App test suite** (`src/__tests__/App.test.tsx`):
+- Service switch panel renders all services (SigBridge, Nostr, Blossom, Chat, IPFS Cloud Archive, Polly)
+- Port labels displayed for active services
+- `toggle_service` command dispatched with correct args when Start/Stop clicked
+- React 19 async state flush: button text transitions Start→Stop and Stop→Start
+- Mock dispatches by command name (`get_auto_start_settings`, `get_service_statuses`, `toggle_service`) using `vi.fn()` default implementation
+- `toggle_service` mock uses `new Promise(r => setTimeout(() => r(...), 0))` (macro-task) to ensure React 19 `act()` properly flushes state updates
 
 ## Building for Production
 

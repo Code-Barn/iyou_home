@@ -15,20 +15,49 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { vi } from "vitest";
 import App from "../App";
-import { invoke } from "@tauri-apps/api/core";
 
-// Mock the invoke function from Tauri
+const mockInvoke = vi.hoisted(() =>
+  vi.fn((cmd: string, args?: Record<string, unknown>) => {
+    switch (cmd) {
+      case "get_auto_start_settings":
+        return Promise.resolve({ Blossom: true, Nostr: true, Chat: true });
+      case "get_service_statuses":
+        return Promise.resolve({
+          SigBridge: "running",
+          Blossom: "stopped",
+          Nostr: "stopped",
+          Chat: "stopped",
+          "IPFS Cloud Archive": "stopped",
+          Polly: "stopped",
+        });
+      case "toggle_service":
+        return new Promise((resolve) =>
+          setTimeout(
+            () => resolve(args?.action === "stop" ? "stopped" : "running"),
+            0,
+          ),
+        );
+      default:
+        return Promise.resolve();
+    }
+  }),
+);
+
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
+  invoke: mockInvoke,
   Channel: vi.fn().mockImplementation(() => ({
     onmessage: null,
   })),
 }));
 
 describe("App", () => {
+  beforeEach(() => {
+    mockInvoke.mockClear();
+  });
+
   it("renders the service switch panel", () => {
     render(<App />);
     expect(screen.getByText("Service Switch Panel")).toBeInTheDocument();
@@ -36,7 +65,7 @@ describe("App", () => {
     expect(screen.getByText("Nostr")).toBeInTheDocument();
     expect(screen.getByText("Blossom")).toBeInTheDocument();
     expect(screen.getByText("Chat")).toBeInTheDocument();
-    expect(screen.getByText("IPFS")).toBeInTheDocument();
+    expect(screen.getAllByText("IPFS Cloud Archive").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("Polly")).toBeInTheDocument();
   });
 
@@ -49,7 +78,6 @@ describe("App", () => {
   });
 
   it("calls the toggle_service command when a start button is clicked", async () => {
-    (invoke as any).mockResolvedValue("running");
     render(<App />);
 
     const startButtons = screen.getAllByRole("button", {
@@ -57,43 +85,53 @@ describe("App", () => {
     });
     expect(startButtons.length).toBe(3);
 
-    fireEvent.click(startButtons[0]);
+    await act(async () => {
+      fireEvent.click(startButtons[0]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
 
     await waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith("toggle_service", {
+      expect(mockInvoke).toHaveBeenCalledWith("toggle_service", {
         name: "Blossom",
         action: "start",
       });
     });
 
-    expect(await screen.findByText("Stop")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("Stop")).toBeInTheDocument();
+    });
   });
 
   it("handles service stop correctly", async () => {
-    (invoke as any).mockResolvedValueOnce("running");
-    (invoke as any).mockResolvedValueOnce("running");
-    (invoke as any).mockResolvedValueOnce("stopped");
-
     render(<App />);
 
     const startButtons = screen.getAllByRole("button", {
       name: /start/i,
     });
-    fireEvent.click(startButtons[0]);
-
-    const stopButton = await screen.findByText("Stop");
-    fireEvent.click(stopButton);
+    await act(async () => {
+      fireEvent.click(startButtons[0]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
 
     await waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith("toggle_service", {
+      expect(screen.getByText("Stop")).toBeInTheDocument();
+    });
+
+    const stopButton = screen.getByText("Stop");
+    await act(async () => {
+      fireEvent.click(stopButton);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("toggle_service", {
         name: "Blossom",
         action: "stop",
       });
     });
 
-    const startButtonsAfter = await screen.findAllByRole("button", {
-      name: /start/i,
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /start/i }).length).toBe(3);
     });
-    expect(startButtonsAfter.length).toBe(3);
   });
 });
