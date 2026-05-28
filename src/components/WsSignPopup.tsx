@@ -172,10 +172,17 @@ export default function WsSignPopup() {
       }
     } catch (err) {
       console.error("Failed to submit WS response:", err);
-    } finally {
       setIsProcessing(false);
       setRequest(null);
+      return;
     }
+
+    // Mitigate unmount/connection-drop race: allow Rust forwarder task
+    // to drain the TCP buffer before tearing down the popup context.
+    setTimeout(() => {
+      setIsProcessing(false);
+      setRequest(null);
+    }, 100);
   };
 
   if (!request) return null;

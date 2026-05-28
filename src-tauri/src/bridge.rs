@@ -146,7 +146,10 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Drain window: give the TCP stack time to flush before we clear
+        // the sender reference — mitigates connection-drop races when the
+        // React popup unmounts before the async write completes.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let ws_state = app_clone.state::<WsState>();
         *ws_state.response_sender.lock().unwrap() = None;
         println!("DEBUG: Forwarder Task Exited — response_sender cleared");
