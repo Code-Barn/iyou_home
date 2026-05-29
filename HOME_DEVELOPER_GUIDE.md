@@ -278,28 +278,27 @@ The forwarder task (`bridge.rs`, spawned alongside every WebSocket connection) r
 4. The forwarder task may not have picked up the message yet — the async write to the TCP stack is still in-flight.
 5. If the iyou_idp WebSocket client times out or the popup teardown causes the browser to close the connection, the response is lost.
 
-**Fix — dual 100ms drain window:**
+**Fix — belt-and-suspenders 250ms drain with explicit flush:**
 
-**Frontend** (`src/components/WsSignPopup.tsx`): After a successful `invoke`, delay popup teardown by 100ms via `setTimeout` instead of clearing state immediately. Error paths still clear instantly (no data to flush).
+**Frontend** (`src/components/WsSignPopup.tsx`): After a successful `invoke`, wait a 250ms async delay before clearing state. Error paths still clear instantly (no data to flush).
 
 ```typescript
-await invoke("submit_ws_response", { profileId, challenge, approved });
-// Mitigate unmount/connection-drop race: allow Rust forwarder task
-// to drain the TCP buffer before tearing down the popup context.
-setTimeout(() => {
-    closePopupModalOrResetState();
-}, 100);
+console.log("[TAURI_SIGN] Submission accepted. Draining network buffers...");
+await new Promise((resolve) => setTimeout(resolve, 250));
 ```
 
-**Backend** (`src-tauri/src/bridge.rs`): The forwarder task's exit sleep increased from 50ms → 100ms, giving the TCP stack an extra drain window before `response_sender` is cleared.
+**Backend** (`src-tauri/src/bridge.rs`): The forwarder task now runs an explicit `ws_sender.flush()` before the exit sleep, then waits 250ms before clearing `response_sender`. The flush forces the TCP stack to push bytes immediately; the sleep provides a safety margin for OS kernel buffer handoff.
 
 ```rust
-tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+// Force TCP buffer flush before clearing sender
+let _ = ws_sender.flush().await;
+// Add a generous buffer for the OS kernel to hand off the bytes
+tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 let ws_state = app_clone.state::<WsState>();
 *ws_state.response_sender.lock().unwrap() = None;
 ```
 
-The flush after every `send()` inside the forwarder loop remains the primary write-completion guarantee; the exit sleep is a secondary guard against premature sender-reference cleanup under load.
+This replaces the previous 100ms-only approach. The flush after every `send()` inside the forwarder loop remains the primary write-completion guarantee; the exit flush+sleep is a secondary guard against premature sender-reference cleanup under load.
 
 ### Testing the Backend
 
@@ -620,14 +619,30 @@ Portals must provide explicit profile identifiers to target alternative identiti
 
 ## Known Risks
 
-1. **`submit_ws_response` sender race.** A concurrent `handle_connection` exit could clear `response_sender` between the clone and the send, dropping the signed VP silently. *Mitigated*: the forwarder task now sleeps 100ms before clearing `response_sender`, and the React popup delays teardown by 100ms after a successful invoke (see **Forwarder Drain Race** pattern above).
+1. **`submit_ws_response` sender race.** A concurrent `handle_connection` exit could clear `response_sender` between the clone and the send, dropping the signed VP silently. *Mitigated*: the forwarder task now flushes + sleeps 250ms before clearing `response_sender`, and the React popup waits 250ms after a successful invoke (see **Forwarder Drain Race** pattern above).
 
 2. **No channel re-registration.** If React unmounts and remounts `WsSignPopup`, it creates a new `Channel` and re-registers it. The old channel in the backend `Mutex` is simply replaced — the WebSocket task always reads the latest.
 
 3. **Heartbeat Ping has no backpressure or retry.** A single failed ping kills the forwarder task and the response path with it.
 
-4. **Forwarder exit race.** The 100ms sleep + explicit flush in the forwarder task mitigates the race where the task exits before the last message reaches the TCP stack, paired with a 100ms `setTimeout` drain window on the frontend before the popup unmounts. Under extreme load the window may still be insufficient.
+4. **Forwarder exit race.** The 250ms sleep + explicit `flush()` in the forwarder task mitigates the race where the task exits before the last message reaches the TCP stack, paired with a 250ms async drain window on the frontend before the popup unmounts. Under extreme load the window may still be insufficient.
 
 5. **PopupGuard pointer safety.** The guard uses a raw pointer `*const WsState` to bypass borrow-checker lifetime constraints. The pointer is valid for the command's duration because `WsState` is managed by Tauri (static lifetime). If `WsState` is ever dropped before the guard, dereferencing the raw pointer would be UB.
 
 6. **`POLLY_CREDENTIAL_REQUEST` queue starvation.** If a requester sends frames faster than the user can approve/deny, the `pending_messages` queue grows unbounded. No backpressure or retention limit is enforced.
+
+## Active Troubleshooting
+
+### Ed25519 Signature Validation Failure on Polly Ingest
+
+Poll creation (Kind 30023) gets a `400` from `POST /api/nostr/ingest/` with `InvalidSignature` even though frontend hex conversion is correct.
+
+**Symptoms:**
+- Browser logs show valid 64-char `id` and 128-char `sig` hex strings in the POST body.
+- iyou_poly logs `[ED25519_DIAG]` with correct-length hex for event_id, pubkey, and sig.
+- Ed25519 `verify()` still raises `InvalidSignature`.
+
+**Current hypothesis (WIP):** The key material or signing scheme differs between iyou_home (Ed25519 vault key) and what iyou_poly expects. iyou_home signs with its vault Ed25519 key, but iyou_poly may be verifying against the user's Nostr pubkey (which is a secp256k1 key derived from the OIDC DID). These are different key types on different curves. The fix likely lives in:
+
+- `iyou_home`: whether it's signing with the correct user key vs its own vault key.
+- `iyou_poly`: whether verification should use Ed25519 at all, or switch to secp256k1/NIP-26 delegation.

@@ -138,6 +138,8 @@ export default function WsSignPopup() {
     setIsProcessing(true);
 
     try {
+      console.log("[TAURI_SIGN] Triggering response submission...");
+
       if (request.type === "sign_event") {
         await invoke("submit_ws_event_response", {
           eventJson: JSON.stringify(request.event),
@@ -170,19 +172,19 @@ export default function WsSignPopup() {
         });
         console.log("REACT: submit_ws_response succeeded");
       }
+
+      console.log("[TAURI_SIGN] Submission accepted. Draining network buffers...");
+      // Enforce a secure 250ms async hold window to allow the Rust TCP stack to flush cleanly
+      await new Promise((resolve) => setTimeout(resolve, 250));
     } catch (err) {
-      console.error("Failed to submit WS response:", err);
+      console.error("[TAURI_ERROR] Core socket write failed:", err);
       setIsProcessing(false);
       setRequest(null);
       return;
     }
 
-    // Mitigate unmount/connection-drop race: allow Rust forwarder task
-    // to drain the TCP buffer before tearing down the popup context.
-    setTimeout(() => {
-      setIsProcessing(false);
-      setRequest(null);
-    }, 100);
+    setIsProcessing(false);
+    setRequest(null);
   };
 
   if (!request) return null;
