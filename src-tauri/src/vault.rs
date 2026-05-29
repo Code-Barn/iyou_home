@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use k256::schnorr::SigningKey as SecpSigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -33,6 +34,7 @@ pub struct Profile {
     pub derivation_index: u32,
     pub did: String,
     pub credentials: Vec<VaultCredential>,
+    pub nostr_pubkey_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +86,32 @@ pub fn derive_deterministic_keypair(root_seed: &[u8], derivation_index: u32) -> 
     }
 }
 
+/// Derive a secp256k1 secret key from the vault root seed, domain-separated
+/// from the Ed25519 derivation path to keep key material independent.
+pub fn decode_root_seed(vault: &VaultStore) -> Result<Vec<u8>, String> {
+    bs58::decode(&vault.root_seed_base58)
+        .into_vec()
+        .map_err(|_| "Invalid root seed encoding".to_string())
+}
+
+pub fn derive_secp256k1_secret_key(root_seed: &[u8], derivation_index: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"secp256k1-nostr");
+    hasher.update(root_seed);
+    hasher.update(&derivation_index.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash);
+    arr
+}
+
+pub fn derive_secp256k1_pubkey_hex(root_seed: &[u8], derivation_index: u32) -> String {
+    let sk_bytes = derive_secp256k1_secret_key(root_seed, derivation_index);
+    let key = SecpSigningKey::from_bytes(&sk_bytes)
+        .expect("valid 32-byte secp256k1 secret key");
+    hex::encode(key.verifying_key().to_bytes())
+}
+
 fn get_storage_path(app: &AppHandle) -> PathBuf {
     let mut path = app
         .path()
@@ -103,6 +131,7 @@ pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
     let root_seed_base58 = bs58::encode(seed).into_string();
 
     let kp = derive_deterministic_keypair(&seed, 0);
+    let nostr_pk = derive_secp256k1_pubkey_hex(&seed, 0);
 
     let vault = VaultStore {
         root_seed_base58,
@@ -112,6 +141,7 @@ pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
             derivation_index: 0,
             did: kp.did,
             credentials: vec![],
+            nostr_pubkey_hex: nostr_pk,
         }],
     };
 
@@ -198,6 +228,7 @@ pub fn add_profile(
         .map_err(|_| "Invalid root seed encoding".to_string())?;
 
     let kp = derive_deterministic_keypair(&seed, next_index);
+    let nostr_pk = derive_secp256k1_pubkey_hex(&seed, next_index);
 
     let profile = Profile {
         profile_id,
@@ -205,6 +236,7 @@ pub fn add_profile(
         derivation_index: next_index,
         did: kp.did,
         credentials: vec![],
+        nostr_pubkey_hex: nostr_pk,
     };
 
     vault.profiles.push(profile.clone());

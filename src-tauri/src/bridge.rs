@@ -166,6 +166,33 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                     println!("DEBUG: Ping received, sending pong via response_tx");
                     let _ = response_tx.send(Message::Text("{\"type\":\"pong\"}".into()));
                     continue;
+                } else if json["type"] == "get_profile" {
+                    println!("DEBUG: get_profile request received");
+                    match crate::vault::load_vault(&app_handle) {
+                        Ok(vault) => {
+                            let response = match vault.profiles.first() {
+                                Some(profile) => serde_json::json!({
+                                    "type": "profile_sync",
+                                    "profile": profile
+                                }),
+                                None => serde_json::json!({
+                                    "type": "error",
+                                    "message": "No profile found in vault"
+                                }),
+                            };
+                            let _ = response_tx.send(Message::Text(response.to_string().into()));
+                        }
+                        Err(e) => {
+                            eprintln!("DEBUG: get_profile failed to load vault: {}", e);
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("Failed to load vault: {}", e)
+                                }).to_string().into()
+                            ));
+                        }
+                    }
+                    continue;
                 }
 
                 let profile_id = json
@@ -203,7 +230,7 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
                     if json["event"].is_object() {
                         let event = json["event"].clone();
                         println!("Triggering Nostr Event signing");
-                        println!("DEBUG: Signing Nostr event with Ed25519 (vault key — deviates from NIP-01 secp256k1 standard)");
+                        println!("DEBUG: Signing Nostr event via secp256k1 Schnorr (NIP-01 standard)");
 
                         let app_handle = app_handle.clone();
                         tokio::spawn(async move {

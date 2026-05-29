@@ -631,18 +631,70 @@ Portals must provide explicit profile identifiers to target alternative identiti
 
 6. **`POLLY_CREDENTIAL_REQUEST` queue starvation.** If a requester sends frames faster than the user can approve/deny, the `pending_messages` queue grows unbounded. No backpressure or retention limit is enforced.
 
-## Active Troubleshooting
+## Nostr Cryptographic Enforcement (BIP-340)
 
-### Ed25519 Signature Validation Failure on Polly Ingest
+### Dual-Key Derivation Architecture
 
-Poll creation (Kind 30023) gets a `400` from `POST /api/nostr/ingest/` with `InvalidSignature` even though frontend hex conversion is correct.
+Every vault persona derives two independent keypairs from the same root seed, domain-separated to keep key material isolated:
 
-**Symptoms:**
-- Browser logs show valid 64-char `id` and 128-char `sig` hex strings in the POST body.
-- iyou_poly logs `[ED25519_DIAG]` with correct-length hex for event_id, pubkey, and sig.
-- Ed25519 `verify()` still raises `InvalidSignature`.
+| Key | Curve | Derivation | Format | Used For |
+|---|---|---|---|---|
+| `Profile.did` | Ed25519 | `SHA-256(root_seed \|\| LE(index))` | `did:key:z...` multibase | OIDC/DID auth, VP signing |
+| `Profile.nostr_pubkey_hex` | secp256k1 x-only | `SHA-256("secp256k1-nostr" \|\| root_seed \|\| LE(index))` | 64-char lowercase hex | Nostr `sign_event` (NIP-01) |
 
-**Current hypothesis (WIP):** The key material or signing scheme differs between iyou_home (Ed25519 vault key) and what iyou_poly expects. iyou_home signs with its vault Ed25519 key, but iyou_poly may be verifying against the user's Nostr pubkey (which is a secp256k1 key derived from the OIDC DID). These are different key types on different curves. The fix likely lives in:
+The `nostr_pubkey_hex` field is pre-computed at profile creation time (`create_vault_at_path`, `add_profile`, `import_did`) and serialized into the `Profile` struct so it is available to the frontend via `list_profiles` and the WebSocket `get_profile` → `profile_sync` handshake.
 
-- `iyou_home`: whether it's signing with the correct user key vs its own vault key.
-- `iyou_poly`: whether verification should use Ed25519 at all, or switch to secp256k1/NIP-26 delegation.
+### BIP-340 Schnorr Calling Convention
+
+All Nostr event signing flows through `submit_ws_event_response` in `src-tauri/src/lib.rs`. The cryptographic pipeline is:
+
+1. Serialize the event as the canonical NIP-01 array: `[0, pubkey, created_at, kind, tags, content]`
+2. Compute `event_hash = SHA-256(canonical_json_bytes)` → `id_hex`
+3. Look up the persona whose `nostr_pubkey_hex` matches the event's `pubkey` field
+4. Sign using `k256::schnorr::SigningKey::sign_raw(&event_hash, &Default::default())`
+
+```rust
+use k256::schnorr::SigningKey as SecpSigningKey;
+
+let schnorr_sig = secp_key
+    .sign_raw(&event_hash, &Default::default())
+    .map_err(|_| "Schnorr signing failed".to_string())?;
+```
+
+#### ⚠️ CRITICAL WARNING — NEVER USE `.sign()`
+
+The `k256::schnorr::SigningKey::sign()` method (from the `signature::Signer` trait) wraps the provided message in `Sha256::new_with_prefix(msg)` **before** the BIP-340 internal challenge hash:
+
+```rust
+// From k256 source — Signer trait impl:
+fn try_sign(&self, msg: &[u8]) -> Result<Signature> {
+    self.try_sign_digest(Sha256::new_with_prefix(msg))
+}
+```
+
+This produces a **double-hash** when applied to the NIP-01 event ID:
+
+```
+sign(event_id)
+  → SHA-256(event_id)           // redundant — event_id is already SHA-256(serialized)
+  → BIP-340 internal hash       // tagged SHA-256 over pubkey + double-hash
+```
+
+The verifier (iyou_poly, standard relays) will compute `SchnorrVerify(pubkey, event_id, sig)` using the single-hash event ID, causing `InvalidSignature`.
+
+All Nostr events MUST pass the **raw 32-byte prehash** via `sign_raw()` or the `PrehashSigner` trait:
+
+```
+sign_raw(event_id, aux_rand)    // ← correct: no extra SHA-256 wrapping
+  → BIP-340 internal hash       // tagged SHA-256 over pubkey + event_id
+```
+
+The `&Default::default()` argument supplies zero auxiliary randomness (acceptable for deterministic signatures; add `[0u8; 32]` for explicit intent).
+
+### Verification Flow
+
+1. Frontend opens WebSocket → sends `{"type": "get_profile"}` → receives `{"type": "profile_sync", "profile": {...}}` containing `nostr_pubkey_hex`.
+2. Frontend includes this pubkey in all Nostr event objects sent for signing.
+3. Bridge matches `event["pubkey"]` against vault profiles by re-deriving each profile's secp256k1 key.
+4. On match, signs with `sign_raw()`; on mismatch, returns `Err("Persona not found...")`.
+5. The returned `id` and `sig` are 64-char and 128-char lowercase hex, respectively.

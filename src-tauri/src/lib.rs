@@ -15,7 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
+
 use chrono::{DateTime, Utc};
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
@@ -365,6 +365,7 @@ fn import_did(
         arr.copy_from_slice(&seed);
         let root_seed_base58 = bs58::encode(arr).into_string();
         let kp = vault::derive_deterministic_keypair(&arr, 0);
+        let nostr_pk = vault::derive_secp256k1_pubkey_hex(&arr, 0);
         vault::VaultStore {
             root_seed_base58,
             profiles: vec![vault::Profile {
@@ -373,6 +374,7 @@ fn import_did(
                 derivation_index: 0,
                 did: kp.did,
                 credentials: vec![],
+                nostr_pubkey_hex: nostr_pk,
             }],
         }
     };
@@ -593,7 +595,7 @@ async fn submit_ws_event_response(
     approved: bool,
     app: AppHandle,
     ws_state: State<'_, WsState>,
-    profile_id: Option<String>,
+    _profile_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
         let guard = ws_state.response_sender.lock().unwrap();
@@ -606,33 +608,74 @@ async fn submit_ws_event_response(
         return Ok(());
     }
 
-    let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
-
     let mut event: serde_json::Value = serde_json::from_str(&event_json)
         .map_err(|e| format!("Failed to parse event JSON: {}", e))?;
 
-    let pubkey = event["pubkey"].as_str().unwrap_or(&did);
-    let created_at = event["created_at"].as_i64().unwrap_or(0);
     let kind = event["kind"].as_i64().unwrap_or(1);
+    let pubkey = event["pubkey"].as_str().unwrap_or("").to_string();
+    let created_at = event["created_at"].as_i64().unwrap_or(0);
     let tags = event.get("tags").cloned().unwrap_or(serde_json::json!([]));
     let content = event["content"].as_str().unwrap_or("");
 
-    let serialized = serde_json::to_string(&serde_json::json!([
+    let canonical = serde_json::json!([
         0, pubkey, created_at, kind, tags, content
-    ]))
-    .map_err(|e| format!("Failed to serialize event: {}", e))?;
+    ]);
+    let canonical_json = serde_json::to_string(&canonical)
+        .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(serialized.as_bytes());
-    let id_bytes = hasher.finalize();
-    let id_b64 = base64.encode(id_bytes);
+    // SHA-256 of canonical NIP-01 event array
+    let event_hash = Sha256::digest(canonical_json.as_bytes());
+    let id_hex = hex::encode(event_hash);
 
-    let signature = signing_key.sign(&id_bytes);
-    let sig_bytes = signature.to_bytes();
-    let sig_b64 = base64.encode(sig_bytes);
+    let event_pubkey = event["pubkey"]
+        .as_str()
+        .ok_or_else(|| "Missing pubkey field in event".to_string())?
+        .to_string();
 
-    event["id"] = serde_json::Value::String(id_b64);
-    event["sig"] = serde_json::Value::String(sig_b64);
+    let vault = vault::load_vault(&app)?;
+    let seed = vault::decode_root_seed(&vault)?;
+
+    // All Nostr events use secp256k1 Schnorr (NIP-01 standard).
+    // Find the persona whose secp256k1 pubkey matches the event's pubkey.
+    use k256::schnorr::SigningKey as SecpSigningKey;
+
+    let (secp_key, _index) = vault
+        .profiles
+        .iter()
+        .filter_map(|profile| {
+            let sk_bytes =
+                vault::derive_secp256k1_secret_key(&seed, profile.derivation_index);
+            let key = SecpSigningKey::from_bytes(&sk_bytes).ok()?;
+            let pubkey_hex = hex::encode(key.verifying_key().to_bytes());
+            if pubkey_hex == event_pubkey {
+                Some((key, profile.derivation_index))
+            } else {
+                None
+            }
+        })
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "Persona not found: no secp256k1 keypair matches pubkey `{}`",
+                event_pubkey
+            )
+        })?;
+
+    // sign_raw signs the 32-byte prehash directly (BIP-340 message).
+    // DO NOT use sign() here — it applies an extra SHA-256, producing
+    // a double-hash that the verifier won't match.
+    let schnorr_sig = secp_key
+        .sign_raw(&event_hash, &Default::default())
+        .map_err(|_| "Schnorr signing failed".to_string())?;
+    let sig_hex = hex::encode(schnorr_sig.to_bytes());
+
+    event["id"] = serde_json::Value::String(id_hex);
+    event["sig"] = serde_json::Value::String(sig_hex);
+
+    println!(
+        "[SIGN_DEBUG] Kind {} signed with secp256k1 pubkey `{}`",
+        kind, event_pubkey
+    );
 
     let response = serde_json::json!({
         "type": "signed_event",
