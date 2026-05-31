@@ -19,13 +19,139 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json;
 
 use tauri::{AppHandle, Manager};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use std::io;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
 use crate::WsState;
+
+// ---------------------------------------------------------------------------
+// ReadBuffered — replays a chunk of already-read bytes before delegating to
+// the inner TLS stream.  Lets us inspect the first few bytes of an encrypted
+// connection (OPTIONS vs WebSocket upgrade) without consuming them.
+// ---------------------------------------------------------------------------
+struct ReadBuffered<S> {
+    inner: S,
+    buffer: Vec<u8>,
+    pos: usize,
+}
+
+impl<S> ReadBuffered<S> {
+    fn new(inner: S, buffer: Vec<u8>) -> Self {
+        Self {
+            inner,
+            buffer,
+            pos: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ReadBuffered<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos < this.buffer.len() {
+            let n = std::cmp::min(buf.remaining(), this.buffer.len() - this.pos);
+            buf.put_slice(&this.buffer[this.pos..this.pos + n]);
+            this.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ReadBuffered<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Self-signed TLS certificate management
+// ---------------------------------------------------------------------------
+fn load_or_generate_certs(
+    app_data_dir: &PathBuf,
+) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let cert_path = app_data_dir.join("bridge_cert.pem");
+    let key_path = app_data_dir.join("bridge_key.pem");
+
+    if cert_path.exists() && key_path.exists() {
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
+            .expect("Failed to read bridge cert file")
+            .map(|c| c.expect("Failed to parse bridge cert"))
+            .collect();
+        if certs.is_empty() {
+            panic!("No certificates found in bridge cert file");
+        }
+        let key =
+            PrivateKeyDer::from_pem_file(&key_path).expect("Failed to read bridge key file");
+        println!("Loaded existing TLS certificate for localhost bridge");
+        return (certs, key);
+    }
+
+    // Generate new self-signed cert
+    let mut params = rcgen::CertificateParams::new(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])
+    .expect("Invalid certificate params");
+
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "iyou-home Local Development Bridge");
+
+    let key_pair = rcgen::KeyPair::generate().expect("Failed to generate TLS key pair");
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("Failed to self-sign TLS certificate");
+
+    std::fs::create_dir_all(app_data_dir).expect("Failed to create app data dir");
+    std::fs::write(&cert_path, cert.pem()).expect("Failed to write bridge cert");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("Failed to write bridge key");
+
+    println!("Generated self-signed TLS certificate for localhost bridge");
+
+    // Re-read from PEM to ensure consistent loading path
+    let certs = CertificateDer::pem_file_iter(&cert_path)
+        .expect("Failed to read freshly generated cert")
+        .map(|c| c.expect("Failed to parse freshly generated cert"))
+        .collect();
+    let key =
+        PrivateKeyDer::from_pem_file(&key_path).expect("Failed to read freshly generated key");
+
+    (certs, key)
+}
 
 fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
     let state = app.state::<WsState>();
@@ -66,19 +192,10 @@ fn is_websocket_upgrade_request(data: &[u8]) -> bool {
     has_upgrade && has_connection_upgrade && has_ws_key
 }
 
-async fn handle_options_preflight(mut stream: TcpStream) {
-    println!("OPTIONS pre-flight received");
-    let response = b"HTTP/1.1 200 OK\r\n\
-        Access-Control-Allow-Origin: *\r\n\
-        Access-Control-Allow-Private-Network: true\r\n\
-        Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS\r\n\
-        Access-Control-Allow-Headers: *\r\n\
-        Content-Length: 0\r\n\
-        Connection: keep-alive\r\n\r\n";
-    let _ = stream.write_all(response).await;
-}
-
-async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
+async fn handle_ws_connection<S>(stream: S, app_handle: AppHandle)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
         println!("DEBUG: Handshake callback triggered");
         println!("DEBUG: Request method: {:?}", req.method());
@@ -353,33 +470,67 @@ async fn handle_ws_connection(stream: TcpStream, app_handle: AppHandle) {
     *ws_state.response_sender.lock().unwrap() = None;
 }
 
-async fn handle_connection(stream: TcpStream, app_handle: AppHandle) {
-    let mut peek_buf = [0u8; 1024];
-    let n = match stream.peek(&mut peek_buf).await {
+async fn handle_connection<S>(mut stream: S, app_handle: AppHandle)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut head = vec![0u8; 4096];
+    let n = match stream.read(&mut head).await {
         Ok(0) | Err(_) => return,
         Ok(n) => n,
     };
 
-    let data = &peek_buf[..n];
+    let data = &head[..n];
 
     if data.starts_with(b"OPTIONS") {
-        handle_options_preflight(stream).await;
+        println!("OPTIONS pre-flight received (TLS)");
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Access-Control-Allow-Private-Network: true\r\n\
+            Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS\r\n\
+            Access-Control-Allow-Headers: *\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\r\n";
+        let _ = stream.write_all(response).await;
     } else if is_websocket_upgrade_request(data) {
-        handle_ws_connection(stream, app_handle).await;
+        let buffered = ReadBuffered::new(stream, head[..n].to_vec());
+        handle_ws_connection(buffered, app_handle).await;
     }
 }
 
 async fn listen_on(addrs: &str, app: AppHandle) {
+    let app_data_dir = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    let (certs, key) = load_or_generate_certs(&app_data_dir);
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("Failed to configure TLS");
+
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
     let listener = TcpListener::bind(addrs)
         .await
-        .unwrap_or_else(|e| panic!("Failed to bind WS on {}: {}", addrs, e));
-    println!("WebSocket server listening on ws://{}", addrs);
+        .unwrap_or_else(|e| panic!("Failed to bind WSS on {}: {}", addrs, e));
+    println!("Signature Bridge listening on wss://{}", addrs);
 
     while let Ok((stream, peer)) = listener.accept().await {
         println!("TCP Connection received from: {:?}", peer);
+        let acceptor = acceptor.clone();
         let app_handle = app.clone();
         tokio::spawn(async move {
-            handle_connection(stream, app_handle).await;
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    handle_connection(tls_stream, app_handle).await;
+                }
+                Err(e) => {
+                    eprintln!("TLS handshake failed from {:?}: {}", peer, e);
+                }
+            }
         });
     }
 }
