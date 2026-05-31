@@ -22,14 +22,13 @@ use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use std::io;
+use std::io::{self, BufReader};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -97,58 +96,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ReadBuffered<S> {
 }
 
 // ---------------------------------------------------------------------------
-// Self-signed TLS certificate management
+// Production Let's Encrypt certificate loading
 // ---------------------------------------------------------------------------
-fn load_or_generate_certs(
-    app_data_dir: &PathBuf,
+fn load_production_certs(
 ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let cert_path = app_data_dir.join("bridge_cert.pem");
-    let key_path = app_data_dir.join("bridge_key.pem");
+    let cert_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("certs")
+        .join("production.crt");
+    let key_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("certs")
+        .join("production.key");
 
-    if cert_path.exists() && key_path.exists() {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
-            .expect("Failed to read bridge cert file")
-            .map(|c| c.expect("Failed to parse bridge cert"))
-            .collect();
-        if certs.is_empty() {
-            panic!("No certificates found in bridge cert file");
-        }
-        let key =
-            PrivateKeyDer::from_pem_file(&key_path).expect("Failed to read bridge key file");
-        println!("Loaded existing TLS certificate for localhost bridge");
-        return (certs, key);
-    }
+    println!(
+        "Sovereign Release: Loading authentic Let's Encrypt keys from {:?}",
+        cert_path
+    );
 
-    // Generate new self-signed cert
-    let mut params = rcgen::CertificateParams::new(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .expect("Invalid certificate params");
+    let mut cert_file =
+        BufReader::new(std::fs::File::open(&cert_path).expect("Failed to open production cert"));
+    let mut key_file =
+        BufReader::new(std::fs::File::open(&key_path).expect("Failed to open production key"));
 
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "iyou-home Local Development Bridge");
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_file)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to parse production certificate chain");
 
-    let key_pair = rcgen::KeyPair::generate().expect("Failed to generate TLS key pair");
-    let cert = params
-        .self_signed(&key_pair)
-        .expect("Failed to self-sign TLS certificate");
+    let key = rustls_pemfile::private_key(&mut key_file)
+        .expect("Failed to parse production private key")
+        .expect("Missing private key asset structure");
 
-    std::fs::create_dir_all(app_data_dir).expect("Failed to create app data dir");
-    std::fs::write(&cert_path, cert.pem()).expect("Failed to write bridge cert");
-    std::fs::write(&key_path, key_pair.serialize_pem()).expect("Failed to write bridge key");
-
-    println!("Generated self-signed TLS certificate for localhost bridge");
-
-    // Re-read from PEM to ensure consistent loading path
-    let certs = CertificateDer::pem_file_iter(&cert_path)
-        .expect("Failed to read freshly generated cert")
-        .map(|c| c.expect("Failed to parse freshly generated cert"))
-        .collect();
-    let key =
-        PrivateKeyDer::from_pem_file(&key_path).expect("Failed to read freshly generated key");
+    println!("Loaded authentic Let's Encrypt keys for home.iyou.me");
 
     (certs, key)
 }
@@ -499,12 +476,7 @@ where
 }
 
 async fn listen_on(addrs: &str, app: AppHandle) {
-    let app_data_dir = app
-        .path()
-        .app_local_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
-
-    let (certs, key) = load_or_generate_certs(&app_data_dir);
+    let (certs, key) = load_production_certs();
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -516,7 +488,7 @@ async fn listen_on(addrs: &str, app: AppHandle) {
     let listener = TcpListener::bind(addrs)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind WSS on {}: {}", addrs, e));
-    println!("Signature Bridge listening on wss://{}", addrs);
+    println!("Signature Bridge listening on wss://home.iyou.me:9001");
 
     while let Ok((stream, peer)) = listener.accept().await {
         println!("TCP Connection received from: {:?}", peer);
