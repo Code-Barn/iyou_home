@@ -18,11 +18,15 @@
 use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+
+use crate::certs::{load_production_certs, ReadBuffered};
 
 const XMPP_SERVER: &str = "127.0.0.1";
 const STREAM_NS: &str = "http://etherx.jabber.org/streams";
@@ -37,7 +41,14 @@ pub async fn start_xmpp_server(
 ) {
     let clients: Arc<Mutex<Vec<XmppClient>>> = Arc::new(Mutex::new(Vec::new()));
 
-    println!("XMPP server listening on :5222");
+    let (certs, key) = load_production_certs();
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("Failed to configure XMPP TLS");
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    println!("XMPP server listening on wss://home.iyou.me:5222");
 
     loop {
         tokio::select! {
@@ -45,16 +56,16 @@ pub async fn start_xmpp_server(
                 match result {
                     Ok((stream, peer)) => {
                         println!("XMPP connection from {:?}", peer);
+                        let acceptor = acceptor.clone();
                         let pass = xmpp_pass.clone();
                         let clients = clients.clone();
                         tokio::spawn(async move {
-                            // Peek to detect WebSocket upgrade vs raw TCP
-                            match detect_connection_type(&stream).await {
-                                ConnectionType::WebSocket => {
-                                    handle_xmpp_ws_connection(stream, pass, clients).await;
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    handle_connection(tls_stream, pass, clients).await;
                                 }
-                                ConnectionType::RawXmpp => {
-                                    handle_xmpp_connection(stream, pass, clients).await;
+                                Err(e) => {
+                                    eprintln!("XMPP TLS handshake failed from {:?}: {}", peer, e);
                                 }
                             }
                         });
@@ -72,12 +83,28 @@ pub async fn start_xmpp_server(
     }
 }
 
-enum ConnectionType {
-    WebSocket,
-    RawXmpp,
+async fn handle_connection<S>(mut stream: S, password: String, clients: Arc<Mutex<Vec<XmppClient>>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut head = vec![0u8; 4096];
+    let n = match stream.read(&mut head).await {
+        Ok(0) | Err(_) => return,
+        Ok(n) => n,
+    };
+
+    let data = &head[..n];
+
+    if is_websocket_upgrade(data) {
+        let buffered = ReadBuffered::new(stream, head[..n].to_vec());
+        handle_xmpp_ws_connection(buffered, password, clients).await;
+    } else {
+        let buffered = ReadBuffered::new(stream, head[..n].to_vec());
+        handle_xmpp_connection(buffered, password, clients).await;
+    }
 }
 
-fn is_xmpp_websocket_upgrade(data: &[u8]) -> bool {
+fn is_websocket_upgrade(data: &[u8]) -> bool {
     let text = String::from_utf8_lossy(data);
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() || !lines[0].starts_with("GET") {
@@ -96,29 +123,15 @@ fn is_xmpp_websocket_upgrade(data: &[u8]) -> bool {
     has_upgrade && has_connection_upgrade && has_ws_key
 }
 
-async fn detect_connection_type(stream: &TcpStream) -> ConnectionType {
-    let mut peek_buf = [0u8; 1024];
-    let n = match stream.peek(&mut peek_buf).await {
-        Ok(0) | Err(_) => return ConnectionType::RawXmpp,
-        Ok(n) => n,
-    };
-
-    let data = &peek_buf[..n];
-
-    if is_xmpp_websocket_upgrade(data) {
-        ConnectionType::WebSocket
-    } else {
-        ConnectionType::RawXmpp
-    }
-}
-
 // -- WebSocket XMPP handler --
 
-async fn handle_xmpp_ws_connection(
-    stream: TcpStream,
+async fn handle_xmpp_ws_connection<S>(
+    stream: S,
     password: String,
     clients: Arc<Mutex<Vec<XmppClient>>>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -168,11 +181,13 @@ async fn handle_xmpp_ws_connection(
 
 // -- Raw TCP XMPP handler --
 
-async fn handle_xmpp_connection(
-    mut stream: TcpStream,
+async fn handle_xmpp_connection<S>(
+    mut stream: S,
     password: String,
     clients: Arc<Mutex<Vec<XmppClient>>>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut buf = [0u8; 8192];
     let mut input = String::new();
     let mut authenticated = false;
@@ -301,7 +316,7 @@ async fn process_xmpp_buffer_tcp(
     input: &mut String,
     authenticated: &mut bool,
     bound_jid: &mut String,
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     password: &str,
     clients: &Arc<Mutex<Vec<XmppClient>>>,
 ) {
@@ -551,7 +566,7 @@ async fn send_auth_failure_ws(ws_sender: &mut (impl SinkExt<Message> + Unpin)) {
 
 // -- Raw TCP output helpers --
 
-async fn send_stream_header(stream: &mut TcpStream, restart: bool) {
+async fn send_stream_header(stream: &mut (impl AsyncWrite + Unpin), restart: bool) {
     let stream_id = if restart { "restart" } else { "sovereign1" };
     let msg = format!(
         "<?xml version='1.0'?>\
@@ -563,7 +578,7 @@ async fn send_stream_header(stream: &mut TcpStream, restart: bool) {
     let _ = stream.write_all(msg.as_bytes()).await;
 }
 
-async fn send_sasl_features(stream: &mut TcpStream) {
+async fn send_sasl_features(stream: &mut (impl AsyncWrite + Unpin)) {
     let msg = format!(
         "<stream:features>\
          <mechanisms xmlns='{}'>\
@@ -575,7 +590,7 @@ async fn send_sasl_features(stream: &mut TcpStream) {
     let _ = stream.write_all(msg.as_bytes()).await;
 }
 
-async fn send_bind_features(stream: &mut TcpStream) {
+async fn send_bind_features(stream: &mut (impl AsyncWrite + Unpin)) {
     let msg = format!(
         "<stream:features>\
          <bind xmlns='{}'/>\
@@ -585,12 +600,12 @@ async fn send_bind_features(stream: &mut TcpStream) {
     let _ = stream.write_all(msg.as_bytes()).await;
 }
 
-async fn send_sasl_success(stream: &mut TcpStream) {
+async fn send_sasl_success(stream: &mut (impl AsyncWrite + Unpin)) {
     let msg = format!("<success xmlns='{}'/>", SASL_NS);
     let _ = stream.write_all(msg.as_bytes()).await;
 }
 
-async fn send_auth_failure(stream: &mut TcpStream) {
+async fn send_auth_failure(stream: &mut (impl AsyncWrite + Unpin)) {
     let msg = format!("<failure xmlns='{}'><not-authorized/></failure>", SASL_NS);
     let _ = stream.write_all(msg.as_bytes()).await;
 }

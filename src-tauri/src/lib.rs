@@ -31,6 +31,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 mod blossom;
 mod bridge;
+mod certs;
 mod nostr_relay;
 mod prosody;
 mod vault;

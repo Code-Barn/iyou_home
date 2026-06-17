@@ -59,7 +59,7 @@ All local services bind exclusively to `127.0.0.1` (IPv4 loopback). **No service
 | Signature Bridge | 9001 | WSS (WebSocket over TLS) / HTTPS | 127.0.0.1 |
 | Blossom (BUD-01) | 9002 | HTTP (GET/PUT/HEAD/OPTIONS) | 127.0.0.1 |
 | Nostr Relay (NIP-01) | 9003 | WebSocket | 127.0.0.1 |
-| XMPP (Chat) | 5222 | TCP / WebSocket | 127.0.0.1 |
+| XMPP (Chat) | 5222 | WSS (WebSocket over TLS) / XMPP over TLS | 127.0.0.1 |
 
 ### Auto-Start Persistence
 
@@ -94,13 +94,13 @@ The bridge loads a globally-trusted Let's Encrypt certificate chain issued for `
 | `src-tauri/certs/production.crt` | PEM (X.509 chain) | Let's Encrypt — leaf cert for `home.iyou.me` + intermediate + ISRG Root X1 |
 | `src-tauri/certs/production.key` | PEM (PKCS#8 RSA) | Corresponding RSA private key, extracted from K3s cert-manager |
 
-**Loading** (`load_production_certs` in `src-tauri/src/bridge.rs`):
+**Loading** (`load_production_certs` in `src-tauri/src/certs.rs`, shared by both bridge and XMPP):
 1. Resolve the paths via `env!("CARGO_MANIFEST_DIR")` (compile-time constant pointing to `src-tauri/`).
 2. Open each file with a `BufReader` and parse with `rustls_pemfile::certs()` / `rustls_pemfile::private_key()`.
 3. Pass the resulting `Vec<CertificateDer>` and `PrivateKeyDer` to `rustls::ServerConfig::with_single_cert()`.
-4. Wrap in `TlsAcceptor` and bind the TCP listener on `127.0.0.1:9001`.
+4. Wrap in `TlsAcceptor` and bind the TCP listener on the respective port.
 
-**Browser trust.** Because the leaf certificate is signed by a public CA (Let's Encrypt → ISRG Root X1), browsers accept `wss://home.iyou.me:9001` without any security warnings. No manual trust configuration, flag overrides, or `thisisunsafe` bypasses are required.
+**Browser trust.** Because the leaf certificate is signed by a public CA (Let's Encrypt → ISRG Root X1), browsers accept `wss://home.iyou.me:9001` and `wss://home.iyou.me:5222` without any security warnings. No manual trust configuration, flag overrides, or `thisisunsafe` bypasses are required.
 
 #### Supported Message Types
 
