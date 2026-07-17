@@ -41,6 +41,7 @@ axum = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 quick-xml = "0.31"
 rand = "0.8"
+http = "1"
 tower-http = { version = "0.5", features = ["cors", "set-header"] }
 chrono = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.13", features = ["schnorr"] }

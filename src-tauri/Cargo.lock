@@ -2195,6 +2195,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "http",
  "k256",
  "quick-xml 0.31.0",
  "rand",

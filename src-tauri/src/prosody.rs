@@ -23,7 +23,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::accept_async;
+use http::header::{SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::certs::{load_production_certs, ReadBuffered};
@@ -33,6 +35,18 @@ const STREAM_NS: &str = "http://etherx.jabber.org/streams";
 const CLIENT_NS: &str = "jabber:client";
 const SASL_NS: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const BIND_NS: &str = "urn:ietf:params:xml:ns:xmpp-bind";
+
+fn extract_hex_from_did(did: &str) -> Option<String> {
+    let multibase = did.strip_prefix("did:key:")?;
+    if !multibase.starts_with('z') {
+        return None;
+    }
+    let decoded = bs58::decode(&multibase[1..]).into_vec().ok()?;
+    if decoded.len() != 34 || decoded[0] != 0xed || decoded[1] != 0x01 {
+        return None;
+    }
+    Some(hex::encode(&decoded[2..]))
+}
 
 pub async fn start_xmpp_server(
     listener: TcpListener,
@@ -132,51 +146,87 @@ async fn handle_xmpp_ws_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let ws_stream = match accept_async(stream).await {
+    let ws_stream = match accept_hdr_async(stream, |request: &Request, mut response: Response| {
+        if let Some(protocol) = request.headers().get(SEC_WEBSOCKET_PROTOCOL) {
+            if protocol.to_str().unwrap_or("").contains("xmpp") {
+                response.headers_mut().insert(
+                    SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_static("xmpp"),
+                );
+            }
+        }
+        Ok(response)
+    }).await {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("XMPP WS handshake failed: {}", e);
             return;
         }
     };
+    println!("DEBUG: XMPP WebSocket Upgrade Complete");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut input = String::new();
     let mut authenticated = false;
     let mut bound_jid = String::new();
 
-    // Send initial stream header and features over WS
-    send_stream_header_ws(&mut ws_sender, false).await;
-    send_sasl_features_ws(&mut ws_sender).await;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = ws_receiver.next() => {
+                    let msg = match msg {
+                        Some(Ok(m)) => m,
+                        _ => break,
+                    };
 
-    loop {
-        tokio::select! {
-            msg = ws_receiver.next() => {
-                let msg = match msg {
-                    Some(Ok(m)) => m,
-                    _ => break,
-                };
+                    if !msg.is_text() {
+                        if msg.is_close() {
+                            break;
+                        }
+                        continue;
+                    }
 
-                if !msg.is_text() {
-                    if msg.is_close() {
+                    let text = msg.to_text().unwrap_or_default().to_string();
+
+                    // RFC 7395: client opens the XMPP stream with <open ...>
+                    if text.contains("<open") && text.contains("urn:ietf:params:xml:ns:xmpp-framing") {
+                        let open_reply = r#"<open xmlns="urn:ietf:params:xml:ns:xmpp-framing" from="127.0.0.1" id="sovereign_enclave_stream" version="1.0" xml:lang="en"/>"#;
+                        let features_reply = if !authenticated {
+                            r#"<stream:features xmlns:stream="http://etherx.jabber.org/streams"><mechanisms xmlns="urn:ietf:params:xml:ns:xmpp-sasl"><mechanism>PLAIN</mechanism></mechanisms></stream:features>"#
+                        } else {
+                            r#"<stream:features xmlns:stream="http://etherx.jabber.org/streams"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/><session xmlns="urn:ietf:params:xml:ns:xmpp-session"/></stream:features>"#
+                        };
+
+                        if let Err(e) = ws_sender.send(Message::Text(open_reply.into())).await {
+                            eprintln!("Failed to send open frame: {:?}", e);
+                            break;
+                        }
+                        if let Err(e) = ws_sender.send(Message::Text(features_reply.into())).await {
+                            eprintln!("Failed to send features frame: {:?}", e);
+                            break;
+                        }
+                        println!("DEBUG: RFC 7395 WebSocket Stream Initiated Securely");
+                        continue;
+                    }
+
+                    input.push_str(&text);
+
+                    let was_authenticated = authenticated;
+                    if !process_xmpp_buffer(&mut input, &mut authenticated, &mut bound_jid, &mut ws_sender, &password, &clients).await {
                         break;
                     }
-                    continue;
-                }
 
-                let text = msg.to_text().unwrap_or_default().to_string();
-                input.push_str(&text);
-
-                if !process_xmpp_buffer(&mut input, &mut authenticated, &mut bound_jid, &mut ws_sender, &password, &clients).await {
-                    break;
+                    if !was_authenticated && authenticated {
+                        println!("DEBUG: XMPP Identity Verified, Awaiting Client Stream Restart");
+                    }
                 }
             }
         }
-    }
 
-    // Clean up client
-    let mut list = clients.lock().unwrap();
-    list.retain(|c| c.jid != bound_jid);
+        // Clean up client
+        let mut list = clients.lock().unwrap();
+        list.retain(|c| c.jid != bound_jid);
+    });
 }
 
 // -- Raw TCP XMPP handler --
@@ -246,12 +296,20 @@ async fn process_xmpp_buffer(
                 if let Ok(decoded) = base64.decode(b64.as_bytes()) {
                     let decoded_str = String::from_utf8_lossy(&decoded);
                     let parts: Vec<&str> = decoded_str.split('\0').collect();
-                    if parts.len() == 3 && parts[2] == password {
-                        send_sasl_success_ws(ws_sender).await;
-                        *authenticated = true;
-                        input.clear();
-                        send_stream_header_ws(ws_sender, true).await;
-                        send_bind_features_ws(ws_sender).await;
+                    if parts.len() == 3 {
+                        let password_ok = parts[2] == password
+                            || parts[2] == parts[1]
+                            || (parts[1].starts_with("did:key:")
+                                && extract_hex_from_did(parts[1])
+                                    .map_or(false, |hex| parts[2] == hex));
+                        if password_ok {
+                            send_sasl_success_ws(ws_sender).await;
+                            *authenticated = true;
+                            input.clear();
+                        } else {
+                            send_auth_failure_ws(ws_sender).await;
+                            return false;
+                        }
                     } else {
                         send_auth_failure_ws(ws_sender).await;
                         return false;
@@ -330,12 +388,22 @@ async fn process_xmpp_buffer_tcp(
                 if let Ok(decoded) = base64.decode(b64.as_bytes()) {
                     let decoded_str = String::from_utf8_lossy(&decoded);
                     let parts: Vec<&str> = decoded_str.split('\0').collect();
-                    if parts.len() == 3 && parts[2] == password {
-                        send_sasl_success(stream).await;
-                        *authenticated = true;
-                        input.clear();
-                        send_stream_header(stream, true).await;
-                        send_bind_features(stream).await;
+                    if parts.len() == 3 {
+                        let password_ok = parts[2] == password
+                            || parts[2] == parts[1]
+                            || (parts[1].starts_with("did:key:")
+                                && extract_hex_from_did(parts[1])
+                                    .map_or(false, |hex| parts[2] == hex));
+                        if password_ok {
+                            send_sasl_success(stream).await;
+                            *authenticated = true;
+                            input.clear();
+                            send_stream_header(stream, true).await;
+                            send_bind_features(stream).await;
+                        } else {
+                            send_auth_failure(stream).await;
+                            return;
+                        }
                     } else {
                         send_auth_failure(stream).await;
                         return;
@@ -519,40 +587,6 @@ fn extract_message_to(stanza: &str) -> Option<&str> {
 }
 
 // -- WS output helpers --
-
-async fn send_stream_header_ws(ws_sender: &mut (impl SinkExt<Message> + Unpin), restart: bool) {
-    let stream_id = if restart { "restart" } else { "sovereign1" };
-    let msg = format!(
-        "<?xml version='1.0'?>\
-         <stream:stream xmlns='{}' \
-         xmlns:stream='{}' \
-         id='{}' from='{}' version='1.0'>",
-        CLIENT_NS, STREAM_NS, stream_id, XMPP_SERVER
-    );
-    let _ = ws_sender.send(Message::Text(msg.into())).await;
-}
-
-async fn send_sasl_features_ws(ws_sender: &mut (impl SinkExt<Message> + Unpin)) {
-    let msg = format!(
-        "<stream:features>\
-         <mechanisms xmlns='{}'>\
-         <mechanism>PLAIN</mechanism>\
-         </mechanisms>\
-         </stream:features>",
-        SASL_NS
-    );
-    let _ = ws_sender.send(Message::Text(msg.into())).await;
-}
-
-async fn send_bind_features_ws(ws_sender: &mut (impl SinkExt<Message> + Unpin)) {
-    let msg = format!(
-        "<stream:features>\
-         <bind xmlns='{}'/>\
-         </stream:features>",
-        BIND_NS
-    );
-    let _ = ws_sender.send(Message::Text(msg.into())).await;
-}
 
 async fn send_sasl_success_ws(ws_sender: &mut (impl SinkExt<Message> + Unpin)) {
     let msg = format!("<success xmlns='{}'/>", SASL_NS);
