@@ -134,4 +134,23 @@ describe("App", () => {
       expect(screen.getAllByRole("button", { name: /start/i }).length).toBe(3);
     });
   });
+
+  it("renders the Project Zero tab button and navigates to Project Zero", async () => {
+    render(<App />);
+    const enclaveTabBtn = screen.getByRole("button", {
+      name: /Project Zero 🛡️/i,
+    });
+    expect(enclaveTabBtn).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(enclaveTabBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Project Zero")).toBeInTheDocument();
+      expect(
+        screen.getByText("🛡️ Air-Gapped Zero Enclave Active"),
+      ).toBeInTheDocument();
+    });
+  });
 });

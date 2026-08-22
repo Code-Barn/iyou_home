@@ -17,6 +17,8 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Profile } from "../lib/types";
+import { isExternallySignable } from "../lib/enclaveFilters";
 
 interface VaultCredential {
   vc_id: string;
@@ -26,13 +28,6 @@ interface VaultCredential {
   fidelity_score?: number | null;
   expiration_date?: string | null;
   raw_payload: string;
-}
-
-interface Profile {
-  profile_id: string;
-  profile_name: string;
-  derivation_index: number;
-  did: string;
 }
 
 function fidelityBadge(score: number | null | undefined): {
@@ -78,8 +73,10 @@ export default function TrustAssets() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const activeProfile = profiles.find((p) => p.did === activeDid) || null;
-  const activeProfileId = activeProfile?.profile_id || "";
+  const signableProfiles = profiles.filter(isExternallySignable);
+  const activeProfile =
+    signableProfiles.find((p) => p.did === activeDid) ||
+    (signableProfiles.length > 0 ? signableProfiles[0] : null);
 
   useEffect(() => {
     const fetchInitial = async () => {
@@ -93,8 +90,10 @@ export default function TrustAssets() {
         setActiveDid(did);
         setProfiles(profileList);
 
+        const signable = profileList.filter(isExternallySignable);
         const profile =
-          profileList.find((p) => p.did === did) || profileList[0];
+          signable.find((p) => p.did === did) ||
+          (signable.length > 0 ? signable[0] : null);
         if (profile) {
           const creds = await invoke<VaultCredential[]>("get_credentials", {
             profileId: profile.profile_id,
@@ -115,8 +114,10 @@ export default function TrustAssets() {
 
   useEffect(() => {
     if (!activeDid || profiles.length === 0) return;
+    const signable = profiles.filter(isExternallySignable);
     const profile =
-      profiles.find((p) => p.did === activeDid) || profiles[0];
+      signable.find((p) => p.did === activeDid) ||
+      (signable.length > 0 ? signable[0] : null);
     if (!profile) return;
     const refreshCredentials = async () => {
       setError(null);
@@ -130,7 +131,7 @@ export default function TrustAssets() {
       }
     };
     refreshCredentials();
-  }, [activeDid]);
+  }, [activeDid, profiles]);
 
   const activeProfileName = activeProfile?.profile_name || "Unknown";
 

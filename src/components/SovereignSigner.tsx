@@ -18,13 +18,8 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
-
-interface Profile {
-  profile_id: string;
-  profile_name: string;
-  derivation_index: number;
-  did: string;
-}
+import { Profile } from "../lib/types";
+import { isExternallySignable } from "../lib/enclaveFilters";
 
 // Note: In the future, we can import init, { verify_vp } from '../lib/did_rust_wasm/did_rust.js'
 // to locally verify the created VP in WASM before returning it to the user.
@@ -55,10 +50,12 @@ export default function SovereignSigner() {
   const fetchProfiles = async () => {
     try {
       const list = await invoke<Profile[]>("list_profiles");
-      setProfiles(list);
-      // Set default selected profile to active one if available
-      if (list.length > 0) {
-        const activeProfile = list.find((p) => p.did === activeDid) || list[0];
+      const signable = (list || []).filter(isExternallySignable);
+      setProfiles(signable);
+      // Set default selected profile to active one if available among signable
+      if (signable.length > 0) {
+        const activeProfile =
+          signable.find((p) => p.did === activeDid) || signable[0];
         setSelectedProfileId(activeProfile.profile_id);
       }
     } catch (err: any) {
@@ -157,7 +154,7 @@ export default function SovereignSigner() {
                 marginTop: "0.5rem",
               }}
             >
-              {profiles.map((profile) => (
+              {profiles.filter(isExternallySignable).map((profile) => (
                 <option key={profile.profile_id} value={profile.profile_id}>
                   {profile.profile_name} (Index: {profile.derivation_index})
                 </option>

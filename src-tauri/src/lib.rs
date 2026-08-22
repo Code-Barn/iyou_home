@@ -32,6 +32,7 @@ use tokio_tungstenite::tungstenite::Message;
 mod blossom;
 mod bridge;
 mod certs;
+mod contacts;
 mod nostr_relay;
 mod prosody;
 mod vault;
@@ -62,8 +63,8 @@ pub struct UserPreferences {
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
-            active_profile_id: "primary".to_string(),
-            default_signing_profile: "primary".to_string(),
+            active_profile_id: vault::DEFAULT_PERSONA_PROFILE_ID.to_string(),
+            default_signing_profile: vault::DEFAULT_PERSONA_PROFILE_ID.to_string(),
             auto_sign: false,
             last_active_tab: "services".to_string(),
         }
@@ -334,13 +335,15 @@ fn get_service_statuses(state: State<'_, ServiceState>) -> HashMap<String, Servi
 
 #[tauri::command]
 fn generate_did(app: AppHandle, state: State<'_, ServiceState>) -> Result<String, String> {
-    let vault = if let Ok(v) = vault::load_vault(&app) {
-        v
-    } else {
-        vault::create_vault(&app)?
-    };
+    // Bootstrap is legitimate here: this is the first-run onboarding entry
+    // point. Corruption is surfaced, never silently regenerated.
+    let vault = vault::load_or_bootstrap_vault(&app).map_err(|e| e.to_string())?;
 
-    let did = vault.profiles[0].did.clone();
+    let did = vault
+        .public_persona()
+        .ok_or("No public persona found in vault")?
+        .did
+        .clone();
     let mut active = state.active_did.lock().unwrap();
     *active = Some(did.clone());
     Ok(did)
@@ -353,34 +356,27 @@ fn import_did(
     private_key: String,
     state: State<'_, ServiceState>,
 ) -> Result<(), String> {
-    let mut vault = if let Ok(v) = vault::load_vault(&app) {
-        v
-    } else {
-        let seed = bs58::decode(&private_key)
-            .into_vec()
-            .map_err(|_| "Invalid base58 private key".to_string())?;
-        let mut arr = [0u8; 32];
-        if seed.len() != 32 {
-            return Err("Private key must be 32 bytes".to_string());
+    let mut vault = match vault::load_vault(&app) {
+        Ok(v) => v,
+        // Only a genuinely missing vault may be seeded from the imported key.
+        Err(vault::VaultLoadError::NotFound) => {
+            let seed = bs58::decode(&private_key)
+                .into_vec()
+                .map_err(|_| "Invalid base58 private key".to_string())?;
+            let mut arr = [0u8; 32];
+            if seed.len() != 32 {
+                return Err("Private key must be 32 bytes".to_string());
+            }
+            arr.copy_from_slice(&seed);
+            vault::VaultStore {
+                root_seed_base58: bs58::encode(arr).into_string(),
+                profiles: vault::initial_profiles(&arr),
+            }
         }
-        arr.copy_from_slice(&seed);
-        let root_seed_base58 = bs58::encode(arr).into_string();
-        let kp = vault::derive_deterministic_keypair(&arr, 0);
-        let nostr_pk = vault::derive_secp256k1_pubkey_hex(&arr, 0);
-        vault::VaultStore {
-            root_seed_base58,
-            profiles: vec![vault::Profile {
-                profile_id: "primary".to_string(),
-                profile_name: "Primary Identity".to_string(),
-                derivation_index: 0,
-                did: kp.did,
-                credentials: vec![],
-                nostr_pubkey_hex: nostr_pk,
-            }],
-        }
+        Err(e) => return Err(e.to_string()),
     };
 
-    if vault::get_profile_by_id(&vault, &did).is_none() {
+    if vault.get_profile_by_id(&did).is_none() {
         let profile = vault::add_profile(
             &mut vault,
             format!("imported_{}", did.chars().take(8).collect::<String>()),
@@ -398,30 +394,42 @@ fn import_did(
 }
 
 #[tauri::command]
-fn get_active_did(app: AppHandle, state: State<'_, ServiceState>) -> Option<String> {
+fn get_active_did(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<Option<String>, String> {
     {
         let active = state.active_did.lock().unwrap();
         if let Some(did) = active.clone() {
-            return Some(did);
+            return Ok(Some(did));
         }
     }
 
     // Try to load preferences and find the active profile
     let prefs = load_preferences(&app);
-    if let Ok(vault) = vault::load_vault(&app) {
-        if let Some(profile) = vault::get_profile_by_id(&vault, &prefs.active_profile_id) {
-            let mut active = state.active_did.lock().unwrap();
-            *active = Some(profile.did.clone());
-            return Some(profile.did.clone());
+    match vault::load_vault(&app) {
+        Ok(vault) => {
+            if let Some(profile) = vault
+                .get_profile_by_id(&prefs.active_profile_id)
+                .filter(|p| !p.is_anchor())
+            {
+                let mut active = state.active_did.lock().unwrap();
+                *active = Some(profile.did.clone());
+                return Ok(Some(profile.did.clone()));
+            }
+            // Fallback to the public persona (Level 1) if preferred profile not found
+            if let Some(profile) = vault.public_persona() {
+                let mut active = state.active_did.lock().unwrap();
+                *active = Some(profile.did.clone());
+                return Ok(Some(profile.did.clone()));
+            }
+            Ok(None)
         }
-        // Fallback to first profile if preferred profile not found
-        if let Some(profile) = vault.profiles.first() {
-            let mut active = state.active_did.lock().unwrap();
-            *active = Some(profile.did.clone());
-            return Some(profile.did.clone());
-        }
+        // First-run: no vault yet is a normal empty state, not an error.
+        Err(vault::VaultLoadError::NotFound) => Ok(None),
+        // Corruption/IO faults must surface, never masquerade as "no DID".
+        Err(e) => Err(e.to_string()),
     }
-    None
 }
 
 #[tauri::command]
@@ -457,7 +465,8 @@ fn set_active_profile(
     let vault = vault::load_vault(&app)?;
 
     // Validate that the profile exists
-    let profile = vault::get_profile_by_id(&vault, &profile_id)
+    let profile = vault
+        .get_profile_by_id(&profile_id)
         .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
 
     // Update the active DID in memory
@@ -478,11 +487,15 @@ fn remove_profile(
     state: State<'_, ServiceState>,
     profile_id: String,
 ) -> Result<(), String> {
-    if profile_id == "primary" {
-        return Err("Cannot remove primary profile".to_string());
-    }
-
     let mut vault = vault::load_vault(&app)?;
+
+    // Structural deletion guard: system-reserved / Level 0 profiles are
+    // protected regardless of their id string.
+    if let Some(target) = vault.get_profile_by_id(&profile_id) {
+        if target.is_system_reserved || target.level == 0 || target.derivation_index == 0 {
+            return Err("Cannot delete system reserved profile".to_string());
+        }
+    }
 
     // Check if this is the currently active profile
     let prefs = load_preferences(&app);
@@ -492,15 +505,15 @@ fn remove_profile(
     vault::remove_profile(&mut vault, &profile_id)?;
     vault::save_vault(&app, &vault)?;
 
-    // If we removed the active profile, reset to primary
+    // If we removed the active profile, reset to the public persona
     if was_active {
         let mut prefs = load_preferences(&app);
-        prefs.active_profile_id = "primary".to_string();
+        prefs.active_profile_id = vault::DEFAULT_PERSONA_PROFILE_ID.to_string();
         save_preferences(&app, &prefs)?;
 
         // Update in-memory state
         let mut active = state.active_did.lock().unwrap();
-        if let Some(profile) = vault::get_profile_by_id(&vault, "primary") {
+        if let Some(profile) = vault.public_persona() {
             *active = Some(profile.did.clone());
         }
     }
@@ -738,7 +751,7 @@ async fn submit_ws_credential_response(
     Ok(())
 }
 
-// ---------- POLLY_CREDENTIAL_REQUEST response ----------
+// ---------- POLY_CREDENTIAL_REQUEST response ----------
 
 struct PopupGuard {
     ws: *const WsState,
@@ -815,10 +828,9 @@ async fn submit_ws_credential_presentation(
 
     let vault = vault::load_vault(&app)?;
     let pid = profile_id.unwrap_or_default();
+    // Empty/omitted profile_id resolves to the public persona (Level 1).
     let profile = vault
-        .profiles
-        .iter()
-        .find(|p| p.profile_id == pid)
+        .get_profile_by_id(&pid)
         .ok_or_else(|| format!("Profile '{}' not found", pid))?;
 
     let mut candidates: Vec<&vault::VaultCredential> = profile
@@ -891,7 +903,7 @@ async fn submit_ws_credential_presentation(
         .map_err(|e| format!("Failed to parse signed VP as JSON: {}", e))?;
 
     let response = serde_json::json!({
-        "type": "POLLY_CREDENTIAL_PRESENTATION",
+        "type": "POLY_CREDENTIAL_PRESENTATION",
         "vp": vp_value,
         "challenge": challenge
     });
@@ -1197,6 +1209,175 @@ fn delete_credential(
     vault::save_vault(&app, &vault)
 }
 
+// ---------- Contact Enclave Commands ----------
+
+#[tauri::command]
+fn list_contacts(app: AppHandle) -> Result<Vec<contacts::PeerContact>, String> {
+    let store = contacts::load_contact_store(&app)?;
+    Ok(store.contacts)
+}
+
+#[tauri::command]
+fn upsert_contact(
+    app: AppHandle,
+    contact: contacts::PeerContact,
+) -> Result<contacts::PeerContact, String> {
+    let mut store = contacts::load_contact_store(&app)?;
+    let stored = contacts::upsert_contact(&mut store, contact)?;
+    contacts::save_contact_store(&app, &store)?;
+    Ok(stored)
+}
+
+#[tauri::command]
+fn delete_contact(app: AppHandle, peer_id: String) -> Result<(), String> {
+    if peer_id.trim().is_empty() {
+        return Err("peer_id must not be empty".to_string());
+    }
+    let mut store = contacts::load_contact_store(&app)?;
+    contacts::remove_contact(&mut store, &peer_id)?;
+    contacts::save_contact_store(&app, &store)
+}
+
+#[tauri::command]
+fn generate_disclosure_card(
+    app: AppHandle,
+    profile_id: Option<String>,
+    target_peer_did: Option<String>,
+    display_name: String,
+    disclosed_aliases: Vec<String>,
+    tier: Option<String>,
+) -> Result<String, String> {
+    let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
+    let card_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut subject = serde_json::json!({
+        "id": did,
+        "name": display_name,
+        "disclosed_aliases": disclosed_aliases,
+    });
+    if let Some(ref target) = target_peer_did {
+        if !target.is_empty() {
+            subject["target_peer_did"] = serde_json::Value::String(target.clone());
+        }
+    }
+    if let Some(ref t) = tier {
+        if !t.is_empty() {
+            subject["tier"] = serde_json::Value::String(t.clone());
+        }
+    }
+
+    let payload = serde_json::json!({
+        "@context": ["https://www.w3.org/2018/credentials/v1"],
+        "id": card_id,
+        "type": ["VerifiableCredential", "SelectiveDisclosureCard"],
+        "issuanceDate": now,
+        "credentialSubject": subject,
+    });
+
+    let payload_str = payload.to_string();
+    let key_b58 = bs58::encode(signing_key.to_bytes()).into_string();
+    let signed_vc = did_rust::issue_vc(&payload_str, &did, &key_b58)
+        .map_err(|e| format!("Failed to sign disclosure card: {}", e))?;
+
+    Ok(signed_vc)
+}
+
+#[tauri::command]
+fn import_disclosure_card(
+    app: AppHandle,
+    disclosure_json: Option<String>,
+    card_json: Option<String>,
+) -> Result<contacts::PeerContact, String> {
+    let raw = disclosure_json
+        .or(card_json)
+        .ok_or_else(|| "Missing disclosure card JSON".to_string())?;
+
+    let card: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|_| "Invalid disclosure card JSON".to_string())?;
+
+    // A disclosure card is a signed VC / presentation. Verify the signature
+    // before trusting any of its contents.
+    let verification = did_rust::verify_vc(&raw);
+    let result: serde_json::Value = serde_json::from_str(&verification)
+        .map_err(|_| "Failed to parse verification result".to_string())?;
+    if !result["valid"].as_bool().unwrap_or(false) {
+        return Err(format!(
+            "Disclosure card verification failed: {}",
+            result["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
+
+    let subject = &card["credentialSubject"];
+    let peer_id = subject["id"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| card["holder"].as_str().map(String::from))
+        .unwrap_or_default();
+    if peer_id.is_empty() {
+        return Err("Disclosure card missing subject id".to_string());
+    }
+
+    let display_name = subject["name"]
+        .as_str()
+        .or_else(|| subject["nickname"].as_str())
+        .unwrap_or("Unnamed Peer")
+        .to_string();
+
+    let disclosed_aliases: Vec<String> = subject["disclosed_aliases"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let trust_level = if let Some(tier_str) = subject["tier"].as_str() {
+        let lower = tier_str.to_lowercase();
+        if lower.contains("0.5") || lower.contains("alliance") {
+            contacts::TrustLevel::Level0_5
+        } else if lower.contains("tier 0") || lower.contains("level 0") || lower.contains("inner") {
+            contacts::TrustLevel::Level0
+        } else {
+            contacts::TrustLevel::Level1
+        }
+    } else {
+        contacts::TrustLevel::Level1
+    };
+
+    let contact = contacts::PeerContact {
+        peer_id,
+        display_name,
+        trust_level,
+        disclosed_aliases,
+        attestation_receipt: Some(raw),
+        created_at: 0,
+        updated_at: 0,
+    };
+
+    let mut store = contacts::load_contact_store(&app)?;
+    let stored = contacts::upsert_contact(&mut store, contact)?;
+    contacts::save_contact_store(&app, &store)?;
+    Ok(stored)
+}
+
+#[tauri::command]
+fn resolve_peer_aliases(app: AppHandle, pubkeys: Vec<String>) -> Result<serde_json::Value, String> {
+    if pubkeys.is_empty() {
+        return Err("pubkeys must not be empty".to_string());
+    }
+    if pubkeys.len() > contacts::MAX_RESOLVE_KEYS {
+        return Err(format!(
+            "Too many pubkeys (max {})",
+            contacts::MAX_RESOLVE_KEYS
+        ));
+    }
+    let store = contacts::load_contact_store(&app)?;
+    Ok(contacts::resolution_json(&store, &pubkeys))
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1318,6 +1499,12 @@ pub fn run() {
             store_credential,
             delete_credential,
             submit_ws_credential_presentation,
+            list_contacts,
+            upsert_contact,
+            delete_contact,
+            import_disclosure_card,
+            generate_disclosure_card,
+            resolve_peer_aliases,
         ]);
 
     builder
@@ -1469,7 +1656,7 @@ mod tests {
             profile.profile_id.contains("test_profile"),
             "Profile ID should contain test_profile"
         );
-        assert_eq!(profile.derivation_index, 1, "Should be derivation index 1");
+        assert_eq!(profile.derivation_index, 2, "Should be derivation index 2");
 
         let _ = std::fs::remove_file(path);
     }
@@ -1488,15 +1675,19 @@ mod tests {
         .expect("Should add profile");
 
         // Verify profile was added
-        assert_eq!(vault_store.profiles.len(), 2);
+        assert_eq!(vault_store.profiles.len(), 3);
 
         // Remove the profile
         vault::remove_profile(&mut vault_store, &profile.profile_id)
             .expect("Should remove profile");
 
         // Verify profile was removed
-        assert_eq!(vault_store.profiles.len(), 1);
-        assert_eq!(vault_store.profiles[0].profile_id, "primary");
+        assert_eq!(vault_store.profiles.len(), 2);
+        assert_eq!(vault_store.profiles[0].profile_id, vault::ANCHOR_PROFILE_ID);
+        assert_eq!(
+            vault_store.profiles[1].profile_id,
+            vault::DEFAULT_PERSONA_PROFILE_ID
+        );
 
         let _ = std::fs::remove_file(path);
     }

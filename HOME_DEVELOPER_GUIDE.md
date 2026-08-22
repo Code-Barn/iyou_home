@@ -34,9 +34,10 @@ This guide provides instructions for setting up the development environment, run
 The backend is located in the `src-tauri` directory and is organised into five source modules plus a build script:
 
 | Module | File | Responsibility |
-|---|---|---|---|
+|---|---|---|
 | **vault** | `src/vault.rs` | Encrypted profile registry, root seed management, deterministic Ed25519 key derivation, **Poll Vote Ledger** (`PollLedger` / `VoteRecord`), **Credential Vault** (`VaultCredential`), **Merkle Root** (`calculate_vote_merkle_root` — second-preimage resistant SHA-256 tree for cold governance anchoring) |
-| **bridge** | `src/bridge.rs` | WebSocket server on port 9001 — parses inbound frames (incl. `OMNI_SIGN_REQUEST` / `POLLY_V2`), routes by `profile_id`, pipes signing requests to React |
+| **contacts** | `src/contacts.rs` | **Contact Enclave** (`contacts.json`) — peer trust store, 3-tier trust badges (Inner Circle, Trusted Alliance, Peer), alias resolution (`RESOLVE_PEER_ALIASES`), and selective disclosure attestation binding |
+| **bridge** | `src/bridge.rs` | WebSocket server on port 9001 — parses inbound frames (incl. `OMNI_SIGN_REQUEST` / `POLY_V2`, `POLY_CREDENTIAL_REQUEST`, `RESOLVE_PEER_ALIASES`), routes by `profile_id`, pipes signing requests to React |
 | **nostr_relay** | `src/nostr_relay.rs` | NIP-01 Nostr relay (port 9003) |
 | **blossom** | `src/blossom.rs` | BUD-01 blob server (port 9002) |
 | **prosody** | `src/prosody.rs` | XMPP server (port 5222) |
@@ -73,7 +74,7 @@ The Signature Bridge is **always on** (not togglable) and is the sole cross-orig
 
 **TLS termination.** Modern browsers block `ws://` connections from HTTPS origins (mixed-content security policy). The bridge terminates TLS natively via `tokio_rustls`, accepting connections at `wss://home.iyou.me:9001/`. The server uses a globally-trusted Let's Encrypt certificate issued for `home.iyou.me` (which resolves natively to `127.0.0.1`). The certificate chain and RSA private key are bundled as PEM files at `src-tauri/certs/production.crt` and `src-tauri/certs/production.key`, loaded at compile time via `env!("CARGO_MANIFEST_DIR")`. Because the cert is issued by a public CA, browsers connect without any security warning — no manual trust configuration is needed.
 
-The bridge also exposes a **Credential Presentation Handshake** (`POLLY_CREDENTIAL_REQUEST`) — see the dedicated section below.
+The bridge also exposes a **Credential Presentation Handshake** (`POLY_CREDENTIAL_REQUEST`) — see the dedicated section below.
 
 #### CORS / Private Network Access (PNA)
 
@@ -109,8 +110,10 @@ The bridge loads a globally-trusted Let's Encrypt certificate chain issued for `
 | `sign` | `"sign"` or `"action":"sign"` | OIDC/VP challenge — returns a Verifiable Presentation signed with the derived Ed25519 key | `profile_id` |
 | `sign_event` | `"sign_event"` or `"type":"sign_event"` | Nostr event signing — returns `{"type":"signed_event","event":{...}}` with `id` and `sig` (Ed25519, deviates from NIP-01 secp256k1) | `profile_id` |
 | `sign_credential` | `"type":"sign_credential"` | W3C Verifiable Credential issuance — returns `{"type":"signed_credential","vc":{...}}` | `profile_id` |
-| `OMNI_SIGN_REQUEST` | `"type":"OMNI_SIGN_REQUEST"` with `"protocol":"POLLY_V2"` | Polly V2 poll vote — canonicalises the inner `payload` (alphabetical key order, zero spacing), hashes with SHA-256, signs with vault Ed25519 key, returns a Nostr Kind 1112 envelope | `profile_id` |
-| `POLLY_CREDENTIAL_REQUEST` | `"type":"POLLY_CREDENTIAL_REQUEST"` | Credential Presentation Handshake — external app requests proof of a specific credential type; React popup prompts user to share; Rust wraps the matching vault credential into a VP via `issue_vp` | `profile_id`, `required_credential_type`, `challenge` |
+| `OMNI_SIGN_REQUEST` | `"type":"OMNI_SIGN_REQUEST"` with `"protocol":"POLY_V2"` | Polly V2 poll vote — canonicalises the inner `payload` (alphabetical key order, zero spacing), hashes with SHA-256, signs with vault Ed25519 key, returns a Nostr Kind 1112 envelope | `profile_id` |
+| `POLY_CREDENTIAL_REQUEST` | `"type":"POLY_CREDENTIAL_REQUEST"` | Credential Presentation Handshake — external app requests proof of a specific credential type; React popup prompts user to share; Rust wraps the matching vault credential into a VP via `issue_vp`. Legacy inbound `POLLY_CREDENTIAL_REQUEST` spelling is still accepted. | `profile_id`, `required_credential_type`, `challenge` |
+| `RESOLVE_PEER_ALIASES` | `"type":"RESOLVE_PEER_ALIASES"` with `"pubkeys":["<64-hex or DID>", ...]` (max 256) | Peer Trust & Alias Lens — exact-match lookup against the local contact book; returns `{"type":"peer_aliases_resolved","matches":{...},"unknown":[...]}` where each match carries only `nickname`, `trust_level`, `badge`. No enumeration endpoint exists; oversized frames are rejected (`too_many_pubkeys`). | — |
+| `get_profile` | `"type":"get_profile"` | Returns profile metadata for the requested persona (no key material) | `profile_id` |
 | `ping` | `"type":"ping"` | Smoke test — immediately responds `{"type":"pong"}` via the response channel | — |
 
 All signing message types accept an optional `"profile_id"` string. If present, the bridge looks up the matching persona in the vault registry and derives its keypair at the profile's `derivation_index`. If absent or empty, the bridge defaults to derivation index 0 (Primary Identity).
@@ -125,15 +128,15 @@ All signing message types accept an optional `"profile_id"` string. If present, 
 7. The Rust command calls `resolve_profile_keypair` which loads the vault, looks up the profile (or defaults to index 0), derives the deterministic Ed25519 keypair from the root seed + derivation index, signs the payload, and sends the response back over the WebSocket via the `mpsc::UnboundedSender<Message>` stored in `WsState.response_sender`.
 8. On denial, a `{"status":"denied"}` message is sent.
 
-#### OMNI_SIGN_REQUEST / POLLY_V2 Auto-Signing Flow
+#### OMNI_SIGN_REQUEST / POLY_V2 Auto-Signing Flow
 
-The `OMNI_SIGN_REQUEST`/`POLLY_V2` message type is designed for headless poll-vote signing from external portal applications (iyou_wun, Polly). Unlike the user-facing `sign`/`sign_event`/`sign_credential` types, the entire signing cycle is handled **entirely within the Rust bridge** — no React popup is involved, keeping the critical path fast and automatic.
+The `OMNI_SIGN_REQUEST`/`POLY_V2` message type is designed for headless poll-vote signing from external portal applications (iyou_wun, Polly). Unlike the user-facing `sign`/`sign_event`/`sign_credential` types, the entire signing cycle is handled **entirely within the Rust bridge** — no React popup is involved, keeping the critical path fast and automatic.
 
 **Incoming schema:**
 ```json
 {
   "type": "OMNI_SIGN_REQUEST",
-  "protocol": "POLLY_V2",
+  "protocol": "POLY_V2",
   "payload": {
     "poll_id": "string",
     "option_id": "string",
@@ -144,7 +147,7 @@ The `OMNI_SIGN_REQUEST`/`POLLY_V2` message type is designed for headless poll-vo
 ```
 
 **Signing pipeline (`handle_omni_sign_request` → `sign_omni_payload`):**
-1. Validate that `protocol == "POLLY_V2"` and the payload contains `poll_id`, `option_id`, and a valid `timestamp`.
+1. Validate that `protocol == "POLY_V2"` and the payload contains `poll_id`, `option_id`, and a valid `timestamp`.
 2. Resolve the vault Ed25519 keypair via `resolve_profile_keypair` (profile defaults to index 0 if absent).
 3. **Canonicalise** the inner `{option_id, poll_id, timestamp}` object using a `BTreeMap<String, Value>` — guarantees alphabetical key order — then serialise with `serde_json::to_string` (zero spacing, no newlines).
 4. Hash the canonical string with SHA-256 and produce an Ed25519 signature over the digest.
@@ -154,7 +157,7 @@ The `OMNI_SIGN_REQUEST`/`POLLY_V2` message type is designed for headless poll-vo
 ```json
 {
   "type": "OMNI_SIGN_RESPONSE",
-  "protocol": "POLLY_V2",
+  "protocol": "POLY_V2",
   "envelope": {
     "kind": 1112,
     "pubkey": "<64-char lowercase hex>",
@@ -169,14 +172,14 @@ The `OMNI_SIGN_REQUEST`/`POLLY_V2` message type is designed for headless poll-vo
 
 The response envelope can be double-broadcast or proxied as a valid Nostr event. The `id` is the SHA-256 hash of the canonical content string; `sig` is the Ed25519 signature over the same hash. Verification: recover the content, hash it, and verify the Ed25519 signature against the voter's `did:key:` public key.
 
-#### POLLY_CREDENTIAL_REQUEST / Credential Presentation Handshake
+#### POLY_CREDENTIAL_REQUEST / Credential Presentation Handshake
 
-The `POLLY_CREDENTIAL_REQUEST` message type enables external local browser applications (e.g., iyou_wun nodes or iyou_poly federation engines) to query the wallet for a specific credential presentation. Unlike the headless `OMNI_SIGN_REQUEST` which is fully automatic, credential sharing is **user-gated** — a React popup prompts for approval before any data leaves the vault.
+The `POLY_CREDENTIAL_REQUEST` message type enables external local browser applications (e.g., iyou_wun nodes or iyou_poly federation engines) to query the wallet for a specific credential presentation. Unlike the headless `OMNI_SIGN_REQUEST` which is fully automatic, credential sharing is **user-gated** — a React popup prompts for approval before any data leaves the vault.
 
 **Incoming schema:**
 ```json
 {
-  "type": "POLLY_CREDENTIAL_REQUEST",
+  "type": "POLY_CREDENTIAL_REQUEST",
   "profile_id": "optional-persona-id",
   "required_credential_type": "ProofOfPersonhood",
   "challenge": "replay-nonce-from-requester"
@@ -184,8 +187,8 @@ The `POLLY_CREDENTIAL_REQUEST` message type enables external local browser appli
 ```
 
 **Pipeline (bridge → popup → Tauri command → response):**
-1. The bridge parses `required_credential_type` and `challenge`, validates they are non-empty, then calls `pipe_or_queue` with `__type__: "POLLY_CREDENTIAL_REQUEST"`.
-2. React dispatches on `__type__ === "POLLY_CREDENTIAL_REQUEST"` and shows a dedicated prompt: "A local application is requesting proof of [type] from your vault" with Approve ("Share Asset") / Deny buttons.
+1. The bridge parses `required_credential_type` and `challenge`, validates they are non-empty, then calls `pipe_or_queue` with `__type__: "POLY_CREDENTIAL_REQUEST"`.
+2. React dispatches on `__type__ === "POLY_CREDENTIAL_REQUEST"` and shows a dedicated prompt: "A local application is requesting proof of [type] from your vault" with Approve ("Share Asset") / Deny buttons.
 3. On approval, React calls `invoke("submit_ws_credential_presentation", { credentialType, challenge, approved, profileId })`.
 4. The Rust command (`src-tauri/src/lib.rs`):
    - **Defensive popup guard**: Acquires `PopupGuard` — an RAII guard that sets `ws_state.popup_active = true` and flushes any queued pending messages on release. If a popup is already active, returns an error immediately (prevents modal trampling).
@@ -197,7 +200,7 @@ The `POLLY_CREDENTIAL_REQUEST` message type enables external local browser appli
 
 ```json
 {
-  "type": "POLLY_CREDENTIAL_PRESENTATION",
+  "type": "POLY_CREDENTIAL_PRESENTATION",
   "vp": {
     "@context": ["https://www.w3.org/2018/credentials/v1"],
     "type": ["VerifiablePresentation"],
@@ -322,7 +325,7 @@ This replaces the previous 100ms-only approach. The flush after every `send()` i
 
 ### Testing the Backend
 
-Unit tests are in `src-tauri/src/lib.rs` and `src-tauri/src/vault.rs`.
+Unit tests are in `src-tauri/src/lib.rs`, `src-tauri/src/vault.rs`, and `src-tauri/src/contacts.rs`.
 
 To run all Rust tests:
 ```bash
@@ -330,32 +333,37 @@ cd src-tauri
 cargo test
 ```
 
-Current test suites — **vault**:
+Current test suites — **vault & derivation (27 tests)**:
 - `test_derivation_is_deterministic` — same seed + index always yields the same DID
 - `test_different_index_different_key` — different indices produce different keypairs
 - `test_vault_round_trip` — create, persist, load, verify base64-encrypted storage
 - `test_add_remove_profile` — profile CRUD operations on `VaultStore`
-- `test_get_profile_by_id_defaults_to_first` — empty `profile_id` resolves to index 0
+- `test_get_profile_by_id_defaults_to_first` — empty `profile_id` resolves to default persona
 - `test_get_profile_keypair` — `get_profile_keypair` returns correct DID for a profile
+- `test_dual_did_initial_provisioning` — bootstrap produces both Level 0 Anchor (index 0) and Level 1 Primary (index 1)
+- `test_anchor_deletion_blocked` — deletion fails on `is_system_reserved`, `derivation_index == 0`, or `level == 0`
+- `test_add_profile_index_floor` — dynamic persona creation starts strictly at index >= 2
+- `test_atomic_save_preserves_on_write_failure` — atomic `.tmp` swap guarantees data integrity
+- `test_load_vault_corrupt_quarantines_file` / `test_quarantine_rotation_keeps_recent_backups` — auto-quarantine corrupt files to `.bak`
+- `test_credential_storage_fidelity` / `test_legacy_vault_without_credentials_defaults_to_empty` — credential store fidelity
 - `test_vote_record_round_trip` — serialise/deserialise cycle for `PollLedger` / `VoteRecord`
-- `test_merkle_root_two_records_deterministic` — same inputs → same root
-- `test_merkle_root_single_record` — leaf = `SHA-256(0x00 \|\| sig)`
-- `test_merkle_root_changing_signature_changes_root` — different sig → different root
-- `test_merkle_root_empty_records_returns_empty` — empty input → `""`
-- `test_merkle_root_three_records_odd_duplication` — odd leaf count duplicates final node
+- `test_merkle_root_two_records_deterministic` / `test_merkle_root_single_record` / `test_merkle_root_changing_signature_changes_root` / `test_merkle_root_empty_records_returns_empty` / `test_merkle_root_three_records_odd_duplication` — second-preimage resistant SHA-256 Merkle root computation
+- `test_vote_before_starts_at_rejected` / `test_vote_after_ends_at_rejected` / `test_vote_within_window_accepted` / `test_is_ongoing_permits_out_of_bounds` — poll schedule timeline validation
 
-Current test suites — **credentials**:
-- `test_credential_storage_fidelity` — upsert by `vc_id` replaces previous entries; `get_credentials` returns live vault data
-- `test_legacy_vault_without_credentials_defaults_to_empty` — legacy files (no `credentials` field) deserialize with an empty `Vec`
+Current test suites — **contacts & peer trust (7 tests)**:
+- `test_trust_level_badges_and_defaults` — maps `level0` (Inner Circle), `level0_5` (Trusted Alliance), `level1` (Peer)
+- `test_contact_round_trip_persistence` — creates, saves, reloads `contacts.json`
+- `test_upsert_preserves_created_at_and_dedupes_aliases` — upsert deduplication
+- `test_remove_contact_errors_on_missing` — deletion safety
+- `test_alias_resolution_matches_primary_and_disclosed` — exact match lookup for both primary DID and disclosed alias tokens
+- `test_resolution_normalizes_hex_case_and_reports_unknown` — lowercase hex normalization & unknown isolation
+- `test_corrupt_contacts_quarantines_and_errors` — auto-quarantine for `contacts.json`
 
-Current test suites — **timeline validation**:
-- `test_vote_before_starts_at_rejected` — vote timestamp before `starts_at` returns `Err`
-- `test_vote_after_ends_at_rejected` — vote timestamp after `ends_at` returns `Err`
-- `test_vote_within_window_accepted` — boundary values (`starts_at`, `ends_at`, midpoint) pass cleanly
-- `test_is_ongoing_permits_out_of_bounds` — `is_ongoing: true` bypasses all bounds checks
-
-Current test suites — **commands**:
+Current test suites — **commands & lifecycle (7 tests)**:
 - `test_toggle_service_start` / `test_toggle_service_stop` — service state transitions
+- `test_preferences_defaults` / `test_preferences_round_trip` — preferences persistence
+- `test_set_active_profile_validation` — active profile validation
+- `test_profile_removal_fallback` — deletion of active persona falls back to Primary Identity
 - `test_sign_auth_challenge_logic` — VP signing with proof validation via derived keypair
 
 ## Identity Model
@@ -363,23 +371,38 @@ Current test suites — **commands**:
 **Passwords are deprecated.** The primary entry point is the OIDC/DID loop:
 
 1. A browser-based identity provider (IdP) at WUN or Polly initiates the flow by connecting to the local Signature Bridge.
-2. The IdP sends a challenge (`sign`), a Nostr event (`sign_event`), a credential body (`sign_credential`), a poll vote (`OMNI_SIGN_REQUEST` / `POLLY_V2`), or a credential presentation request (`POLLY_CREDENTIAL_REQUEST`) over the WebSocket, optionally specifying a `"profile_id"` to select which persona performs the signing.
-3. For user-facing types (`sign`/`sign_event`/`sign_credential`/`POLLY_CREDENTIAL_REQUEST`), the user approves or denies via the React popup (`WsSignPopup`). For the headless `OMNI_SIGN_REQUEST` type, signing is fully automatic within the Rust bridge — no React popup appears.
-4. The Rust backend loads the vault, looks up the profile (or defaults to derivation index 0), derives the deterministic Ed25519 keypair from the root seed + `derivation_index`, signs, and returns the result over the same WebSocket connection. For `OMNI_SIGN_REQUEST` responses, the signed payload is wrapped in a Nostr Kind 1112 envelope. For `POLLY_CREDENTIAL_REQUEST` responses, the selected credential is wrapped in a Verifiable Presentation envelope via `issue_vp`.
+2. The IdP sends a challenge (`sign`), a Nostr event (`sign_event`), a credential body (`sign_credential`), a poll vote (`OMNI_SIGN_REQUEST` / `POLY_V2`), or a credential presentation request (`POLY_CREDENTIAL_REQUEST`) over the WebSocket, optionally specifying a `"profile_id"` to select which persona performs the signing.
+3. For user-facing types (`sign`/`sign_event`/`sign_credential`/`POLY_CREDENTIAL_REQUEST`), the user approves or denies via the React popup (`WsSignPopup`). For the headless `OMNI_SIGN_REQUEST` type, signing is fully automatic within the Rust bridge — no React popup appears.
+4. The Rust backend loads the vault, looks up the profile (or defaults to Level 1 Primary Identity), derives the deterministic Ed25519 keypair from the root seed + `derivation_index`, signs, and returns the result over the same WebSocket connection. For `OMNI_SIGN_REQUEST` responses, the signed payload is wrapped in a Nostr Kind 1112 envelope. For `POLY_CREDENTIAL_REQUEST` responses, the selected credential is wrapped in a Verifiable Presentation envelope via `issue_vp`.
 
-### Multi-Persona Architecture
+### Project Zero & Multi-Persona Architecture
 
-The vault stores a single 32-byte root seed (`root_seed_base58`) and a `Vec<Profile>`. Each profile has a `profile_id`, `profile_name`, `derivation_index`, and a cached `did:key:` string. No per-profile private keys are stored — all keys are derived deterministically:
+The vault stores a single 32-byte root seed (`root_seed_base58`) and a `Vec<Profile>`. Each profile has a `profile_id`, `profile_name`, `derivation_index`, `level`, `is_system_reserved`, `nostr_pubkey_hex`, and a cached `did:key:` string. No per-profile private keys are stored — all keys are derived deterministically:
 
 ```
 Ed25519 keypair = SHA-256(root_seed || LE(derivation_index))
+Nostr secp256k1 = SHA-256("secp256k1-nostr" || root_seed || LE(derivation_index))
 ```
 
+#### Derivation Hierarchy & Air-Gap Guarantees
+
+1. **Level 0 — Anchor Sanctum (Derivation Index 0)**:
+   - `profile_id: "anchor"`, `level: 0`, `is_system_reserved: true`.
+   - **Air-Gap Invariant**: Excluded from public WebSocket signing pickers, external persona selectors, and general social relay broadcasting. Used strictly as the sovereign cryptographic root for high-assurance peer disclosures and containment.
+   - Protected from deletion by structural backend guards (`is_system_reserved || derivation_index == 0 || level == 0`).
+2. **Level 1 — Primary Identity / Public Persona (Derivation Index 1)**:
+   - `profile_id: "primary"`, `level: 1`, `is_system_reserved: false`.
+   - Default active persona for public social broadcasting, Nostr relay events, OIDC/VP challenge signing, and bridge interactions.
+3. **Level 2+ — Contextual Burner Identities (Derivation Index 2+)**:
+   - `level: 2`, disposable burner personas created dynamically for isolated contexts. Deletable at will.
+
 | Tauri Command | Description |
-|---|---|---|
-| `list_profiles` | Returns all profiles (public DID only, no private material) |
-| `add_profile(profileName)` | Creates a new persona at the next unused `derivation_index` |
-| `get_active_did` | Returns the DID of the currently active profile |
+|---|---|
+| `list_profiles` | Returns all profiles (public DIDs and metadata, zero private material) |
+| `add_profile(profileName)` | Creates a new Level 2+ burner persona at the next unused `derivation_index` |
+| `get_active_did` | Returns the DID of the currently active profile (defaults to Level 1 Primary) |
+| `set_active_profile(profileId)` | Sets the active profile and persists preference |
+| `remove_profile(profileId)` | Deletes a persona (blocked on Level 0 / Anchor) |
 | `sync_vote_records(records)` | Ingests and appends an array of `VoteRecord` objects to the local Poll Vote Ledger |
 | `get_vote_history` | Returns the full array of stored `VoteRecord` entries from the local Poll Vote Ledger |
 | `save_credential(profile_id, vc_json)` | Validates a VC signature, then upserts it into the profile's credential store |
@@ -398,6 +421,9 @@ pub struct Profile {
     pub derivation_index: u32,
     pub did: String,
     pub credentials: Vec<VaultCredential>,
+    pub nostr_pubkey_hex: String,
+    pub level: u8,
+    pub is_system_reserved: bool,
 }
 ```
 
@@ -436,19 +462,20 @@ pub struct VaultCredential {
 
 **Zero UI Leakage:** Private key bytes never cross the Rust/TypeScript boundary. All signing happens inside the compiled Rust process using `ed25519-dalek` via the derived keypair. The frontend sees only `did:key:` strings.
 
-### Greenfield Resets & Backward Compatibility Policy
+### Greenfield Resets & Dual-Bootstrap Provisioning
 
-**Architectural Decision**: This application has dropped all backward compatibility support in favor of a clean, greenfield-only approach. This decision eliminates technical debt and simplifies the codebase since the application is currently in pre-release with a single user base.
+**Architectural Decision**: This application has dropped all backward compatibility support in favor of a clean, greenfield-only approach.
 
-#### Reset Behavior
+#### Reset & Dual-Bootstrap Behavior
 
-If `vault.json` is missing, corrupt, or fails to deserialize as a valid `VaultStore`, `load_vault` immediately:
+If `vault.json` is missing or when bootstrapping from a fresh 32-byte root seed, `load_or_bootstrap_vault` automatically provisions **both foundational identities**:
 
-1. Generates a fresh 32-byte root seed
-2. Creates a "Primary Identity" profile at derivation index 0
-3. Overwrites the existing file with the new schema
+1. **Derivation Index 0 (Level 0 Anchor Sanctum)**:
+   - `profile_id: "anchor"`, `profile_name: "Anchor Identity"`, `level: 0`, `is_system_reserved: true`
+2. **Derivation Index 1 (Level 1 Primary Identity / Public Persona)**:
+   - `profile_id: "primary"`, `profile_name: "Primary Identity"`, `level: 1`, `is_system_reserved: false`
 
-**No legacy format migration is attempted** — the old single-key `IdentityStore` schema has been permanently removed.
+If an existing file is corrupted, `load_vault` renames the corrupted file to `vault.json.corrupt_{timestamp}.bak` (retaining up to 5 newest backups) before returning an explicit error, preventing silent loss of user state.
 
 #### Benefits of Greenfield-Only Approach
 
@@ -457,15 +484,42 @@ If `vault.json` is missing, corrupt, or fails to deserialize as a valid `VaultSt
 - **Clean State**: Users always start with known-good configuration
 - **Easy Reset**: Delete `vault.json` to start fresh at any time
 
-#### User Impact
-
-- **Existing Users**: Delete `vault.json` to migrate to v3 schema (one-time operation)
-- **New Users**: Automatic clean initialization on first run
-- **Multi-User Systems**: Each OS user gets independent greenfield initialization
-
 This approach aligns with the Level 2 Secure Enclave model by ensuring all users start with a cryptographically sound, deterministic configuration.
 
 There is no password-based authentication for the signing flow. The XMPP (Chat) service uses a locally-generated password file for SASL PLAIN (`{app_data}/xmpp_password.txt`) — this is a transport credential, not an identity credential. All higher-level identity operations go through the DID/Vault+WebSocket path.
+
+### Contact Enclave & Peer Trust Lens (`contacts.json`)
+
+Peer contacts and trust relationships are persisted independently in `{app_data}/contacts.json` (managed by `src-tauri/src/contacts.rs`). Separating the contact book from `vault.json` ensures that peer trust queries cannot touch private key material.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerContact {
+    pub peer_id: String,                     // Primary DID or Nostr 64-hex
+    pub display_name: String,
+    pub trust_level: TrustLevel,             // Level0, Level0_5, Level1
+    pub disclosed_aliases: Vec<String>,      // Known burner DIDs / pubkeys
+    pub attestation_receipt: Option<String>, // Verifiable Credential payload
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+```
+
+#### Trust Tiers
+
+| Trust Tier | Wire / JSON Token | Badge Title | Color Scheme | Description |
+|---|---|---|---|---|
+| **Tier 0** | `level0` / `Level0` | **Inner Circle** | Violet / Crimson | Air-gapped peers, high-trust root anchors |
+| **Tier 0.5** | `level0_5` / `Level0_5` | **Trusted Alliance** | Emerald Green | Vouched collaborators and alliance nodes |
+| **Tier 1** | `level1` / `Level1` | **Peer** | Slate Gray | Standard public peers and contextual contacts |
+
+#### Contact Enclave Commands:
+- `list_contacts` — returns all contacts from `contacts.json`.
+- `upsert_contact(contact)` — inserts or updates a contact by `peer_id`, deduplicating `disclosed_aliases`.
+- `delete_contact(peer_id)` — removes a contact by `peer_id`.
+- `generate_disclosure_card(profile_id, target_peer_did, display_name, disclosed_aliases, tier)` — issues a signed W3C Verifiable Credential (`SelectiveDisclosureCard`) containing the specified aliases and trust tier.
+- `import_disclosure_card(card_json)` — cryptographically verifies the signature on a peer's disclosure card using `did_rust::verify_vc`, extracts subject details, and upserts into `contacts.json`.
+- `resolve_peer_aliases(pubkeys)` / `RESOLVE_PEER_ALIASES` (WS) — exact-match lookup capped at `MAX_RESOLVE_KEYS = 256` returning `{ nickname, trust_level, badge }`. Leaves `unknown` unmapped and avoids enumeration.
 
 ### Poll Vote Ledger
 
@@ -519,7 +573,14 @@ The frontend is a React application located in the `src` directory.
 
 *   **Main Component:** The main UI is defined in `src/App.tsx`.
 *   **Communicating with the Backend:** The frontend uses the `@tauri-apps/api/core` package to `invoke` commands exposed by the Rust backend.
-*   **WebSocket Sign Popup:** `src/components/WsSignPopup.tsx` creates a `Channel<string>` on mount, sets `channel.onmessage` to show the challenge modal, and registers it via `invoke('register_challenge_pipe', { channel })`. Shows a modal with challenge text, Approve/Deny buttons, and an auto-sign checkbox for development. This is the **only** delivery path — polling and event-based approaches have been removed. Supports four request types: `sign` (challenge), `sign_event` (Nostr), `sign_credential` (VC issuance), and `POLLY_CREDENTIAL_REQUEST` (credential sharing).
+*   **Project Zero Enclave:** `src/components/enclave/` provides the root sovereign interface:
+    - `ProjectZero.tsx`: Main enclave container managing status and subtab navigation.
+    - `PersonaMatrix.tsx`: 3-tier matrix view separating Level 0 Anchor Sanctum, Level 1 Public Persona, and Level 2+ Burners.
+    - `ContactList.tsx`: Contact enclave management table with trust level badges and disclosed alias tokens.
+    - `DisclosureModal.tsx`: Generates and imports W3C Verifiable Disclosure Cards.
+*   **Air-Gap Selector Filters:** `src/lib/enclaveFilters.ts` provides `isAnchor(p)` and `isExternallySignable(p)` to strictly air-gap Level 0 from external pickers and dropdowns.
+*   **WebSocket Sign Popup:** `src/components/WsSignPopup.tsx` creates a `Channel<string>` on mount, sets `channel.onmessage` to show the challenge modal, and registers it via `invoke('register_challenge_pipe', { channel })`. Shows a modal with challenge text, Approve/Deny buttons, and an auto-sign checkbox for development. This is the **only** delivery path — polling and event-based approaches have been removed. Supports four request types: `sign` (challenge), `sign_event` (Nostr), `sign_credential` (VC issuance), and `POLY_CREDENTIAL_REQUEST` (credential sharing).
+*   **Keys (Vault) Manager:** `src/components/KeysManager.tsx` displays public personas (Level 1+), derivation indices, and provides vault regeneration actions.
 *   **Trust Assets Dashboard:** `src/components/TrustAssets.tsx` displays the credential vault — credential cards with fidelity tier badges, expired/grayscale state, subject DID mismatch alerts against the active profile, and a raw payload inspection modal.
 *   **Sovereign Signer:** `src/components/SovereignSigner.tsx` provides a manual challenge paste UI as an alternative to the WebSocket flow.
 *   **IPFS Cloud Archive Viewer:** `src/components/IpfsArchiveViewer.tsx` provides a CID input with gateway selection, fetches poll snapshots from IPFS gateways, and audits the asserted Merkle root against the local `calculate_vote_merkle_root` command — match (green) or mismatch (red) UI.
@@ -530,11 +591,23 @@ The frontend is a React application located in the `src` directory.
 Frontend tests use [Vitest](https://vitest.dev/) and [@testing-library/react](https://testing-library.com/docs/react-testing-library/intro/) in `src/__tests__/`.
 
 ```bash
-npm test          # run tests
+npm test          # run tests (npx vitest run)
 npm run coverage  # run tests with coverage
 ```
 
-**Trust Assets test suite** (`src/__tests__/TrustAssets.test.tsx`):
+**Project Zero test suite** (`src/__tests__/ProjectZero.test.tsx` — 5 tests):
+- Project Zero banner and hierarchy overview
+- 3 distinct persona tiers rendering in Persona Matrix
+- Contact Enclave tab switching and trust badge display
+- Selective Disclosure Card generation and signed payload output
+- Selective Disclosure Card import and signature verification
+
+**Enclave Filters test suite** (`src/__tests__/enclaveFilters.test.ts` — 3 tests):
+- Level 0 / index 0 / system reserved profiles identified as anchors
+- Level 1 and Level 2+ profiles identified as non-anchors
+- Inverse resolution for `isExternallySignable`
+
+**Trust Assets test suite** (`src/__tests__/TrustAssets.test.tsx` — 9 tests):
 - Empty state rendering
 - Credential card rendering with type, issuer, subject fidelity
 - Fidelity tier badge mapping (Tier 1 / Tier 2 / Tier 3)
@@ -543,13 +616,12 @@ npm run coverage  # run tests with coverage
 - Subject DID mismatch against active profile: critical alert
 - Raw payload inspection modal: open and close
 
-**App test suite** (`src/__tests__/App.test.tsx`):
+**App test suite** (`src/__tests__/App.test.tsx` — 5 tests):
 - Service switch panel renders all services (SigBridge, Nostr, Blossom, Chat, IPFS Cloud Archive, Polly)
 - Port labels displayed for active services
 - `toggle_service` command dispatched with correct args when Start/Stop clicked
-- React 19 async state flush: button text transitions Start→Stop and Stop→Start
-- Mock dispatches by command name (`get_auto_start_settings`, `get_service_statuses`, `toggle_service`) using `vi.fn()` default implementation
-- `toggle_service` mock uses `new Promise(r => setTimeout(() => r(...), 0))` (macro-task) to ensure React 19 `act()` properly flushes state updates
+- Service stop transitions and state updates
+- Project Zero navigation tab button rendering and navigation
 
 ## Building for Production
 
@@ -566,7 +638,7 @@ This application strictly employs a Level 2 (Sovereign) security posture using a
 1.  **The Vault (Rust Backend):** A 32-byte root seed, a vector of profile descriptors, and per-profile Verifiable Credentials are persisted in base64-encrypted JSON at `{app_data}/vault.json`. All access is managed exclusively by Rust (`src-tauri/src/vault.rs`). **No private key material — derived or stored — is ever exposed to the JavaScript frontend context.** The frontend receives only `did:key:` strings via `Profile.did` and credential payloads via `get_credentials`.
 2.  **Poll Vote Ledger (Rust Backend):** An immutable local audit trail of poll voting history is persisted as plain JSON at `{app_data}/poll_ledger.json`. The ledger is managed by the same `vault.rs` module and exposed to the frontend via `sync_vote_records` and `get_vote_history` Tauri commands. No private key material is stored in the ledger — only Ed25519 signatures over canonicalised poll payloads.
 3.  **Deterministic Derivation:** Per-persona Ed25519 keypairs are derived inside the Rust process via `SHA-256(root_seed || LE(derivation_index))`. Individual profile private keys are never stored.
-4.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge`, `submit_ws_response`, etc.). The `profile_id` is threaded from the WebSocket frame through the React popup and back to the signing command. Vote history retrieval is handled via `get_vote_history` / `sync_vote_records`. Credential storage is managed via `save_credential` / `store_credential` / `get_credentials` / `delete_credential` and displayed in the Trust Assets dashboard. Headless `OMNI_SIGN_REQUEST` / `POLLY_V2` signing bypasses the React layer entirely and is handled directly in the Rust bridge. User-gated `POLLY_CREDENTIAL_REQUEST` credential sharing routes through the React popup.
+4.  **The Switchboard (React Frontend):** The UI manages user interactions and orchestrates signing by passing challenges to the backend via Tauri IPC (`sign_auth_challenge`, `submit_ws_response`, etc.). The `profile_id` is threaded from the WebSocket frame through the React popup and back to the signing command. Vote history retrieval is handled via `get_vote_history` / `sync_vote_records`. Credential storage is managed via `save_credential` / `store_credential` / `get_credentials` / `delete_credential` and displayed in the Trust Assets dashboard. Headless `OMNI_SIGN_REQUEST` / `POLY_V2` signing bypasses the React layer entirely and is handled directly in the Rust bridge. User-gated `POLY_CREDENTIAL_REQUEST` credential sharing routes through the React popup.
 5.  **Backend Cryptography:** VP signing, DID resolution, and OMNI payload canonicalisation + signing are performed natively in Rust by the combined `ed25519-dalek`, `sha2`, and `did_rust` libraries.
 6.  **WASM Utilities:** `did_rust` is compiled to WebAssembly (`src/lib/did_rust_wasm/`) only for non-sensitive parsing and validation in the frontend.
 
@@ -627,7 +699,7 @@ When fetching the current identity via `get_active_did`, the system:
 
 #### Headless Bridge Processing Limitations
 
-**CRITICAL**: Headless protocol requests (`OMNI_SIGN_REQUEST` / `POLLY_V2`) bypass the React context state. If an incoming message contains an empty `profile_id`, the signing bridge continues to default strictly to derivation index 0 (Primary Identity) **regardless of what is currently selected inside the UI's user preference layer**. 
+**CRITICAL**: Headless protocol requests (`OMNI_SIGN_REQUEST` / `POLY_V2`) bypass the React context state. If an incoming message contains an empty `profile_id`, the signing bridge continues to default strictly to derivation index 0 (Primary Identity) **regardless of what is currently selected inside the UI's user preference layer**. 
 
 This is a **cryptographic distinction** that external applications must understand:
 
@@ -649,7 +721,7 @@ Portals must provide explicit profile identifiers to target alternative identiti
 
 5. **PopupGuard pointer safety.** The guard uses a raw pointer `*const WsState` to bypass borrow-checker lifetime constraints. The pointer is valid for the command's duration because `WsState` is managed by Tauri (static lifetime). If `WsState` is ever dropped before the guard, dereferencing the raw pointer would be UB.
 
-6. **`POLLY_CREDENTIAL_REQUEST` queue starvation.** If a requester sends frames faster than the user can approve/deny, the `pending_messages` queue grows unbounded. No backpressure or retention limit is enforced.
+6. **`POLY_CREDENTIAL_REQUEST` queue starvation.** If a requester sends frames faster than the user can approve/deny, the `pending_messages` queue grows unbounded. No backpressure or retention limit is enforced.
 
 ## Nostr Cryptographic Enforcement (BIP-340)
 

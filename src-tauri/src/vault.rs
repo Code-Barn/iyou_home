@@ -18,7 +18,9 @@
 use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -26,6 +28,11 @@ use k256::schnorr::SigningKey as SecpSigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+
+/// Level 0 — immutable, air-gapped anchor identity (private P2P enclaves only).
+pub const ANCHOR_PROFILE_ID: &str = "anchor";
+/// Level 1 — default active persona for public social tasks.
+pub const DEFAULT_PERSONA_PROFILE_ID: &str = "primary";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -35,6 +42,18 @@ pub struct Profile {
     pub did: String,
     pub credentials: Vec<VaultCredential>,
     pub nostr_pubkey_hex: String,
+    /// Identity tier: 0 = Anchor, 1 = Public Persona, 2+ = Burner/Contextual.
+    #[serde(default)]
+    pub level: u8,
+    /// System-reserved profiles (Anchor) can never be deleted or externally used.
+    #[serde(default)]
+    pub is_system_reserved: bool,
+}
+
+impl Profile {
+    pub fn is_anchor(&self) -> bool {
+        self.level == 0 || self.derivation_index == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +71,27 @@ pub struct VaultCredential {
 pub struct VaultStore {
     pub root_seed_base58: String,
     pub profiles: Vec<Profile>,
+}
+
+impl VaultStore {
+    /// The default public-facing identity: first profile at Level 1+ /
+    /// derivation index 1+. Never returns the Level 0 anchor.
+    pub fn public_persona(&self) -> Option<&Profile> {
+        self.profiles
+            .iter()
+            .find(|p| p.level >= 1 || p.derivation_index >= 1)
+            .or_else(|| self.profiles.iter().find(|p| p.derivation_index == 1))
+    }
+
+    /// Resolve a profile by id. An empty id resolves to the public persona
+    /// (Level 1), never the air-gapped anchor.
+    pub fn get_profile_by_id(&self, id: &str) -> Option<&Profile> {
+        if id.is_empty() {
+            self.public_persona()
+        } else {
+            self.profiles.iter().find(|p| p.profile_id == id)
+        }
+    }
 }
 
 pub struct DerivedKeypair {
@@ -121,79 +161,277 @@ fn get_storage_path(app: &AppHandle) -> PathBuf {
     path
 }
 
-pub fn create_vault(app: &AppHandle) -> Result<VaultStore, String> {
-    create_vault_at_path(&get_storage_path(app))
-}
-
 pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
     let root_seed_base58 = bs58::encode(seed).into_string();
 
-    let kp = derive_deterministic_keypair(&seed, 0);
-    let nostr_pk = derive_secp256k1_pubkey_hex(&seed, 0);
-
     let vault = VaultStore {
         root_seed_base58,
-        profiles: vec![Profile {
-            profile_id: "primary".to_string(),
-            profile_name: "Primary Identity".to_string(),
-            derivation_index: 0,
-            did: kp.did,
-            credentials: vec![],
-            nostr_pubkey_hex: nostr_pk,
-        }],
+        profiles: initial_profiles(&seed),
     };
 
     save_vault_inner(path, &vault)?;
     Ok(vault)
 }
 
-pub fn load_vault(app: &AppHandle) -> Result<VaultStore, String> {
-    let path = get_storage_path(app);
-    load_vault_from_path(&path).or_else(|_| create_vault_at_path(&path))
+/// Bootstrap the reserved identity hierarchy from a root seed:
+/// Level 0 Anchor at index 0 and the Level 1 public persona at index 1.
+pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
+    let anchor_kp = derive_deterministic_keypair(seed, 0);
+    let anchor_nostr_pk = derive_secp256k1_pubkey_hex(seed, 0);
+    let persona_kp = derive_deterministic_keypair(seed, 1);
+    let persona_nostr_pk = derive_secp256k1_pubkey_hex(seed, 1);
+
+    vec![
+        Profile {
+            profile_id: ANCHOR_PROFILE_ID.to_string(),
+            profile_name: "Anchor Identity".to_string(),
+            derivation_index: 0,
+            did: anchor_kp.did,
+            credentials: vec![],
+            nostr_pubkey_hex: anchor_nostr_pk,
+            level: 0,
+            is_system_reserved: true,
+        },
+        Profile {
+            profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
+            profile_name: "Primary Identity".to_string(),
+            derivation_index: 1,
+            did: persona_kp.did,
+            credentials: vec![],
+            nostr_pubkey_hex: persona_nostr_pk,
+            level: 1,
+            is_system_reserved: false,
+        },
+    ]
 }
 
-pub fn load_vault_from_path(path: &Path) -> Result<VaultStore, String> {
-    if !path.exists() {
-        return Err("No vault found".to_string());
+// ---------- Persistence: load, quarantine, atomic save ----------
+
+/// Error taxonomy for vault loading. `NotFound` is the legitimate first-run
+/// bootstrap signal; every other variant must NEVER trigger regeneration.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VaultLoadError {
+    NotFound,
+    Corrupt {
+        quarantined_to: Option<PathBuf>,
+        detail: String,
+    },
+    Io(String),
+}
+
+impl std::fmt::Display for VaultLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VaultLoadError::NotFound => write!(f, "No vault found at path"),
+            VaultLoadError::Corrupt {
+                quarantined_to,
+                detail,
+            } => write!(
+                f,
+                "Vault corrupt (quarantined: {:?}): {}",
+                quarantined_to, detail
+            ),
+            VaultLoadError::Io(err) => write!(f, "Vault IO error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for VaultLoadError {}
+
+impl From<VaultLoadError> for String {
+    fn from(e: VaultLoadError) -> Self {
+        e.to_string()
+    }
+}
+
+/// Number of `vault.json.corrupt_*.bak` files retained after rotation.
+const CORRUPT_BACKUPS_TO_KEEP: usize = 5;
+
+fn corrupt_backup_prefix(original_file_name: &str) -> String {
+    format!("{}.corrupt_", original_file_name)
+}
+
+/// Collect existing quarantine backups for a vault file, newest first.
+/// Timestamps are fixed-width unix seconds embedded in the file name, so
+/// lexicographic ordering matches chronological ordering.
+pub(crate) fn existing_corrupt_backups(dir: &Path, original_file_name: &str) -> Vec<PathBuf> {
+    let prefix = corrupt_backup_prefix(original_file_name);
+    let mut backups: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix) && n.ends_with(".bak"))
+                .unwrap_or(false)
+        })
+        .collect();
+    backups.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    backups
+}
+
+/// Rename a damaged vault file out of harm's way as
+/// `<name>.corrupt_<UNIX_TIMESTAMP>.bak` (with `_N` collision counter
+/// within the same second), then prune older backups. Shared by the vault
+/// and contact stores so a damaged file can never be destroyed by a
+/// subsequent save.
+pub(crate) fn quarantine_corrupt_vault(path: &Path) -> std::io::Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let original_file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vault.json")
+        .to_string();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut backup = dir.join(format!("{}.corrupt_{}.bak", original_file_name, timestamp));
+    let mut collision = 0u32;
+    while backup.exists() {
+        collision += 1;
+        backup = dir.join(format!(
+            "{}.corrupt_{}_{}.bak",
+            original_file_name, timestamp, collision
+        ));
     }
 
-    let encrypted = fs::read_to_string(path).map_err(|e| format!("Failed to read vault: {}", e))?;
-    let decoded = base64
-        .decode(encrypted.trim())
-        .map_err(|e| format!("Base64 decode error: {}", e))?;
-    let json = String::from_utf8(decoded).map_err(|e| format!("UTF-8 error: {}", e))?;
+    fs::rename(path, &backup)?;
+    rotate_corrupt_backups(dir, &original_file_name)?;
+    Ok(backup)
+}
 
-    serde_json::from_str::<VaultStore>(&json).map_err(|e| format!("Failed to parse vault: {}", e))
+fn rotate_corrupt_backups(dir: &Path, original_file_name: &str) -> std::io::Result<()> {
+    for stale in existing_corrupt_backups(dir, original_file_name)
+        .into_iter()
+        .skip(CORRUPT_BACKUPS_TO_KEEP)
+    {
+        let _ = fs::remove_file(stale);
+    }
+    Ok(())
+}
+
+/// Build a `Corrupt` error, quarantining the damaged file when possible so a
+/// subsequent save can never destroy the only copy of the user's identities.
+fn corrupt_error(path: &Path, detail: String) -> VaultLoadError {
+    match quarantine_corrupt_vault(path) {
+        Ok(quarantined_to) => VaultLoadError::Corrupt {
+            quarantined_to: Some(quarantined_to),
+            detail,
+        },
+        Err(q_err) => VaultLoadError::Corrupt {
+            quarantined_to: None,
+            detail: format!("{} (quarantine failed: {})", detail, q_err),
+        },
+    }
+}
+
+/// Read-only load from disk. Never creates or regenerates a vault.
+pub fn load_vault_from_path(path: &Path) -> Result<VaultStore, VaultLoadError> {
+    if !path.exists() {
+        return Err(VaultLoadError::NotFound);
+    }
+
+    let raw = fs::read(path).map_err(|e| VaultLoadError::Io(e.to_string()))?;
+
+    let text = match String::from_utf8(raw) {
+        Ok(t) => t,
+        Err(_) => return Err(corrupt_error(path, "File is not valid UTF-8".to_string())),
+    };
+
+    let decoded = match base64.decode(text.trim()) {
+        Ok(d) => d,
+        Err(e) => return Err(corrupt_error(path, format!("Base64 decode error: {}", e))),
+    };
+
+    let json = match String::from_utf8(decoded) {
+        Ok(j) => j,
+        Err(_) => {
+            return Err(corrupt_error(
+                path,
+                "Decoded payload is not valid UTF-8".to_string(),
+            ))
+        }
+    };
+
+    serde_json::from_str::<VaultStore>(&json)
+        .map_err(|e| corrupt_error(path, format!("Failed to parse vault: {}", e)))
+}
+
+pub fn load_vault(app: &AppHandle) -> Result<VaultStore, VaultLoadError> {
+    load_vault_from_path(&get_storage_path(app))
+}
+
+/// Path-based bootstrap loader: creates a fresh vault if and only if the
+/// vault file does not exist. Corruption and IO faults are returned as-is —
+/// a damaged-but-quarantineable vault is never silently replaced.
+pub fn load_or_bootstrap_vault_at_path(path: &Path) -> Result<VaultStore, VaultLoadError> {
+    match load_vault_from_path(path) {
+        Ok(vault) => Ok(vault),
+        Err(VaultLoadError::NotFound) => create_vault_at_path(path).map_err(VaultLoadError::Io),
+        Err(other) => Err(other),
+    }
+}
+
+pub fn load_or_bootstrap_vault(app: &AppHandle) -> Result<VaultStore, VaultLoadError> {
+    load_or_bootstrap_vault_at_path(&get_storage_path(app))
+}
+
+/// Generic atomic write: stage to `<name>.tmp` in the same directory,
+/// fsync, then rename over the target. On any failure the staging file is
+/// removed and the existing file at `path` is left untouched. Shared by
+/// the vault and contact stores.
+pub(crate) fn atomic_write_bytes(path: &Path, payload: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+    }
+    if path.is_dir() {
+        return Err(format!("{} is a directory", path.display()));
+    }
+
+    let staging = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("vault.json")
+    ));
+
+    let outcome = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&staging)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        fs::rename(&staging, path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = outcome {
+        let _ = fs::remove_file(&staging);
+        return Err(format!("Failed to write {} atomically: {}", path.display(), e));
+    }
+
+    Ok(())
 }
 
 fn save_vault_inner(path: &Path, vault: &VaultStore) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create vault directory: {}", e))?;
-    }
-
     let json = serde_json::to_string(vault).map_err(|e| format!("Serialization error: {}", e))?;
     let encrypted = base64.encode(json);
-    fs::write(path, encrypted).map_err(|e| format!("Failed to write vault: {}", e))?;
-    Ok(())
+    atomic_write_bytes(path, encrypted.as_bytes())
 }
 
 pub fn save_vault(app: &AppHandle, vault: &VaultStore) -> Result<(), String> {
     save_vault_inner(&get_storage_path(app), vault)
 }
 
-pub fn get_profile_by_id<'a>(vault: &'a VaultStore, profile_id: &str) -> Option<&'a Profile> {
-    if profile_id.is_empty() {
-        vault.profiles.first()
-    } else {
-        vault.profiles.iter().find(|p| p.profile_id == profile_id)
-    }
-}
-
 pub fn get_profile_keypair(vault: &VaultStore, profile_id: &str) -> Result<DerivedKeypair, String> {
-    let profile = get_profile_by_id(vault, profile_id)
+    let profile = vault
+        .get_profile_by_id(profile_id)
         .ok_or_else(|| format!("Profile not found: '{}'", profile_id))?;
 
     let seed = bs58::decode(&vault.root_seed_base58)
@@ -215,13 +453,15 @@ pub fn add_profile(
         return Err(format!("Profile '{}' already exists", profile_id));
     }
 
-    let next_index = vault
+    // Derivation indices 0 and 1 are reserved for the Anchor and the public
+    // persona; user-created personas start at index 2.
+    let max_index = vault
         .profiles
         .iter()
         .map(|p| p.derivation_index)
         .max()
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(1);
+    let next_index = std::cmp::max(2, max_index + 1);
 
     let seed = bs58::decode(&vault.root_seed_base58)
         .into_vec()
@@ -237,6 +477,8 @@ pub fn add_profile(
         did: kp.did,
         credentials: vec![],
         nostr_pubkey_hex: nostr_pk,
+        level: 2,
+        is_system_reserved: false,
     };
 
     vault.profiles.push(profile.clone());
@@ -244,14 +486,17 @@ pub fn add_profile(
 }
 
 pub fn remove_profile(vault: &mut VaultStore, profile_id: &str) -> Result<(), String> {
-    if profile_id == "primary" {
-        return Err("Cannot remove primary profile".to_string());
-    }
     let pos = vault
         .profiles
         .iter()
         .position(|p| p.profile_id == profile_id)
         .ok_or_else(|| format!("Profile not found: '{}'", profile_id))?;
+
+    let target = &vault.profiles[pos];
+    if target.is_system_reserved || target.derivation_index == 0 || target.level == 0 {
+        return Err("Cannot delete system reserved profile".into());
+    }
+
     vault.profiles.remove(pos);
     Ok(())
 }
@@ -430,16 +675,273 @@ mod tests {
 
         let vault = create_vault_at_path(&path).expect("Should create vault");
 
-        assert_eq!(vault.profiles.len(), 1);
-        assert_eq!(vault.profiles[0].profile_id, "primary");
+        assert_eq!(vault.profiles.len(), 2);
+        assert_eq!(vault.profiles[0].profile_id, ANCHOR_PROFILE_ID);
+        assert_eq!(vault.profiles[1].profile_id, DEFAULT_PERSONA_PROFILE_ID);
         assert!(vault.profiles[0].did.starts_with("did:key:"));
+        assert!(vault.profiles[1].did.starts_with("did:key:"));
 
         let raw = fs::read_to_string(&path).expect("Should read file");
         assert!(!raw.contains(vault.profiles[0].did.as_str()));
+        assert!(!raw.contains(vault.profiles[1].did.as_str()));
 
         let loaded = load_vault_from_path(&path).expect("Should load vault");
-        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.profiles[0].did, vault.profiles[0].did);
+        assert_eq!(loaded.profiles[1].did, vault.profiles[1].did);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_dual_did_initial_provisioning() {
+        let mut path = temp_dir();
+        path.push("test_vault_dual_did.json");
+
+        let vault = create_vault_at_path(&path).expect("Should create vault");
+
+        assert_eq!(vault.profiles.len(), 2);
+
+        let anchor = &vault.profiles[0];
+        assert_eq!(anchor.profile_id, ANCHOR_PROFILE_ID);
+        assert_eq!(anchor.profile_name, "Anchor Identity");
+        assert_eq!(anchor.derivation_index, 0);
+        assert_eq!(anchor.level, 0);
+        assert!(anchor.is_system_reserved);
+        assert!(anchor.is_anchor());
+        assert!(anchor.did.starts_with("did:key:"));
+        assert_eq!(anchor.nostr_pubkey_hex.len(), 64);
+
+        let persona = &vault.profiles[1];
+        assert_eq!(persona.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(persona.profile_name, "Primary Identity");
+        assert_eq!(persona.derivation_index, 1);
+        assert_eq!(persona.level, 1);
+        assert!(!persona.is_system_reserved);
+        assert!(!persona.is_anchor());
+        assert!(persona.did.starts_with("did:key:"));
+        assert_eq!(persona.nostr_pubkey_hex.len(), 64);
+
+        // Anchor and persona must be cryptographically distinct identities.
+        assert_ne!(anchor.did, persona.did);
+        assert_ne!(anchor.nostr_pubkey_hex, persona.nostr_pubkey_hex);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_load_vault_not_found() {
+        let mut path = temp_dir();
+        path.push(format!("test_vault_missing_{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+
+        assert!(!path.exists());
+        let result = load_vault_from_path(&path);
+        assert!(
+            matches!(result, Err(VaultLoadError::NotFound)),
+            "Missing file must yield NotFound, got {:?}",
+            result
+        );
+        assert!(!path.exists(), "NotFound must not create a vault file");
+    }
+
+    #[test]
+    fn test_load_vault_corrupt_quarantines_file() {
+        let dir = temp_dir();
+
+        // Case 1: binary garbage (invalid UTF-8).
+        let path = dir.join("test_vault_corrupt_binary.json");
+        let garbage: &[u8] = &[0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF];
+        fs::write(&path, garbage).expect("Should write binary garbage");
+
+        let err = load_vault_from_path(&path)
+            .err()
+            .expect("Corrupt vault must fail");
+        let backup = match err {
+            VaultLoadError::Corrupt {
+                quarantined_to,
+                detail,
+            } => {
+                assert!(!detail.is_empty());
+                quarantined_to.expect("Corrupt file must be quarantined")
+            }
+            other => panic!("Expected Corrupt, got {:?}", other),
+        };
+        assert!(backup.to_string_lossy().contains(".corrupt_"));
+        assert!(backup.to_string_lossy().ends_with(".bak"));
+        assert_eq!(fs::read(&backup).expect("Backup must be readable"), garbage);
+        assert!(!path.exists(), "Original corrupt file must be renamed away");
+        let _ = fs::remove_file(&backup);
+
+        // Case 2: valid UTF-8 but invalid base64 payload.
+        let path = dir.join("test_vault_corrupt_text.json");
+        fs::write(&path, "definitely not base64 !!!").expect("Should write bad text");
+
+        let err = load_vault_from_path(&path)
+            .err()
+            .expect("Corrupt vault must fail");
+        match err {
+            VaultLoadError::Corrupt { quarantined_to, .. } => {
+                let backup = quarantined_to.expect("Corrupt file must be quarantined");
+                assert!(backup.exists());
+                assert!(!path.exists());
+                let _ = fs::remove_file(&backup);
+            }
+            other => panic!("Expected Corrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_quarantine_rotation_keeps_recent_backups() {
+        let dir = temp_dir();
+        let original_name = format!("test_vault_rotate_{}.json", std::process::id());
+        let path = dir.join(&original_name);
+
+        // Seed seven fake older backups with ascending timestamps.
+        for ts in 100..=106u64 {
+            fs::write(
+                dir.join(format!("{}.corrupt_{}.bak", original_name, ts)),
+                b"old",
+            )
+            .expect("Should seed backup");
+        }
+
+        // Quarantine a fresh corrupt file — real timestamp sorts newest.
+        fs::write(&path, b"\x00\xFFgarbage").expect("Should write garbage");
+        let err = load_vault_from_path(&path)
+            .err()
+            .expect("Corrupt vault must fail");
+        let fresh_backup = match err {
+            VaultLoadError::Corrupt { quarantined_to, .. } => {
+                quarantined_to.expect("Must quarantine")
+            }
+            other => panic!("Expected Corrupt, got {:?}", other),
+        };
+
+        let backups = existing_corrupt_backups(&dir, &original_name);
+        assert_eq!(
+            backups.len(),
+            CORRUPT_BACKUPS_TO_KEEP,
+            "Rotation must retain only the newest backups"
+        );
+        assert!(backups.contains(&fresh_backup));
+        // The three oldest seeded backups must have been pruned.
+        for ts in 100..=102u64 {
+            assert!(
+                !dir.join(format!("{}.corrupt_{}.bak", original_name, ts)).exists(),
+                "Old backup {} must be pruned",
+                ts
+            );
+        }
+        for ts in 103..=106u64 {
+            assert!(dir
+                .join(format!("{}.corrupt_{}.bak", original_name, ts))
+                .exists());
+        }
+
+        let _ = fs::remove_file(&fresh_backup);
+        for backup in backups {
+            let _ = fs::remove_file(backup);
+        }
+    }
+
+    #[test]
+    fn test_atomic_save_preserves_on_write_failure() {
+        let mut path = temp_dir();
+        path.push("test_vault_atomic.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        let original_persona_did = vault.profiles[1].did.clone();
+
+        // Occupy the staging path with a directory so File::create fails
+        // mid-save, simulating an interrupted/crashed write.
+        let staging = path.with_file_name(format!("{}.tmp", path.file_name().unwrap().to_string_lossy()));
+        fs::create_dir(&staging).expect("Should create staging blocker");
+
+        add_profile(&mut vault, "burner".to_string(), "Burner".to_string())
+            .expect("Should mutate in-memory state");
+        let result = save_vault_inner(&path, &vault);
+        assert!(result.is_err(), "Save must fail when staging is blocked");
+
+        // The on-disk vault must be untouched and still fully loadable.
+        let loaded = load_vault_from_path(&path).expect("Original vault must survive");
+        assert_eq!(loaded.profiles.len(), 2, "Partial write must not land");
+        assert_eq!(loaded.profiles[1].did, original_persona_did);
+
+        let _ = fs::remove_dir(&staging);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_bootstrap_only_on_not_found() {
+        let dir = temp_dir();
+        let original_name = format!("test_vault_bootstrap_{}.json", std::process::id());
+        let path = dir.join(&original_name);
+        let _ = fs::remove_file(&path);
+
+        // Missing → bootstraps the dual-DID hierarchy.
+        assert!(!path.exists());
+        let vault = load_or_bootstrap_vault_at_path(&path).expect("Should bootstrap");
+        assert_eq!(vault.profiles.len(), 2);
+        assert!(path.exists());
+
+        // Corrupt → error + quarantine. Never regenerated, never overwritten.
+        fs::write(&path, b"\x00\xFFcorrupted").expect("Should corrupt vault");
+        let result = load_or_bootstrap_vault_at_path(&path);
+        assert!(
+            matches!(result, Err(VaultLoadError::Corrupt { .. })),
+            "Corruption must surface as Corrupt, got {:?}",
+            result
+        );
+        assert!(
+            !path.exists(),
+            "Quarantined vault must not be replaced by a fresh one"
+        );
+
+        for backup in existing_corrupt_backups(&dir, &original_name) {
+            let _ = fs::remove_file(backup);
+        }
+    }
+
+    #[test]
+    fn test_anchor_deletion_blocked() {
+        let mut path = temp_dir();
+        path.push("test_vault_anchor_guard.json");
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let result = remove_profile(&mut vault, ANCHOR_PROFILE_ID);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("system reserved"),
+            "Anchor deletion must be rejected as system-reserved"
+        );
+        assert_eq!(vault.profiles.len(), 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_default_resolution_targets_persona() {
+        let mut path = temp_dir();
+        path.push("test_vault_persona_resolution.json");
+
+        let vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let persona = vault.public_persona().expect("Should resolve persona");
+        assert_eq!(persona.derivation_index, 1);
+        assert_eq!(persona.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+
+        let by_empty = vault
+            .get_profile_by_id("")
+            .expect("Empty id should resolve to persona");
+        assert_eq!(by_empty.derivation_index, 1);
+        assert!(!by_empty.is_anchor());
+
+        let kp = get_profile_keypair(&vault, "").expect("Should derive from default");
+        assert_eq!(kp.did, vault.profiles[1].did);
+        assert_ne!(kp.did, vault.profiles[0].did);
 
         let _ = fs::remove_file(path);
     }
@@ -457,14 +959,35 @@ mod tests {
             "Social Pseudonym".to_string(),
         )
         .expect("Should add profile");
-        assert_eq!(p.derivation_index, 1);
+        assert_eq!(p.derivation_index, 2);
+        assert_eq!(p.level, 2);
+        assert!(!p.is_system_reserved);
         assert!(p.did.starts_with("did:key:"));
         assert_ne!(p.did, vault.profiles[0].did);
+        assert_ne!(p.did, vault.profiles[1].did);
 
-        assert_eq!(vault.profiles.len(), 2);
+        assert_eq!(vault.profiles.len(), 3);
 
         remove_profile(&mut vault, "pseudo_1").expect("Should remove");
-        assert_eq!(vault.profiles.len(), 1);
+        assert_eq!(vault.profiles.len(), 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_add_profile_index_floor() {
+        let mut path = temp_dir();
+        path.push("test_vault_index_floor.json");
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let p1 = add_profile(&mut vault, "burner_a".to_string(), "Burner A".to_string())
+            .expect("Should add first burner");
+        assert_eq!(p1.derivation_index, 2);
+
+        let p2 = add_profile(&mut vault, "burner_b".to_string(), "Burner B".to_string())
+            .expect("Should add second burner");
+        assert_eq!(p2.derivation_index, 3);
 
         let _ = fs::remove_file(path);
     }
@@ -476,13 +999,22 @@ mod tests {
 
         let vault = create_vault_at_path(&path).expect("Should create vault");
 
-        let p = get_profile_by_id(&vault, "").expect("Should return first");
-        assert_eq!(p.profile_id, "primary");
+        // Empty id resolves to the public persona (Level 1), not the anchor.
+        let p = vault.get_profile_by_id("").expect("Should return persona");
+        assert_eq!(p.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(p.derivation_index, 1);
 
-        let p2 = get_profile_by_id(&vault, "primary").expect("Should find by id");
-        assert_eq!(p2.profile_id, "primary");
+        let p2 = vault
+            .get_profile_by_id(DEFAULT_PERSONA_PROFILE_ID)
+            .expect("Should find by id");
+        assert_eq!(p2.profile_id, DEFAULT_PERSONA_PROFILE_ID);
 
-        assert!(get_profile_by_id(&vault, "nonexistent").is_none());
+        let anchor = vault
+            .get_profile_by_id(ANCHOR_PROFILE_ID)
+            .expect("Should find anchor");
+        assert_eq!(anchor.derivation_index, 0);
+
+        assert!(vault.get_profile_by_id("nonexistent").is_none());
 
         let _ = fs::remove_file(path);
     }
@@ -493,11 +1025,17 @@ mod tests {
         path.push("test_vault_keypair.json");
 
         let vault = create_vault_at_path(&path).expect("Should create vault");
-        let kp = get_profile_keypair(&vault, "primary").expect("Should derive keypair");
-        assert_eq!(kp.did, vault.profiles[0].did);
+        let kp = get_profile_keypair(&vault, DEFAULT_PERSONA_PROFILE_ID)
+            .expect("Should derive keypair");
+        assert_eq!(kp.did, vault.profiles[1].did);
 
         let kp2 = get_profile_keypair(&vault, "").expect("Should derive from default");
-        assert_eq!(kp2.did, vault.profiles[0].did);
+        assert_eq!(kp2.did, vault.profiles[1].did);
+
+        let anchor_kp = get_profile_keypair(&vault, ANCHOR_PROFILE_ID)
+            .expect("Should derive anchor keypair");
+        assert_eq!(anchor_kp.did, vault.profiles[0].did);
+        assert_ne!(anchor_kp.did, kp.did);
 
         let _ = fs::remove_file(path);
     }
@@ -602,7 +1140,7 @@ mod tests {
         assert_eq!(c2.credential_type, "Membership");
 
         // Verify alt profile has empty credentials
-        assert!(loaded.profiles[1].credentials.is_empty());
+        assert!(loaded.profiles[2].credentials.is_empty());
 
         // --- Upsert: replace existing vc-001 with updated payload ---
         let cred1_updated = VaultCredential {
@@ -657,11 +1195,11 @@ mod tests {
         assert_eq!(final_loaded.profiles[0].credentials[2].vc_id, "vc-003");
 
         // --- Zero regression: key derivation still works ---
-        let kp = get_profile_keypair(&final_loaded, "primary")
+        let kp = get_profile_keypair(&final_loaded, DEFAULT_PERSONA_PROFILE_ID)
             .expect("Key derivation should still work");
-        assert_eq!(kp.did, final_loaded.profiles[0].did);
+        assert_eq!(kp.did, final_loaded.profiles[1].did);
         let kp2 = get_profile_keypair(&final_loaded, "")
-            .expect("Empty profile_id should default to first");
+            .expect("Empty profile_id should default to public persona");
         assert_eq!(kp2.did, kp.did);
 
         let _ = std::fs::remove_file(&path);
@@ -688,6 +1226,14 @@ mod tests {
             profile0.get("credentials").is_some(),
             "New serialization must include credentials field"
         );
+        assert!(
+            profile0.get("level").is_some() && profile0.get("is_system_reserved").is_some(),
+            "New serialization must include hierarchy fields"
+        );
+        assert_eq!(profile0["level"], 0);
+        assert_eq!(profile0["is_system_reserved"], true);
+        assert_eq!(legacy["profiles"][1]["level"], 1);
+        assert_eq!(legacy["profiles"][1]["is_system_reserved"], false);
 
         let _ = std::fs::remove_file(&path);
     }

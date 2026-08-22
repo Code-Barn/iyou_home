@@ -17,13 +17,8 @@
 
 import { useState, useEffect } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
-
-interface Profile {
-  profile_id: string;
-  profile_name: string;
-  derivation_index: number;
-  did: string;
-}
+import { Profile } from "../lib/types";
+import { isAnchor } from "../lib/enclaveFilters";
 
 type SignRequest =
   | { type: "sign"; challenge: string; profile_id?: string }
@@ -35,7 +30,7 @@ type SignRequest =
       profile_id?: string;
     }
   | {
-      type: "POLLY_CREDENTIAL_REQUEST";
+      type: "POLY_CREDENTIAL_REQUEST";
       required_credential_type: string;
       challenge: string;
       profile_id?: string;
@@ -82,9 +77,9 @@ export default function WsSignPopup() {
             holder_did: parsed.holder_did,
             profile_id,
           });
-        } else if (parsed.__type__ === "POLLY_CREDENTIAL_REQUEST") {
+        } else if (parsed.__type__ === "POLY_CREDENTIAL_REQUEST") {
           setRequest({
-            type: "POLLY_CREDENTIAL_REQUEST",
+            type: "POLY_CREDENTIAL_REQUEST",
             required_credential_type: parsed.required_credential_type,
             challenge: parsed.challenge,
             profile_id,
@@ -112,14 +107,19 @@ export default function WsSignPopup() {
         invoke<string | null>("get_active_did"),
       ]);
 
-      setProfiles(profilesList);
+      const signable = (profilesList || []).filter((p) => !isAnchor(p));
+      setProfiles(signable);
 
-      // Find the active profile
+      // Find the active profile among signable profiles
       if (activeDid) {
-        const activeProfile = profilesList.find((p) => p.did === activeDid);
+        const activeProfile = signable.find((p) => p.did === activeDid);
         if (activeProfile) {
           setActiveProfileId(activeProfile.profile_id);
+        } else if (signable.length > 0) {
+          setActiveProfileId(signable[0].profile_id);
         }
+      } else if (signable.length > 0) {
+        setActiveProfileId(signable[0].profile_id);
       }
     } catch (err) {
       console.error("Failed to load profiles:", err);
@@ -128,10 +128,17 @@ export default function WsSignPopup() {
 
   useEffect(() => {
     if (autoSign && request && !isProcessing) {
+      const targetProfile = profiles.find(
+        (p) => p.profile_id === (request.profile_id || activeProfileId),
+      );
+      if (targetProfile && isAnchor(targetProfile)) {
+        console.warn("REACT: Auto-sign blocked for Anchor Level 0 identity");
+        return;
+      }
       console.log("REACT: Auto-sign enabled, approving immediately");
       handleResponse(true);
     }
-  }, [autoSign, request]);
+  }, [autoSign, request, profiles, activeProfileId, isProcessing]);
 
   const handleResponse = async (approved: boolean) => {
     if (!request) return;
@@ -155,7 +162,7 @@ export default function WsSignPopup() {
           profileId: request.profile_id || null,
         });
         console.log("REACT: submit_ws_credential_response succeeded");
-      } else if (request.type === "POLLY_CREDENTIAL_REQUEST") {
+      } else if (request.type === "POLY_CREDENTIAL_REQUEST") {
         await invoke("submit_ws_credential_presentation", {
           credentialType: request.required_credential_type,
           challenge: request.challenge,
@@ -221,7 +228,7 @@ export default function WsSignPopup() {
             ? "Nostr Event Signing Request"
             : request.type === "sign_credential"
               ? `${getCredentialTitle(request.credential)} Signing Request`
-              : request.type === "POLLY_CREDENTIAL_REQUEST"
+              : request.type === "POLY_CREDENTIAL_REQUEST"
                 ? "Credential Sharing Request"
                 : "Signature Request"}
         </h2>
@@ -339,7 +346,7 @@ export default function WsSignPopup() {
           </>
         )}
 
-        {request.type === "POLLY_CREDENTIAL_REQUEST" && (
+        {request.type === "POLY_CREDENTIAL_REQUEST" && (
           <>
             <p>
               A local application is requesting proof of{" "}
@@ -426,7 +433,7 @@ export default function WsSignPopup() {
             >
               {isProcessing
                 ? "Signing..."
-                : request.type === "POLLY_CREDENTIAL_REQUEST"
+                : request.type === "POLY_CREDENTIAL_REQUEST"
                   ? "Share Asset"
                   : "Approve & Sign"}
             </button>

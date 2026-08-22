@@ -22,6 +22,7 @@ import KeysManager from "./components/KeysManager";
 import SovereignSigner from "./components/SovereignSigner";
 import TrustAssets from "./components/TrustAssets";
 import WsSignPopup from "./components/WsSignPopup";
+import ProjectZero from "./components/enclave/ProjectZero";
 import "./App.css";
 
 type ServiceStatus = "running" | "stopped" | "starting";
@@ -165,9 +166,9 @@ function ServiceSwitchPanel() {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState<"services" | "keys" | "signer" | "assets" | "archive">(
-    "services",
-  );
+  const [activeTab, setActiveTab] = useState<
+    "services" | "keys" | "signer" | "assets" | "archive" | "enclave"
+  >("services");
 
   return (
     <>
@@ -201,6 +202,12 @@ function App() {
             Assets
           </button>
           <button
+            className={activeTab === "enclave" ? "active" : ""}
+            onClick={() => setActiveTab("enclave")}
+          >
+            Project Zero 🛡️
+          </button>
+          <button
             className={activeTab === "archive" ? "active" : ""}
             onClick={() => setActiveTab("archive")}
           >
@@ -213,6 +220,7 @@ function App() {
           {activeTab === "keys" && <KeysManager />}
           {activeTab === "signer" && <SovereignSigner />}
           {activeTab === "assets" && <TrustAssets />}
+          {activeTab === "enclave" && <ProjectZero />}
           {activeTab === "archive" && <IpfsArchiveViewer />}
         </div>
       </main>

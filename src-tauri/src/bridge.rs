@@ -33,6 +33,9 @@ use crate::certs::{load_production_certs, ReadBuffered};
 
 use crate::WsState;
 
+/// Upper bound on keys per RESOLVE_PEER_ALIASES frame (harvesting guard).
+const MAX_RESOLVE_KEYS: usize = 256;
+
 fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
     let state = app.state::<WsState>();
     let serialized = msg_json.to_string();
@@ -50,6 +53,30 @@ fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
     } else {
         state.pending_messages.lock().unwrap().push(serialized);
         println!("!!! CHALLENGE QUEUED — React pipe not registered yet !!!");
+    }
+}
+
+/// Fail-closed access evaluation for external bridge frames. Returns the
+/// denial reason when the request must not proceed. A vault that cannot be
+/// loaded blocks ALL signing traffic — never fail open.
+fn bridge_access_denial_reason(app: &AppHandle, profile_id: &str) -> Option<String> {
+    let vault = match crate::vault::load_vault(app) {
+        Ok(v) => v,
+        Err(_) => {
+            return Some("Access denied: Vault unavailable or uninitialized".to_string());
+        }
+    };
+
+    // Empty/omitted profile_id resolves to the public persona downstream.
+    if profile_id.is_empty() {
+        return None;
+    }
+
+    match vault.get_profile_by_id(profile_id) {
+        Some(p) if p.is_anchor() || p.is_system_reserved => Some(
+            "Access denied: Level 0 identity is air-gapped from external signing".to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -167,14 +194,17 @@ where
                     println!("DEBUG: get_profile request received");
                     match crate::vault::load_vault(&app_handle) {
                         Ok(vault) => {
-                            let response = match vault.profiles.first() {
+                            // Un-scoped sync only ever exposes the public
+                            // persona (Level 1). The Level 0 anchor is
+                            // air-gapped from external bridge callers.
+                            let response = match vault.public_persona() {
                                 Some(profile) => serde_json::json!({
                                     "type": "profile_sync",
                                     "profile": profile
                                 }),
                                 None => serde_json::json!({
                                     "type": "error",
-                                    "message": "No profile found in vault"
+                                    "message": "No public persona found in vault"
                                 }),
                             };
                             let _ = response_tx.send(Message::Text(response.to_string().into()));
@@ -190,6 +220,53 @@ where
                         }
                     }
                     continue;
+                } else if json["type"] == "RESOLVE_PEER_ALIASES" {
+                    println!("DEBUG: RESOLVE_PEER_ALIASES request received");
+                    // Privacy safeguards: exact-match resolution only. The
+                    // bridge never enumerates the contact book, responses
+                    // carry solely nickname/badge for exact key hits, and
+                    // query caps blunt brute-force harvesting.
+                    match json.get("pubkeys").and_then(|v| v.as_array()) {
+                        Some(keys) if !keys.is_empty() && keys.len() <= MAX_RESOLVE_KEYS => {
+                            let queries: Vec<String> = keys
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .map(String::from)
+                                .collect();
+                            match crate::contacts::load_contact_store(&app_handle) {
+                                Ok(store) => {
+                                    let response =
+                                        crate::contacts::resolution_json(&store, &queries);
+                                    let _ = response_tx
+                                        .send(Message::Text(response.to_string().into()));
+                                }
+                                Err(e) => {
+                                    eprintln!("DEBUG: contact store failed to load: {}", e);
+                                    let _ = response_tx.send(Message::Text(
+                                        serde_json::json!({
+                                            "type": "error",
+                                            "message": format!("Failed to load contacts: {}", e)
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            // Oversized frame: reject outright (harvesting guard).
+                            let _ = response_tx.send(Message::Text(
+                                "{\"type\":\"error\",\"message\":\"too_many_pubkeys\"}".into(),
+                            ));
+                        }
+                        None => {
+                            let _ = response_tx.send(Message::Text(
+                                "{\"type\":\"error\",\"message\":\"missing_or_invalid_pubkeys\"}"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    continue;
                 }
 
                 let profile_id = json
@@ -197,6 +274,22 @@ where
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+
+                // Enclave air-gap, fail-closed: external frames may never
+                // target the Level 0 anchor, and an unloadable vault blocks
+                // all signing traffic.
+                if let Some(reason) = bridge_access_denial_reason(&app_handle, &profile_id) {
+                    println!("DEBUG: Rejected bridge request: {}", reason);
+                    let _ = response_tx.send(Message::Text(
+                        serde_json::json!({
+                            "type": "error",
+                            "message": reason
+                        })
+                        .to_string()
+                        .into(),
+                    ));
+                    continue;
+                }
 
                 let is_sign = json["action"] == "sign" || json["type"] == "sign";
                 if is_sign && json["challenge"].is_string() {
@@ -257,15 +350,15 @@ where
                         let holder_did = if json["holder_did"].is_string() {
                             json["holder_did"].as_str().unwrap().to_string()
                         } else {
-                            let default_did = crate::vault::load_vault(&app_handle)
-                                .ok()
-                                .and_then(|v| v.profiles.first().cloned())
-                                .map(|p| p.did)
-                                .unwrap_or_else(|| "did:vault:unknown".to_string());
-                            println!(
-                                "DEBUG: No holder_did in message, defaulting to vault DID: {}",
-                                default_did
-                            );
+                        let default_did = crate::vault::load_vault(&app_handle)
+                            .ok()
+                            .and_then(|v| v.public_persona().cloned())
+                            .map(|p| p.did)
+                            .unwrap_or_else(|| "did:vault:unknown".to_string());
+                        println!(
+                            "DEBUG: No holder_did in message, defaulting to public persona DID: {}",
+                            default_did
+                        );
                             default_did
                         };
                         println!("Triggering Credential signing for holder: {}", holder_did);
@@ -297,7 +390,9 @@ where
                             text
                         );
                     }
-                } else if json["type"] == "POLLY_CREDENTIAL_REQUEST" {
+                } else if json["type"] == "POLY_CREDENTIAL_REQUEST"
+                    || json["type"] == "POLLY_CREDENTIAL_REQUEST"
+                {
                     let required_type = json["required_credential_type"]
                         .as_str()
                         .unwrap_or("")
@@ -307,7 +402,7 @@ where
                         .unwrap_or("")
                         .to_string();
                     if required_type.is_empty() || challenge.is_empty() {
-                        println!("DEBUG: POLLY_CREDENTIAL_REQUEST missing required_credential_type or challenge");
+                        println!("DEBUG: POLY_CREDENTIAL_REQUEST missing required_credential_type or challenge");
                         let _ = response_tx.send(Message::Text(
                             "{\"status\":\"error\",\"reason\":\"missing_required_fields\"}".into(),
                         ));
@@ -327,7 +422,7 @@ where
                         pipe_or_queue(
                             &app,
                             serde_json::json!({
-                                "__type__": "POLLY_CREDENTIAL_REQUEST",
+                                "__type__": "POLY_CREDENTIAL_REQUEST",
                                 "required_credential_type": required_type,
                                 "challenge": challenge,
                                 "profile_id": profile_id
@@ -416,7 +511,9 @@ async fn handle_omni_sign_request(
     response_tx: &mpsc::UnboundedSender<Message>,
 ) {
     let protocol = json["protocol"].as_str().unwrap_or("");
-    if protocol != "POLLY_V2" {
+    // Accept both canonical POLY_V2 and legacy POLLY_V2 spellings; the
+    // response always echoes the protocol the caller used.
+    if protocol != "POLY_V2" && protocol != "POLLY_V2" {
         println!("OMNI_SIGN_REQUEST rejected: unknown protocol '{}'", protocol);
         let _ = response_tx.send(Message::Text(
             "{\"status\":\"error\",\"reason\":\"unsupported_protocol\"}".into(),
@@ -439,6 +536,7 @@ async fn handle_omni_sign_request(
         .get("profile_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let protocol_out = protocol.to_string();
 
     let app = app_handle.clone();
     let tx = response_tx.clone();
@@ -447,7 +545,7 @@ async fn handle_omni_sign_request(
             Ok(envelope) => {
                 let response = serde_json::json!({
                     "type": "OMNI_SIGN_RESPONSE",
-                    "protocol": "POLLY_V2",
+                    "protocol": protocol_out,
                     "envelope": envelope,
                 });
                 println!("OMNI_SIGN_REQUEST signed successfully");

@@ -17,13 +17,8 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-
-interface Profile {
-  profile_id: string;
-  profile_name: string;
-  derivation_index: number;
-  did: string;
-}
+import { Profile } from "../lib/types";
+import { isExternallySignable } from "../lib/enclaveFilters";
 
 interface UserPreferences {
   active_profile_id: string;
@@ -83,7 +78,7 @@ export default function KeysManager() {
   const fetchProfiles = async () => {
     try {
       const list = await invoke<Profile[]>("list_profiles");
-      setProfiles(list);
+      setProfiles(list || []);
     } catch (err: any) {
       console.error("Failed to list profiles:", err);
     }
@@ -211,12 +206,16 @@ export default function KeysManager() {
       </div>
 
       <div className="section">
-        <h3>Personas ({profiles.length})</h3>
-        {profiles.length === 0 ? (
-          <p className="muted">No personas configured.</p>
-        ) : (
-          <div className="profile-list">
-            {profiles.map((p) => (
+        {(() => {
+          const signableProfiles = profiles.filter(isExternallySignable);
+          return (
+            <>
+              <h3>Personas ({signableProfiles.length})</h3>
+              {signableProfiles.length === 0 ? (
+                <p className="muted">No personas configured.</p>
+              ) : (
+                <div className="profile-list">
+                  {signableProfiles.map((p) => (
               <div
                 key={p.profile_id}
                 className={`profile-item ${
@@ -314,7 +313,10 @@ export default function KeysManager() {
             ))}
           </div>
         )}
-      </div>
+      </>
+    );
+  })()}
+</div>
 
       <div className="section actions">
         <h3>Generate New Vault</h3>
