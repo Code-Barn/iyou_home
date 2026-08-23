@@ -58,3 +58,14 @@ src/
 ## Getting Started
 
 See [HOME_DEVELOPER_GUIDE.md](./HOME_DEVELOPER_GUIDE.md) for setup instructions, architecture details, and known risks.
+
+## did_rust Parity (SEC-003)
+
+`libs/did_rust` is a git submodule of the shared crypto library. Its pin must always match what `iyou_idp` and `iyou_mobile` consume, otherwise signature verification and handshake behavior diverge between services.
+
+```bash
+git submodule update --remote --merge libs/did_rust    # sync to did_rust main
+bash ../did_rust/scripts/check_did_submodules.sh       # verify parity (exit 0)
+```
+
+Invariants and troubleshooting: `../did_rust/docs/strategy/SECURITY_HARDENING.md`.
