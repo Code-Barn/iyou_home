@@ -187,7 +187,7 @@ function App() {
             className={activeTab === "keys" ? "active" : ""}
             onClick={() => setActiveTab("keys")}
           >
-            Keys (Vault)
+            Backup &amp; Recovery
           </button>
           <button
             className={activeTab === "signer" ? "active" : ""}

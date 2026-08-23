@@ -249,7 +249,18 @@ async fn start_service_internal(
                 .path()
                 .app_local_data_dir()
                 .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-            let vault = vault::load_vault(app)?;
+            // Self-healing loader: provisions the missing Level 1 persona on
+            // legacy single-profile vaults before relay identity resolution.
+            let vault = match vault::load_or_bootstrap_vault(app) {
+                Ok(v) => v,
+                // Fresh install: defer identity creation to onboarding
+                // (generate_did) instead of failing auto-start.
+                Err(vault::VaultLoadError::NotFound) => {
+                    eprintln!("Nostr relay deferred: vault not yet provisioned (onboarding pending)");
+                    return Ok(());
+                }
+                Err(e) => return Err(e.to_string()),
+            };
             let kp = vault::get_profile_keypair(&vault, "")?;
             let pubkey = nostr_relay::derive_vault_pubkey_from_verifying(&kp.verifying_key)?;
             let db_path = app_data.join("nostr_events.db");

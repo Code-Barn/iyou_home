@@ -368,12 +368,57 @@ pub fn load_vault(app: &AppHandle) -> Result<VaultStore, VaultLoadError> {
     load_vault_from_path(&get_storage_path(app))
 }
 
+/// Self-healing migration for legacy vaults that predate the dual-bootstrap
+/// era (e.g. anchor-only Index-0 dev vaults): deterministically provisions
+/// the missing Level 1 Public Persona at Index 1.
+///
+/// Safe because every key derives purely from `root_seed || LE(index)` —
+/// the healed persona is byte-identical to the one `initial_profiles`
+/// would have minted, so there is zero key rotation. Idempotent: the
+/// `profile_id`/index guard prevents duplicate insertion on re-runs.
+/// Returns `Ok(true)` when the vault was mutated and needs persisting.
+pub fn heal_reserved_profiles(vault: &mut VaultStore) -> Result<bool, String> {
+    let seed = decode_root_seed(vault)?;
+    let mut changed = false;
+
+    // Match on id OR index — serde-defaulted `level` on unmigrated rows
+    // makes a bare `level >= 1` predicate unreliable.
+    let has_persona = vault.profiles.iter().any(|p| {
+        p.profile_id == DEFAULT_PERSONA_PROFILE_ID || p.derivation_index == 1
+    });
+    if !has_persona {
+        let kp = derive_deterministic_keypair(&seed, 1);
+        vault.profiles.push(Profile {
+            profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
+            profile_name: "Primary Identity".to_string(),
+            derivation_index: 1,
+            did: kp.did,
+            credentials: vec![],
+            nostr_pubkey_hex: derive_secp256k1_pubkey_hex(&seed, 1),
+            level: 1,
+            is_system_reserved: false,
+        });
+        changed = true;
+    }
+
+    if changed {
+        vault.profiles.sort_by_key(|p| p.derivation_index);
+    }
+    Ok(changed)
+}
+
 /// Path-based bootstrap loader: creates a fresh vault if and only if the
-/// vault file does not exist. Corruption and IO faults are returned as-is —
-/// a damaged-but-quarantineable vault is never silently replaced.
+/// vault file does not exist, and self-heals partially-provisioned legacy
+/// vaults (persisting atomically). Corruption and IO faults are returned
+/// as-is — a damaged-but-quarantineable vault is never silently replaced.
 pub fn load_or_bootstrap_vault_at_path(path: &Path) -> Result<VaultStore, VaultLoadError> {
     match load_vault_from_path(path) {
-        Ok(vault) => Ok(vault),
+        Ok(mut vault) => {
+            if heal_reserved_profiles(&mut vault).map_err(VaultLoadError::Io)? {
+                save_vault_inner(path, &vault).map_err(VaultLoadError::Io)?;
+            }
+            Ok(vault)
+        }
         Err(VaultLoadError::NotFound) => create_vault_at_path(path).map_err(VaultLoadError::Io),
         Err(other) => Err(other),
     }
@@ -902,6 +947,109 @@ mod tests {
         for backup in existing_corrupt_backups(&dir, &original_name) {
             let _ = fs::remove_file(backup);
         }
+    }
+
+    // ---------- Self-Healing Migration Tests ----------
+
+    /// Rewind a freshly minted vault to an anchor-only (Index 0) snapshot,
+    /// simulating a pre-dual-bootstrap legacy dev vault on disk.
+    fn write_legacy_anchor_only_vault(path: &Path) -> (VaultStore, Vec<u8>) {
+        let full = create_vault_at_path(path).expect("Should create full vault");
+        let legacy = VaultStore {
+            root_seed_base58: full.root_seed_base58.clone(),
+            profiles: vec![full.profiles[0].clone()],
+        };
+        save_vault_inner(path, &legacy).expect("Should persist legacy vault");
+        let seed = bs58::decode(&legacy.root_seed_base58)
+            .into_vec()
+            .expect("Seed should decode");
+        (legacy, seed)
+    }
+
+    #[test]
+    fn test_legacy_single_profile_vault_self_heals() {
+        let mut path = temp_dir();
+        path.push("test_vault_heal_legacy.json");
+        let _ = fs::remove_file(&path);
+
+        let (legacy, seed) = write_legacy_anchor_only_vault(&path);
+        assert_eq!(legacy.profiles.len(), 1);
+        let anchor_did = legacy.profiles[0].did.clone();
+
+        // Load through the bootstrapping loader: must heal and persist.
+        let healed = load_or_bootstrap_vault_at_path(&path).expect("Should heal legacy vault");
+        assert_eq!(healed.profiles.len(), 2, "Missing Level 1 persona must be provisioned");
+
+        // The anchor is untouched.
+        assert_eq!(healed.profiles[0].profile_id, ANCHOR_PROFILE_ID);
+        assert_eq!(healed.profiles[0].did, anchor_did, "Anchor identity must not rotate");
+        assert_eq!(healed.profiles[0].derivation_index, 0);
+
+        // The healed persona sits at Index 1 with the deterministic identity
+        // initial_profiles would have created — zero key rotation.
+        let persona = &healed.profiles[1];
+        let expected_kp = derive_deterministic_keypair(&seed, 1);
+        assert_eq!(persona.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(persona.profile_name, "Primary Identity");
+        assert_eq!(persona.derivation_index, 1);
+        assert_eq!(persona.level, 1);
+        assert!(!persona.is_system_reserved);
+        assert_eq!(persona.did, expected_kp.did);
+        assert_eq!(persona.nostr_pubkey_hex, derive_secp256k1_pubkey_hex(&seed, 1));
+
+        // Healing must survive a cold reload: state was persisted to disk.
+        let reloaded = load_vault_from_path(&path).expect("Healed vault must round-trip");
+        assert_eq!(reloaded.profiles.len(), 2);
+        assert_eq!(reloaded.profiles[1].did, expected_kp.did);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_heal_is_idempotent() {
+        let mut path = temp_dir();
+        path.push("test_vault_heal_idempotent.json");
+        let _ = fs::remove_file(&path);
+
+        let (_legacy, seed) = write_legacy_anchor_only_vault(&path);
+
+        let first = load_or_bootstrap_vault_at_path(&path).expect("First load should heal");
+        let second = load_or_bootstrap_vault_at_path(&path).expect("Second load must not duplicate");
+
+        assert_eq!(first.profiles.len(), 2);
+        assert_eq!(second.profiles.len(), 2);
+        assert_eq!(
+            first.profiles[1].did,
+            derive_deterministic_keypair(&seed, 1).did
+        );
+        assert_eq!(first.profiles[1].did, second.profiles[1].did);
+
+        // A healed vault reports no further mutations needed.
+        let mut already_healed = second.clone();
+        assert!(!heal_reserved_profiles(&mut already_healed).unwrap());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_get_profile_keypair_empty_id_after_heal() {
+        let mut path = temp_dir();
+        path.push("test_vault_heal_empty_id.json");
+        let _ = fs::remove_file(&path);
+
+        let (_legacy, seed) = write_legacy_anchor_only_vault(&path);
+
+        // Regression guard for: Auto-start Nostr failed: Profile not found: ''
+        let healed = load_or_bootstrap_vault_at_path(&path).expect("Should heal");
+        let kp = get_profile_keypair(&healed, "").expect("Empty id must resolve post-heal");
+        assert_eq!(kp.did, derive_deterministic_keypair(&seed, 1).did);
+        assert_ne!(kp.did, healed.profiles[0].did, "Must never fall back to the anchor");
+
+        // Public persona resolution agrees with the empty-id keypair path.
+        let persona = healed.public_persona().expect("Persona should resolve");
+        assert_eq!(persona.did, kp.did);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
