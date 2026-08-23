@@ -72,7 +72,7 @@ The application runs a local **WSS** (WebSocket over TLS) server on port 9001 th
 
 The Signature Bridge is **always on** (not togglable) and is the sole cross-origin entry point for browser-based identity providers (WUN, Polly, etc.).
 
-**TLS termination.** Modern browsers block `ws://` connections from HTTPS origins (mixed-content security policy). The bridge terminates TLS natively via `tokio_rustls`, accepting connections at `wss://home.iyou.me:9001/`. The server uses a globally-trusted Let's Encrypt certificate issued for `home.iyou.me` (which resolves natively to `127.0.0.1`). The certificate chain and RSA private key are bundled as PEM files at `src-tauri/certs/production.crt` and `src-tauri/certs/production.key`, loaded at compile time via `env!("CARGO_MANIFEST_DIR")`. Because the cert is issued by a public CA, browsers connect without any security warning — no manual trust configuration is needed.
+**TLS termination.** Modern browsers block `ws://` connections from HTTPS origins (mixed-content security policy). The bridge terminates TLS natively via `tokio_rustls`, accepting connections at `wss://home.iyou.me:9001/`. TLS assets are resolved **strictly at runtime** (SEC-002): domain certificates are loaded from `{app_data_dir}/certs/` when present; otherwise an ephemeral self-signed local authority is generated in-memory for this session. No private keys are bundled with or embedded in the distributed binary.
 
 The bridge also exposes a **Credential Presentation Handshake** (`POLY_CREDENTIAL_REQUEST`) — see the dedicated section below.
 
@@ -86,22 +86,32 @@ Safari, Chrome, and Brave all require a PNA pre-flight (OPTIONS) before a public
 4. If the buffer contains a `GET` + WebSocket upgrade headers — a `ReadBuffered<TlsStream<TcpStream>>` wrapper replays the already-read bytes into `accept_hdr_async`, whose callback injects the same PNA headers into the 101 Switching Protocols response.
 5. All other connections are silently dropped.
 
-#### TLS Certificate Lifecycle
+#### TLS Certificate Lifecycle (SEC-002)
 
-The bridge loads a globally-trusted Let's Encrypt certificate chain issued for `home.iyou.me`. The certs are bundled in the repository and resolved at compile time:
+The binary ships with **zero private key material**. TLS identities are resolved at runtime by `resolve_tls_assets()` in `src-tauri/src/certs.rs`, shared by both the Signature Bridge and the XMPP server:
 
-| File | Format | Source |
+**1. Runtime domain certificates (optional, operator-provisioned):**
+
+| File | Format | Location |
 |---|---|---|
-| `src-tauri/certs/production.crt` | PEM (X.509 chain) | Let's Encrypt — leaf cert for `home.iyou.me` + intermediate + ISRG Root X1 |
-| `src-tauri/certs/production.key` | PEM (PKCS#8 RSA) | Corresponding RSA private key, extracted from K3s cert-manager |
+| `production.crt` | PEM (X.509 chain) | `{app_data_dir}/certs/production.crt` |
+| `production.key` | PEM (PKCS#8) | `{app_data_dir}/certs/production.key` |
 
-**Loading** (`load_production_certs` in `src-tauri/src/certs.rs`, shared by both bridge and XMPP):
-1. Resolve the paths via `env!("CARGO_MANIFEST_DIR")` (compile-time constant pointing to `src-tauri/`).
-2. Open each file with a `BufReader` and parse with `rustls_pemfile::certs()` / `rustls_pemfile::private_key()`.
-3. Pass the resulting `Vec<CertificateDer>` and `PrivateKeyDer` to `rustls::ServerConfig::with_single_cert()`.
-4. Wrap in `TlsAcceptor` and bind the TCP listener on the respective port.
+If either file exists, **both must exist and parse cleanly — fail-closed**: a half-provisioned, unreadable, or corrupt certificate directory is a hard error. The affected TLS server refuses to start (loud `fail-closed` log line) rather than silently serving under a different identity or falling back to plaintext.
 
-**Browser trust.** Because the leaf certificate is signed by a public CA (Let's Encrypt → ISRG Root X1), browsers accept `wss://home.iyou.me:9001` and `wss://home.iyou.me:5222` without any security warnings. No manual trust configuration, flag overrides, or `thisisunsafe` bypasses are required.
+**2. Ephemeral local authority (default fallback):**
+
+With no runtime certificates present, an ephemeral self-signed certificate is generated in-memory via `rcgen` on each launch (CN `iyou-home Local Authority`; SANs `localhost`, `127.0.0.1`, `home.iyou.me`). It is never written to disk and never outlives the process.
+
+**Loading sequence:**
+1. Resolve the cert directory from `app_local_data_dir()/certs` at runtime — no `env!()` / `include_bytes!` compile-time paths.
+2. If `production.crt` + `production.key` both exist → open with `BufReader`, parse via `rustls_pemfile::certs()` / `rustls_pemfile::private_key()`, propagating any IO/parse failure as a hard error.
+3. Otherwise → `rcgen::KeyPair::generate()`, self-sign `CertificateParams`, convert to `CertificateDer` + PKCS#8 `PrivateKeyDer`.
+4. Pass to `rustls::ServerConfig::with_single_cert()`, wrap in `TlsAcceptor`, bind the TCP listener on the respective port.
+
+**Browser trust:** With operator-provisioned domain certificates (e.g., a Let's Encrypt chain for `home.iyou.me`, which resolves to `127.0.0.1`) placed in `{app_data_dir}/certs/`, browsers connect without warnings. With the ephemeral authority, clients will see a standard self-signed-certificate warning that must be accepted once per session — this is expected for loopback-only development use.
+
+**Provisioning:** To install domain certificates, copy the PEM chain and matching private key into `{app_data_dir}/certs/` with restrictive file permissions (`0600` for the key) and restart the app. Never place production keys inside the repository tree or bundle resources.
 
 #### Supported Message Types
 

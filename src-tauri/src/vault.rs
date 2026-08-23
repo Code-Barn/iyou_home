@@ -369,24 +369,51 @@ pub fn load_vault(app: &AppHandle) -> Result<VaultStore, VaultLoadError> {
 }
 
 /// Self-healing migration for legacy vaults that predate the dual-bootstrap
-/// era (e.g. anchor-only Index-0 dev vaults): deterministically provisions
-/// the missing Level 1 Public Persona at Index 1.
+/// era. Two degenerate shapes are repaired:
+///
+///   1. Anchor-only vaults (single Index-0 profile) — the missing Level 1
+///      Public Persona is provisioned at Index 1.
+///   2. Vaults where a single pre-hierarchy identity squats the reserved
+///      `"primary"` id at Index 0 with `level: 0` — the row is normalized
+///      into proper Anchor form (`profile_id: "anchor"`, system-reserved)
+///      before the canonical Level 1 persona is provisioned, keeping the
+///      reserved id unique and resolution paths functional.
 ///
 /// Safe because every key derives purely from `root_seed || LE(index)` —
 /// the healed persona is byte-identical to the one `initial_profiles`
-/// would have minted, so there is zero key rotation. Idempotent: the
-/// `profile_id`/index guard prevents duplicate insertion on re-runs.
+/// would have minted, so there is zero key rotation. Idempotent: healed
+/// vaults satisfy the effective-persona predicate and are left untouched.
 /// Returns `Ok(true)` when the vault was mutated and needs persisting.
 pub fn heal_reserved_profiles(vault: &mut VaultStore) -> Result<bool, String> {
     let seed = decode_root_seed(vault)?;
     let mut changed = false;
 
-    // Match on id OR index — serde-defaulted `level` on unmigrated rows
-    // makes a bare `level >= 1` predicate unreliable.
-    let has_persona = vault.profiles.iter().any(|p| {
-        p.profile_id == DEFAULT_PERSONA_PROFILE_ID || p.derivation_index == 1
-    });
-    if !has_persona {
+    // An *effective* public persona must satisfy the same predicate the
+    // resolution paths use (public_persona / empty-id lookups). A bare id
+    // match is not enough: a legacy "primary"-labeled row at Index 0 /
+    // Level 0 cannot serve as a public persona.
+    let has_effective_persona = vault
+        .profiles
+        .iter()
+        .any(|p| p.level >= 1 || p.derivation_index >= 1);
+
+    // Normalize any Index-0 row into strict Anchor invariants (AGENT.md §1.1):
+    // reserved id, level 0, system-reserved. Key material is untouched — the
+    // DID derives from seed + index and is unaffected by metadata repair.
+    for p in vault.profiles.iter_mut() {
+        if p.derivation_index == 0 && !p.is_system_reserved {
+            p.is_system_reserved = true;
+            p.level = 0;
+            if p.profile_id != ANCHOR_PROFILE_ID {
+                p.profile_id = ANCHOR_PROFILE_ID.to_string();
+            }
+            changed = true;
+        }
+    }
+
+    if !has_effective_persona {
+        // After anchor normalization above, DEFAULT_PERSONA_PROFILE_ID is
+        // guaranteed free for the canonical Index-1 persona.
         let kp = derive_deterministic_keypair(&seed, 1);
         vault.profiles.push(Profile {
             profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
@@ -1001,6 +1028,64 @@ mod tests {
         let reloaded = load_vault_from_path(&path).expect("Healed vault must round-trip");
         assert_eq!(reloaded.profiles.len(), 2);
         assert_eq!(reloaded.profiles[1].did, expected_kp.did);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_legacy_primary_squatting_index0_vault_self_heals() {
+        // Regression for the observed dev-machine shape: a single pre-hierarchy
+        // identity labeled "primary" sitting at Index 0 with serde-defaulted
+        // level/is_system_reserved fields. The id alone must NOT satisfy the
+        // effective-persona predicate.
+        let mut path = temp_dir();
+        path.push("test_vault_heal_squatting.json");
+        let _ = fs::remove_file(&path);
+
+        let full = create_vault_at_path(&path).expect("Should create vault");
+        let seed = bs58::decode(&full.root_seed_base58)
+            .into_vec()
+            .expect("Seed should decode");
+        let squatting = VaultStore {
+            root_seed_base58: full.root_seed_base58.clone(),
+            profiles: vec![Profile {
+                profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
+                profile_name: "Primary Identity".to_string(),
+                derivation_index: 0,
+                did: full.profiles[0].did.clone(),
+                credentials: vec![],
+                nostr_pubkey_hex: full.profiles[0].nostr_pubkey_hex.clone(),
+                level: 0,
+                is_system_reserved: false,
+            }],
+        };
+        save_vault_inner(&path, &squatting).expect("Should persist squatting vault");
+        let anchor_did = squatting.profiles[0].did.clone();
+
+        let healed =
+            load_or_bootstrap_vault_at_path(&path).expect("Squatting vault must self-heal");
+        assert_eq!(healed.profiles.len(), 2);
+
+        // The Index-0 row is normalized into strict Anchor invariants; key
+        // material is untouched.
+        let anchor = &healed.profiles[0];
+        assert_eq!(anchor.profile_id, ANCHOR_PROFILE_ID, "Reserved id must be reclaimed");
+        assert_eq!(anchor.derivation_index, 0);
+        assert_eq!(anchor.level, 0);
+        assert!(anchor.is_system_reserved);
+        assert_eq!(anchor.did, anchor_did, "Anchor DID must not rotate");
+
+        // The canonical Level 1 persona is provisioned at Index 1.
+        let persona = &healed.profiles[1];
+        assert_eq!(persona.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(persona.derivation_index, 1);
+        assert_eq!(persona.level, 1);
+        assert!(!persona.is_system_reserved);
+        assert_eq!(persona.did, derive_deterministic_keypair(&seed, 1).did);
+
+        // Empty-id resolution (the Nostr auto-start path) now succeeds.
+        let kp = get_profile_keypair(&healed, "").expect("Empty id must resolve post-heal");
+        assert_eq!(kp.did, persona.did);
 
         let _ = fs::remove_file(path);
     }

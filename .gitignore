@@ -29,3 +29,6 @@ dist-ssr
 *.p12
 *.jks
 test_seed*.json
+
+
+src-tauri/certs/production.crt

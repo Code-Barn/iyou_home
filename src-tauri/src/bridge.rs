@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use std::sync::Arc;
 
-use crate::certs::{load_production_certs, ReadBuffered};
+use crate::certs::{resolve_tls_assets, ReadBuffered};
 
 use crate::WsState;
 
@@ -474,12 +474,36 @@ where
 }
 
 async fn listen_on(addrs: &str, app: AppHandle) {
-    let (certs, key) = load_production_certs();
+    // SEC-002: TLS assets resolve strictly at runtime from the app data dir
+    // (or fall back to an ephemeral local authority). No compile-time keys.
+    let cert_dir = match app.path().app_local_data_dir() {
+        Ok(dir) => dir.join("certs"),
+        Err(e) => {
+            eprintln!(
+                "Signature Bridge cannot resolve cert directory (fail-closed, NOT started): {}",
+                e
+            );
+            return;
+        }
+    };
+    let (certs, key) = match resolve_tls_assets(&cert_dir) {
+        Ok(assets) => assets,
+        Err(e) => {
+            eprintln!("Signature Bridge TLS failure (fail-closed, NOT started): {}", e);
+            return;
+        }
+    };
 
-    let config = ServerConfig::builder()
+    let config = match ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .expect("Failed to configure TLS");
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Signature Bridge TLS config rejected (fail-closed): {}", e);
+            return;
+        }
+    };
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
 

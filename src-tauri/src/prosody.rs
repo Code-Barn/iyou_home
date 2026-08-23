@@ -28,7 +28,7 @@ use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::certs::{load_production_certs, ReadBuffered};
+use crate::certs::{resolve_tls_assets, ReadBuffered};
 
 const XMPP_SERVER: &str = "127.0.0.1";
 const STREAM_NS: &str = "http://etherx.jabber.org/streams";
@@ -52,14 +52,28 @@ pub async fn start_xmpp_server(
     listener: TcpListener,
     mut shutdown_rx: watch::Receiver<bool>,
     xmpp_pass: String,
+    cert_dir: std::path::PathBuf,
 ) {
     let clients: Arc<Mutex<Vec<XmppClient>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let (certs, key) = load_production_certs();
-    let config = ServerConfig::builder()
+    // SEC-002: runtime cert resolution with ephemeral fallback (fail-closed).
+    let (certs, key) = match resolve_tls_assets(&cert_dir) {
+        Ok(assets) => assets,
+        Err(e) => {
+            eprintln!("XMPP TLS failure (fail-closed, server NOT started): {}", e);
+            return;
+        }
+    };
+    let config = match ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .expect("Failed to configure XMPP TLS");
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("XMPP TLS config rejected (fail-closed): {}", e);
+            return;
+        }
+    };
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     println!("XMPP server listening on wss://home.iyou.me:5222");

@@ -2,11 +2,10 @@
 // used by both the Signature Bridge (bridge.rs) and the XMPP server (prosody.rs).
 
 use std::io::{self, BufReader};
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 // ---------------------------------------------------------------------------
 // ReadBuffered — replays a chunk of already-read bytes before delegating to
@@ -69,36 +68,206 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ReadBuffered<S> {
 }
 
 // ---------------------------------------------------------------------------
-// Production Let's Encrypt certificate loading
+// TLS asset resolution (SEC-002)
+//
+// Private keys are NEVER embedded in the binary or resolved via compile-time
+// macros. Strategy, in priority order:
+//
+//   1. Runtime domain certificates: `{app_local_data_dir}/certs/production.crt`
+//      + `production.key`, resolved strictly at runtime from an
+//      access-controlled external path. Fail-closed: if either file exists
+//      but is unreadable, incomplete, or corrupt, this is a hard error —
+//      TLS servers must not silently fall back to another identity.
+//   2. Ephemeral self-signed local authority generated in-memory via `rcgen`
+//      (SANs: localhost, 127.0.0.1, home.iyou.me). Nothing touches disk and
+//      nothing outlives the process.
 // ---------------------------------------------------------------------------
-pub fn load_production_certs(
-) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let cert_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("certs")
-        .join("production.crt");
-    let key_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("certs")
-        .join("production.key");
 
-    println!(
-        "Sovereign Release: Loading authentic Let's Encrypt keys from {:?}",
-        cert_path
-    );
+/// File names resolved inside the runtime certificate directory.
+pub const RUNTIME_CERT_FILE: &str = "production.crt";
+pub const RUNTIME_KEY_FILE: &str = "production.key";
 
+fn parse_runtime_certs(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let mut cert_file =
-        BufReader::new(std::fs::File::open(&cert_path).expect("Failed to open production cert"));
+        BufReader::new(std::fs::File::open(cert_path).map_err(|e| {
+            format!("Unreadable TLS certificate {}: {}", cert_path.display(), e)
+        })?);
     let mut key_file =
-        BufReader::new(std::fs::File::open(&key_path).expect("Failed to open production key"));
+        BufReader::new(std::fs::File::open(key_path).map_err(|e| {
+            format!("Unreadable TLS private key {}: {}", key_path.display(), e)
+        })?);
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_file)
         .collect::<Result<Vec<_>, _>>()
-        .expect("Failed to parse production certificate chain");
+        .map_err(|e| format!("Corrupt TLS certificate PEM {}: {}", cert_path.display(), e))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "No certificates found in {}",
+            cert_path.display()
+        ));
+    }
 
     let key = rustls_pemfile::private_key(&mut key_file)
-        .expect("Failed to parse production private key")
-        .expect("Missing private key asset structure");
+        .map_err(|e| format!("Corrupt TLS private key PEM {}: {}", key_path.display(), e))?
+        .ok_or_else(|| format!("No private key material in {}", key_path.display()))?;
 
-    println!("Loaded authentic Let's Encrypt keys for home.iyou.me");
+    Ok((certs, key))
+}
 
-    (certs, key)
+/// Generate an ephemeral self-signed certificate for loopback binding.
+/// In-memory only: never persisted, never leaves the process.
+pub fn generate_ephemeral_certs(
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| format!("Ephemeral key generation failed: {}", e))?;
+
+    let mut params = rcgen::CertificateParams::new(vec![
+        "localhost".to_string(),
+        "home.iyou.me".to_string(),
+    ])
+    .map_err(|e| format!("Ephemeral certificate params failed: {}", e))?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "iyou-home Local Authority");
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::from([127, 0, 0, 1])));
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("Ephemeral self-signing failed: {}", e))?;
+
+    let certs = vec![CertificateDer::from(cert.der().to_vec())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+    println!("TLS: using ephemeral self-signed local authority (valid for this session only)");
+    Ok((certs, key))
+}
+
+/// Resolve TLS assets at runtime. Domain certificates are loaded from
+/// `{cert_dir}/` only if present on disk; otherwise an ephemeral self-signed
+/// local authority is generated. Any partial or corrupt runtime certificate
+/// state fails closed.
+pub fn resolve_tls_assets(
+    cert_dir: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    let cert_path = cert_dir.join(RUNTIME_CERT_FILE);
+    let key_path = cert_dir.join(RUNTIME_KEY_FILE);
+    let has_cert = cert_path.exists();
+    let has_key = key_path.exists();
+
+    if has_cert || has_key {
+        // A half-provisioned directory is a configuration error, not a
+        // fallback trigger.
+        if !has_cert || !has_key {
+            return Err(format!(
+                "TLS configuration incomplete in {}: both {} and {} must be present",
+                cert_dir.display(),
+                RUNTIME_CERT_FILE,
+                RUNTIME_KEY_FILE
+            ));
+        }
+        println!("TLS: loading domain certificates from {}", cert_dir.display());
+        return parse_runtime_certs(&cert_path, &key_path);
+    }
+
+    println!(
+        "TLS: no domain certificates in {} — generating ephemeral self-signed local authority",
+        cert_dir.display()
+    );
+    generate_ephemeral_certs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::temp_dir;
+
+    fn temp_cert_dir(label: &str) -> std::path::PathBuf {
+        let dir = temp_dir().join(format!("iyou_certs_{}_{}", label, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("Should create cert dir");
+        dir
+    }
+
+    #[test]
+    fn test_ephemeral_generation_yields_parseable_identity() {
+        let (certs, key) = generate_ephemeral_certs().expect("Should generate");
+        assert!(!certs.is_empty());
+
+        // The returned key must be valid DER that rustls can classify.
+        match &key {
+            PrivateKeyDer::Pkcs8(pkcs8) => {
+                assert!(!pkcs8.secret_pkcs8_der().is_empty());
+            }
+            other => panic!("Expected PKCS#8 key, got {:?}", other),
+        }
+
+        // Two generations produce distinct identities.
+        let (certs2, _) = generate_ephemeral_certs().expect("Second generation");
+        assert_ne!(certs[0], certs2[0], "Ephemeral identities must be unique per launch");
+    }
+
+    #[test]
+    fn test_empty_cert_dir_falls_back_to_ephemeral() {
+        let dir = temp_cert_dir("empty");
+        let result = resolve_tls_assets(&dir).expect("Empty dir should yield ephemeral assets");
+        assert!(!result.0.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_half_provisioned_cert_dir_fails_closed() {
+        let dir = temp_cert_dir("half");
+
+        // Key without cert.
+        std::fs::write(dir.join(RUNTIME_KEY_FILE), b"junk").expect("Write key");
+        let err = resolve_tls_assets(&dir).err().expect("Must fail closed");
+        assert!(err.contains("incomplete"), "Got: {}", err);
+
+        // Cert without key.
+        std::fs::remove_file(dir.join(RUNTIME_KEY_FILE)).expect("Remove key");
+        std::fs::write(dir.join(RUNTIME_CERT_FILE), b"junk").expect("Write cert");
+        let err = resolve_tls_assets(&dir).err().expect("Must fail closed");
+        assert!(err.contains("incomplete"), "Got: {}", err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_corrupt_runtime_certs_fail_closed() {
+        let dir = temp_cert_dir("corrupt");
+        std::fs::write(dir.join(RUNTIME_CERT_FILE), b"not a pem at all")
+            .expect("Write corrupt cert");
+        std::fs::write(dir.join(RUNTIME_KEY_FILE), b"\x00\xFFgarbage").expect("Write corrupt key");
+
+        let err = resolve_tls_assets(&dir).err().expect("Corrupt certs must fail closed");
+        assert!(err.contains("Corrupt") || err.contains("No "), "Got: {}", err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_runtime_domain_certs_load_from_disk() {
+        let dir = temp_cert_dir("runtime");
+
+        // Provision real PEM files by round-tripping an rcgen identity.
+        let key_pair = rcgen::KeyPair::generate().expect("Generate key pair");
+        let params = rcgen::CertificateParams::new(vec!["home.iyou.me".to_string()])
+            .expect("Params");
+        let cert = params.self_signed(&key_pair).expect("Self-sign");
+        std::fs::write(dir.join(RUNTIME_CERT_FILE), cert.pem()).expect("Write cert pem");
+        std::fs::write(dir.join(RUNTIME_KEY_FILE), key_pair.serialize_pem())
+            .expect("Write key pem");
+
+        let (certs, _key) =
+            resolve_tls_assets(&dir).expect("Runtime certs should load");
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), cert.der().as_ref(), "Round-trip must be byte-identical");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

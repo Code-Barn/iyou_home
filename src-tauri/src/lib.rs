@@ -307,7 +307,7 @@ async fn start_service_internal(
                 .map_err(|e| format!("Failed to bind XMPP: {}", e))?;
             let (tx, rx) = watch::channel(false);
             tauri::async_runtime::spawn(async move {
-                prosody::start_xmpp_server(listener, rx, password).await;
+                prosody::start_xmpp_server(listener, rx, password, app_data.join("certs")).await;
             });
             tx
         }
