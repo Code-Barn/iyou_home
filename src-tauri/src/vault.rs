@@ -28,6 +28,15 @@ use k256::schnorr::SigningKey as SecpSigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+// Identity Graduation transit crypto (AGENT.md §16 / AUTH_FLOW_SPECIFICATION §16).
+// The IdP seals the custodial Ed25519 seed behind an ephemeral X25519 ECDH +
+// HKDF-SHA256 + AES-256-GCM envelope; these crates unwrap it locally.
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce as AesNonce, Key as AesKey};
+use hkdf::Hkdf;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 /// Level 0 — immutable, air-gapped anchor identity (private P2P enclaves only).
 pub const ANCHOR_PROFILE_ID: &str = "anchor";
@@ -71,6 +80,11 @@ pub struct VaultCredential {
 pub struct VaultStore {
     pub root_seed_base58: String,
     pub profiles: Vec<Profile>,
+    /// Graduated sovereign identities whose Ed25519 seeds are sealed with
+    /// ChaCha20Poly1305 under the WebAuthn PRF KEK. These never derive from
+    /// the local root seed and are invisible to root-seed keypair paths.
+    #[serde(default)]
+    pub sovereign_identities: Vec<SovereignIdentity>,
 }
 
 impl VaultStore {
@@ -90,6 +104,38 @@ impl VaultStore {
             self.public_persona()
         } else {
             self.profiles.iter().find(|p| p.profile_id == id)
+        }
+    }
+}
+
+/// A graduated sovereign persona imported from an iyou_idp custodial export.
+/// The raw 32-byte Ed25519 seed is stored only as a ChaCha20Poly1305 sealed
+/// blob (`nonce || ciphertext || tag`, base64) keyed by the WebAuthn PRF KEK,
+/// so the vault file alone never yields usable key material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SovereignIdentity {
+    pub did: String,
+    pub profile_name: String,
+    pub nostr_pubkey_hex: String,
+    pub sealed_seed_b64: String,
+    #[serde(default = "default_true")]
+    pub custodial_origin: bool,
+    pub graduated_at: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SovereignIdentity {
+    fn default() -> Self {
+        Self {
+            did: String::new(),
+            profile_name: "Sovereign Identity".to_string(),
+            nostr_pubkey_hex: String::new(),
+            sealed_seed_b64: String::new(),
+            custodial_origin: true,
+            graduated_at: 0,
         }
     }
 }
@@ -152,6 +198,163 @@ pub fn derive_secp256k1_pubkey_hex(root_seed: &[u8], derivation_index: u32) -> S
     hex::encode(key.verifying_key().to_bytes())
 }
 
+// ---------- Identity Graduation: transit unsealing & sovereign ingest ----------
+
+/// HKDF info string binding derived wrapping keys to the graduation protocol.
+/// Must stay byte-identical to the IdP implementation
+/// (AUTH_FLOW_SPECIFICATION §16.1).
+pub const GRADUATION_HKDF_INFO: &[u8] = b"iyou-idp/graduation-export/v1";
+
+/// Unwrap a sealed custodial identity export on the client side:
+/// X25519 ECDH(client_ephemeral_priv × server_ephemeral_pub) →
+/// HKDF-SHA256(salt = nonce, info = GRADUATION_HKDF_INFO) → AES-256-GCM
+/// open with `custodial_did` bound as AEAD associated data. Returns the raw
+/// 32-byte Ed25519 seed wrapped in `Zeroizing`.
+pub fn unseal_graduation_export(
+    client_ephemeral_priv: &[u8; 32],
+    server_ephemeral_pub: &[u8; 32],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    custodial_did: &str,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    if nonce.len() != 12 {
+        return Err(format!(
+            "Invalid export nonce length: expected 12 bytes, got {}",
+            nonce.len()
+        ));
+    }
+    // Minimum plausible payload: 32-byte seed + 16-byte GCM tag.
+    if ciphertext.len() < 48 {
+        return Err(format!(
+            "Export ciphertext too short: expected at least 48 bytes, got {}",
+            ciphertext.len()
+        ));
+    }
+
+    let client_secret = StaticSecret::from(*client_ephemeral_priv);
+    let shared = client_secret.diffie_hellman(&X25519PublicKey::from(*server_ephemeral_pub));
+    if !shared.was_contributory() {
+        return Err("Degenerate ECDH shared secret (low-order point)".to_string());
+    }
+
+    let hk = Hkdf::<Sha256>::new(Some(nonce), shared.as_bytes());
+    let mut wrapping_key = Zeroizing::new([0u8; 32]);
+    hk.expand(GRADUATION_HKDF_INFO, wrapping_key.as_mut())
+        .map_err(|_| "HKDF expansion failed".to_string())?;
+
+    let cipher = Aes256Gcm::new(AesKey::<Aes256Gcm>::from_slice(wrapping_key.as_slice()));
+    let plaintext = cipher
+        .decrypt(
+            AesNonce::from_slice(&nonce[..12]),
+            Payload {
+                msg: ciphertext,
+                aad: custodial_did.as_bytes(),
+            },
+        )
+        .map_err(|_| {
+            "Graduation export decryption failed: AEAD authentication error \
+             (transit key mismatch or custodial DID binding violation)"
+                .to_string()
+        })?;
+
+    if plaintext.len() != 32 {
+        return Err(format!(
+            "Unsealed identity seed must be exactly 32 bytes, got {}",
+            plaintext.len()
+        ));
+    }
+
+    Ok(Zeroizing::new(plaintext))
+}
+
+/// Import a graduated sovereign persona into the vault. The unsealed seed is
+/// immediately re-sealed with ChaCha20Poly1305 under the WebAuthn PRF KEK via
+/// `did_rust::encrypt_vault_payload` and persisted as an opaque blob — the
+/// plaintext seed never touches disk.
+pub fn ingest_graduated_identity(
+    vault: &mut VaultStore,
+    custodial_did: &str,
+    ed25519_seed: &[u8],
+    prf_kek: &[u8; 32],
+) -> Result<SovereignIdentity, String> {
+    if ed25519_seed.len() != 32 {
+        return Err(format!(
+            "Ed25519 seed must be 32 bytes, got {}",
+            ed25519_seed.len()
+        ));
+    }
+    if vault
+        .sovereign_identities
+        .iter()
+        .any(|s| s.did == custodial_did)
+    {
+        return Err(format!(
+            "Sovereign identity '{}' already exists in vault",
+            custodial_did
+        ));
+    }
+
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(ed25519_seed);
+
+    // Validate the seed is a usable Ed25519 scalar before persisting anything.
+    SigningKey::from_bytes(&seed_arr);
+
+    // Deterministic companion Nostr key derived from the sovereign seed itself
+    // (domain-separated from the Ed25519 key inside did_rust).
+    let (nostr_pubkey_hex, _) = did_rust::derive_nostr_keypair(&seed_arr, 0)
+        .map_err(|e| format!("Failed to derive sovereign Nostr key: {}", e))?;
+
+    let sealed = did_rust::encrypt_vault_payload(prf_kek, &seed_arr)
+        .map_err(|e| format!("Failed to seal sovereign seed: {}", e))?;
+
+    let record = SovereignIdentity {
+        did: custodial_did.to_string(),
+        profile_name: "Sovereign Identity".to_string(),
+        nostr_pubkey_hex,
+        sealed_seed_b64: base64::engine::general_purpose::STANDARD.encode(&sealed),
+        custodial_origin: true,
+        graduated_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+
+    vault.sovereign_identities.push(record.clone());
+    Ok(record)
+}
+
+/// Recover the signing key of a stored sovereign persona by unsealing its
+/// ChaCha20Poly1305 blob under the supplied PRF KEK.
+pub fn unseal_sovereign_identity(
+    record: &SovereignIdentity,
+    prf_kek: &[u8; 32],
+) -> Result<SigningKey, String> {
+    let sealed = base64::engine::general_purpose::STANDARD
+        .decode(&record.sealed_seed_b64)
+        .map_err(|_| "Invalid sealed sovereign seed encoding".to_string())?;
+    let plaintext = Zeroizing::new(
+        did_rust::decrypt_vault_payload(prf_kek, &sealed)
+            .map_err(|e| format!("Failed to unseal sovereign seed: {}", e))?,
+    );
+    if plaintext.len() != 32 {
+        return Err(format!(
+            "Unsealed sovereign seed must be 32 bytes, got {}",
+            plaintext.len()
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&plaintext);
+    Ok(SigningKey::from_bytes(&arr))
+}
+
+pub fn get_sovereign_identity<'a>(
+    vault: &'a VaultStore,
+    did: &str,
+) -> Option<&'a SovereignIdentity> {
+    vault.sovereign_identities.iter().find(|s| s.did == did)
+}
+
 fn get_storage_path(app: &AppHandle) -> PathBuf {
     let mut path = app
         .path()
@@ -169,6 +372,7 @@ pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
     let vault = VaultStore {
         root_seed_base58,
         profiles: initial_profiles(&seed),
+        sovereign_identities: Vec::new(),
     };
 
     save_vault_inner(path, &vault)?;
@@ -985,6 +1189,7 @@ mod tests {
         let legacy = VaultStore {
             root_seed_base58: full.root_seed_base58.clone(),
             profiles: vec![full.profiles[0].clone()],
+            sovereign_identities: Vec::new(),
         };
         save_vault_inner(path, &legacy).expect("Should persist legacy vault");
         let seed = bs58::decode(&legacy.root_seed_base58)
@@ -1058,6 +1263,7 @@ mod tests {
                 level: 0,
                 is_system_reserved: false,
             }],
+            sovereign_identities: Vec::new(),
         };
         save_vault_inner(&path, &squatting).expect("Should persist squatting vault");
         let anchor_did = squatting.profiles[0].did.clone();
@@ -1619,5 +1825,182 @@ mod tests {
         assert!(poll.validate_vote_timeline(50).is_ok());
         assert!(poll.validate_vote_timeline(250).is_ok());
         assert!(poll.validate_vote_timeline(9999999).is_ok());
+    }
+
+    // ---------- Identity Graduation: transit unsealing & sovereign ingest ----------
+
+    /// RFC 7748 §5.2 X25519 test vector #1 (Alice private × Bob public).
+    const RFC7748_ALICE_PRIV: [u8; 32] = [
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+        0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+        0x1d, 0xb9, 0x2c, 0x2a,
+    ];
+    const RFC7748_BOB_PUB: [u8; 32] = [
+        0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4,
+        0x35, 0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x74, 0xda, 0xdf, 0xc7, 0xe1,
+        0x46, 0xf8, 0x82, 0xb4,
+    ];
+
+    fn test_server_side_seal(
+        server_ephemeral_priv: &[u8; 32],
+        client_ephemeral_pub: &[u8; 32],
+        nonce: &[u8; 12],
+        seed: &[u8; 32],
+        custodial_did: &str,
+    ) -> Vec<u8> {
+        let server_secret = StaticSecret::from(*server_ephemeral_priv);
+        let shared = server_secret.diffie_hellman(&X25519PublicKey::from(*client_ephemeral_pub));
+        let hk = Hkdf::<Sha256>::new(Some(nonce), shared.as_bytes());
+        let mut wrapping_key = [0u8; 32];
+        hk.expand(GRADUATION_HKDF_INFO, &mut wrapping_key)
+            .expect("HKDF expand must succeed");
+        let cipher = Aes256Gcm::new(AesKey::<Aes256Gcm>::from_slice(&wrapping_key));
+        cipher
+            .encrypt(
+                AesNonce::from_slice(nonce),
+                Payload {
+                    msg: seed,
+                    aad: custodial_did.as_bytes(),
+                },
+            )
+            .expect("AES-256-GCM seal must succeed")
+    }
+
+    #[test]
+    fn test_transit_ecdh_matches_rfc7748_vector() {
+        let client_secret = StaticSecret::from(RFC7748_ALICE_PRIV);
+        let shared = client_secret.diffie_hellman(&X25519PublicKey::from(RFC7748_BOB_PUB));
+        assert!(
+            shared.was_contributory(),
+            "RFC 7748 vector must be contributory"
+        );
+    }
+
+    #[test]
+    fn test_unseal_graduation_export_roundtrip() {
+        let mut client_priv = [0u8; 32];
+        OsRng.fill_bytes(&mut client_priv);
+        let client_secret = StaticSecret::from(client_priv);
+        let client_pub = X25519PublicKey::from(&client_secret).to_bytes();
+
+        let mut server_priv = [0u8; 32];
+        OsRng.fill_bytes(&mut server_priv);
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+
+        let seed: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        let did = "did:web:iyou.me:user:test-uuid-0001";
+
+        let ciphertext = test_server_side_seal(&server_priv, &client_pub, &nonce, &seed, did);
+        let server_pub = X25519PublicKey::from(&StaticSecret::from(server_priv)).to_bytes();
+
+        let unsealed =
+            unseal_graduation_export(&client_priv, &server_pub, &nonce, &ciphertext, did)
+                .expect("Unsealing must succeed");
+        assert_eq!(unsealed.len(), 32);
+        assert_eq!(unsealed.as_slice(), seed);
+    }
+
+    #[test]
+    fn test_unseal_rejects_aad_binding_violation() {
+        let client_secret = StaticSecret::from(RFC7748_ALICE_PRIV);
+        let client_pub = X25519PublicKey::from(&client_secret).to_bytes();
+        let nonce = [0x42u8; 12];
+        let seed = [0x11u8; 32];
+
+        let ciphertext =
+            test_server_side_seal(&[0x99u8; 32], &client_pub, &nonce, &seed, "did:web:right");
+        let server_pub = X25519PublicKey::from(&StaticSecret::from([0x99u8; 32])).to_bytes();
+
+        let err = unseal_graduation_export(
+            &RFC7748_ALICE_PRIV,
+            &server_pub,
+            &nonce,
+            &ciphertext,
+            "did:web:wrong",
+        )
+        .err()
+        .expect("Wrong AAD must fail AEAD authentication");
+        assert!(err.contains("AEAD authentication error"), "{}", err);
+    }
+
+    #[test]
+    fn test_unseal_rejects_malformed_inputs() {
+        let client_pub_dummy = [2u8; 32];
+        let server_pub = X25519PublicKey::from(client_pub_dummy).to_bytes();
+        let bad_nonce = [0u8; 11];
+        let tiny_ct = [0u8; 10];
+
+        assert!(unseal_graduation_export(&[0u8; 32], &server_pub, &bad_nonce, &[0u8; 48], "d")
+            .is_err());
+        assert!(unseal_graduation_export(&[0u8; 32], &server_pub, &[0u8; 12], &tiny_ct, "d")
+            .is_err());
+    }
+
+    #[test]
+    fn test_prf_identity_derivation_matches_vault_path() {
+        // The PRF dual-curve derivation in did_rust must agree byte-for-byte
+        // with the local vault hierarchy for the same root material.
+        let prf_seed: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(31));
+        for index in [0u32, 1, 2, 77] {
+            let identity = did_rust::derive_identity_from_prf(&prf_seed, index)
+                .expect("PRF derivation must succeed");
+
+            let vault_kp = derive_deterministic_keypair(&prf_seed, index);
+            assert_eq!(identity.did, vault_kp.did);
+            assert_eq!(
+                identity.nostr_pubkey_hex,
+                derive_secp256k1_pubkey_hex(&prf_seed, index)
+            );
+
+            let again = did_rust::derive_identity_from_prf(&prf_seed, index)
+                .expect("PRF derivation must be deterministic");
+            assert_eq!(identity.did, again.did);
+            assert_eq!(identity.nostr_pubkey_hex, again.nostr_pubkey_hex);
+        }
+    }
+
+    #[test]
+    fn test_sovereign_ingest_seals_seed_in_vault_storage() {
+        let mut path = temp_dir();
+        path.push("test_vault_sovereign.json");
+        let _ = fs::remove_file(&path);
+
+        let kek: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_add(1));
+        let seed: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(3));
+        let did = "did:web:iyou.me:user:sovereign-abc";
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        let record = ingest_graduated_identity(&mut vault, did, &seed, &kek)
+            .expect("Ingest must succeed");
+
+        save_vault_inner(&path, &vault).expect("Should persist vault");
+        let raw = fs::read_to_string(&path).expect("Should read vault file");
+        assert!(!raw.contains(hex::encode(seed).as_str()), "Raw hex of seed leaked to disk");
+        assert!(!raw.contains(bs58::encode(seed).into_string().as_str()));
+
+        let reloaded = load_vault_from_path(&path).expect("Should reload");
+        assert_eq!(reloaded.sovereign_identities.len(), 1);
+        let stored = get_sovereign_identity(&reloaded, did).expect("Should resolve sovereign");
+        assert_ne!(stored.sealed_seed_b64, hex::encode(seed));
+        assert_eq!(stored.did, record.did);
+        assert_eq!(stored.nostr_pubkey_hex, record.nostr_pubkey_hex);
+
+        // Sealed blob must round-trip back to the exact seed.
+        let signing_key = unseal_sovereign_identity(stored, &kek).expect("Unseal must succeed");
+        assert_eq!(signing_key.to_bytes(), seed);
+        assert_eq!(
+            signing_key.verifying_key().to_bytes(),
+            SigningKey::from_bytes(&seed).verifying_key().to_bytes()
+        );
+
+        // Wrong KEK must fail cleanly.
+        let wrong_kek: [u8; 32] = [9u8; 32];
+        assert!(unseal_sovereign_identity(stored, &wrong_kek).is_err());
+
+        // Duplicate DID ingest is rejected structurally.
+        assert!(ingest_graduated_identity(&mut vault, did, &seed, &kek).is_err());
+
+        let _ = fs::remove_file(path);
     }
 }

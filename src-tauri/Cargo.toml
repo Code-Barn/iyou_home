@@ -46,3 +46,7 @@ http = "1"
 tower-http = { version = "0.5", features = ["cors", "set-header"] }
 chrono = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.13", features = ["schnorr"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+aes-gcm = "0.10"
+zeroize = "1"

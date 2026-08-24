@@ -18,6 +18,8 @@
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::Signer;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -29,6 +31,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
+use x25519_dalek::StaticSecret;
+use zeroize::Zeroizing;
 mod blossom;
 mod bridge;
 mod certs;
@@ -58,6 +62,10 @@ pub struct UserPreferences {
     pub default_signing_profile: String,
     pub auto_sign: bool,
     pub last_active_tab: String,
+    /// Set when a graduated sovereign identity is the active signer. Takes
+    /// precedence over `active_profile_id` during DID resolution.
+    #[serde(default)]
+    pub active_sovereign_did: Option<String>,
 }
 
 impl Default for UserPreferences {
@@ -67,6 +75,7 @@ impl Default for UserPreferences {
             default_signing_profile: vault::DEFAULT_PERSONA_PROFILE_ID.to_string(),
             auto_sign: false,
             last_active_tab: "services".to_string(),
+            active_sovereign_did: None,
         }
     }
 }
@@ -76,6 +85,40 @@ pub struct WsState {
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
     pub pending_messages: Mutex<Vec<String>>,
     pub popup_active: Mutex<bool>,
+}
+
+/// Short-lived cache for the graduation transit handshake. The client's
+/// ephemeral X25519 scalar lives here only between `generate_transit_keypair`
+/// and `process_graduation_ingest`; it is taken (removed) on use and wrapped
+/// in `Zeroizing` so it is wiped from memory when dropped. It never crosses
+/// back over the IPC boundary.
+pub struct TransitState {
+    pub client_ephemeral_priv: Mutex<Option<Zeroizing<[u8; 32]>>>,
+}
+
+impl Default for TransitState {
+    fn default() -> Self {
+        Self {
+            client_ephemeral_priv: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DerivedIdentityPublic {
+    pub did: String,
+    pub nostr_pubkey_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransitKeypairPublic {
+    pub client_ephemeral_pub_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraduationConfirmPayload {
+    pub receipt: serde_json::Value,
+    pub signature: String,
 }
 
 impl Default for WsState {
@@ -382,6 +425,7 @@ fn import_did(
             vault::VaultStore {
                 root_seed_base58: bs58::encode(arr).into_string(),
                 profiles: vault::initial_profiles(&arr),
+                sovereign_identities: Vec::new(),
             }
         }
         Err(e) => return Err(e.to_string()),
@@ -420,6 +464,15 @@ fn get_active_did(
     let prefs = load_preferences(&app);
     match vault::load_vault(&app) {
         Ok(vault) => {
+            // A graduated sovereign identity outranks derived personas when
+            // the user has claimed custody.
+            if let Some(sovereign_did) = &prefs.active_sovereign_did {
+                if vault::get_sovereign_identity(&vault, sovereign_did).is_some() {
+                    let mut active = state.active_did.lock().unwrap();
+                    *active = Some(sovereign_did.clone());
+                    return Ok(Some(sovereign_did.clone()));
+                }
+            }
             if let Some(profile) = vault
                 .get_profile_by_id(&prefs.active_profile_id)
                 .filter(|p| !p.is_anchor())
@@ -484,9 +537,11 @@ fn set_active_profile(
     let mut active = state.active_did.lock().unwrap();
     *active = Some(profile.did.clone());
 
-    // Update preferences and save
+    // Update preferences and save. Selecting a derived persona deactivates
+    // any graduated sovereign identity.
     let mut prefs = load_preferences(&app);
     prefs.active_profile_id = profile_id;
+    prefs.active_sovereign_did = None;
     save_preferences(&app, &prefs)?;
 
     Ok(())
@@ -1389,6 +1444,165 @@ fn resolve_peer_aliases(app: AppHandle, pubkeys: Vec<String>) -> Result<serde_js
     Ok(contacts::resolution_json(&store, &pubkeys))
 }
 
+// ---------- WebAuthn PRF & Identity Graduation Commands ----------
+
+/// Derives the dual-curve sovereign identity (Ed25519 DID + Nostr pubkey)
+/// deterministically from a browser-supplied WebAuthn PRF seed. Only public
+/// key material is returned — the derived private scalars stay in Rust and
+/// are zeroized when `DerivedIdentity` drops.
+#[tauri::command]
+fn derive_prf_identity(
+    prf_seed_hex: String,
+    derivation_index: u32,
+) -> Result<DerivedIdentityPublic, String> {
+    let decoded = hex::decode(prf_seed_hex.trim())
+        .map_err(|_| "Invalid PRF seed hex encoding".to_string())?;
+    let prf_seed = Zeroizing::new(
+        <[u8; 32]>::try_from(decoded.as_slice())
+            .map_err(|_| "PRF seed must be exactly 32 bytes (64 hex chars)".to_string())?,
+    );
+
+    let identity = did_rust::derive_identity_from_prf(&prf_seed, derivation_index)
+        .map_err(|e| format!("PRF identity derivation failed: {}", e))?;
+
+    Ok(DerivedIdentityPublic {
+        did: identity.did.clone(),
+        nostr_pubkey_hex: identity.nostr_pubkey_hex.clone(),
+    })
+}
+
+/// Mints an ephemeral X25519 transit keypair for the graduation handshake.
+/// The private scalar is cached in a short-lived managed state (single use:
+/// consumed by `process_graduation_ingest`) and never leaves the backend.
+#[tauri::command]
+fn generate_transit_keypair(state: State<'_, TransitState>) -> Result<TransitKeypairPublic, String> {
+    let mut sk_bytes = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(sk_bytes.as_mut());
+
+    let secret = StaticSecret::from(*sk_bytes);
+    let public = x25519_dalek::PublicKey::from(&secret);
+
+    *state.client_ephemeral_priv.lock().unwrap() = Some(sk_bytes);
+
+    Ok(TransitKeypairPublic {
+        client_ephemeral_pub_hex: hex::encode(public.as_bytes()),
+    })
+}
+
+/// Unwraps the IdP's sealed custodial identity export, re-seals the raw
+/// Ed25519 seed under the WebAuthn PRF KEK (ChaCha20Poly1305) inside
+/// `vault.json`, then signs the canonical graduation receipt with the
+/// unsealed key. All intermediate secrets are zeroized before returning;
+/// only the receipt and its signature cross the IPC boundary.
+#[tauri::command]
+fn process_graduation_ingest(
+    app: AppHandle,
+    transit: State<'_, TransitState>,
+    server_ephemeral_pub_hex: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+    custodial_did: String,
+    prf_kek_hex: String,
+) -> Result<GraduationConfirmPayload, String> {
+    let custodial_did = custodial_did.trim().to_string();
+    if custodial_did.is_empty() {
+        return Err("custodial_did must not be empty".to_string());
+    }
+
+    let client_priv = transit
+        .client_ephemeral_priv
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| {
+            "No cached transit keypair: call generate_transit_keypair first".to_string()
+        })?;
+
+    let server_pub_vec = hex::decode(server_ephemeral_pub_hex.trim())
+        .map_err(|_| "Server ephemeral public key is not valid hex".to_string())?;
+    let server_pub: [u8; 32] = server_pub_vec
+        .try_into()
+        .map_err(|_| "Server ephemeral public key must be 32 bytes".to_string())?;
+    let nonce =
+        hex::decode(nonce_hex.trim()).map_err(|_| "Export nonce is not valid hex".to_string())?;
+    let ciphertext = hex::decode(ciphertext_hex.trim())
+        .map_err(|_| "Export ciphertext is not valid hex".to_string())?;
+
+    let kek_decoded = hex::decode(prf_kek_hex.trim())
+        .map_err(|_| "PRF KEK is not valid hex".to_string())?;
+    let prf_kek = Zeroizing::new(
+        <[u8; 32]>::try_from(kek_decoded.as_slice())
+            .map_err(|_| "PRF KEK must be exactly 32 bytes".to_string())?,
+    );
+
+    // ECDH → HKDF-SHA256 → AES-256-GCM unwrap of the custodial Ed25519 seed.
+    let seed = vault::unseal_graduation_export(
+        &client_priv,
+        &server_pub,
+        &nonce,
+        &ciphertext,
+        &custodial_did,
+    )?;
+
+    // Persist the persona sealed under the PRF KEK. The plaintext seed never
+    // touches disk and never returns to TypeScript.
+    let mut vault_store = vault::load_vault(&app)?;
+    let record = vault::ingest_graduated_identity(
+        &mut vault_store,
+        &custodial_did,
+        &seed,
+        &prf_kek,
+    )?;
+    vault::save_vault(&app, &vault_store)?;
+
+    // Canonical receipt JSON: alphabetical keys, zero whitespace — byte
+    // compatible with the IdP verifier (`json.dumps(sort_keys=True,
+    // separators=(",", ":"))`).
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Time went backwards".to_string())?
+        .as_secs();
+    let mut canonical_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    canonical_map.insert("action".to_string(), serde_json::json!("graduate"));
+    canonical_map.insert("did".to_string(), serde_json::json!(custodial_did));
+    canonical_map.insert("issued_at".to_string(), serde_json::json!(issued_at));
+    let canonical_str = serde_json::to_string(&canonical_map)
+        .map_err(|e| format!("Failed to serialize graduation receipt: {}", e))?;
+
+    // Sign via the persisted record: proves the ChaCha20Poly1305 sealed blob
+    // round-trips under the PRF KEK before we ever report success.
+    let signing_key = vault::unseal_sovereign_identity(&record, &prf_kek)?;
+    let signature = signing_key.sign(canonical_str.as_bytes());
+
+    Ok(GraduationConfirmPayload {
+        receipt: serde_json::Value::Object(canonical_map.into_iter().collect()),
+        signature: hex::encode(signature.to_bytes()),
+    })
+}
+
+/// Switches the active signer to a graduated sovereign identity and persists
+/// the pointer so it survives restarts.
+#[tauri::command]
+fn activate_sovereign_identity(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+    did: String,
+) -> Result<(), String> {
+    let vault_store = vault::load_vault(&app)?;
+    if vault::get_sovereign_identity(&vault_store, &did).is_none() {
+        return Err(format!("Sovereign identity '{}' not found in vault", did));
+    }
+
+    {
+        let mut active = state.active_did.lock().unwrap();
+        *active = Some(did.clone());
+    }
+
+    let mut prefs = load_preferences(&app);
+    prefs.active_sovereign_did = Some(did);
+    save_preferences(&app, &prefs)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1401,10 +1615,12 @@ pub fn run() {
         auto_start_settings: Mutex::new(HashMap::new()),
     };
     let ws_state = WsState::default();
+    let transit_state = TransitState::default();
 
     let builder = tauri::Builder::default()
         .manage(service_state)
         .manage(ws_state)
+        .manage(transit_state)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1516,6 +1732,10 @@ pub fn run() {
             import_disclosure_card,
             generate_disclosure_card,
             resolve_peer_aliases,
+            derive_prf_identity,
+            generate_transit_keypair,
+            process_graduation_ingest,
+            activate_sovereign_identity,
         ]);
 
     builder
@@ -1615,6 +1835,7 @@ mod tests {
             default_signing_profile: "signing_profile".to_string(),
             auto_sign: true,
             last_active_tab: "keys".to_string(),
+            active_sovereign_did: None,
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");

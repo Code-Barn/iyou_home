@@ -21,6 +21,7 @@ import { Profile, PeerContact } from "../../lib/types";
 import PersonaMatrix from "./PersonaMatrix";
 import ContactList from "./ContactList";
 import DisclosureModal from "./DisclosureModal";
+import GraduationWizard from "./GraduationWizard";
 
 export default function ProjectZero() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -28,6 +29,7 @@ export default function ProjectZero() {
   const [activeDid, setActiveDid] = useState<string | null>(null);
   const [subTab, setSubTab] = useState<"matrix" | "contacts">("matrix");
   const [showDisclosureModal, setShowDisclosureModal] = useState(false);
+  const [showGraduationWizard, setShowGraduationWizard] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -88,56 +90,83 @@ export default function ProjectZero() {
             gap: "1rem",
           }}
         >
-          <div>
+            <div>
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.4rem",
+                  background: "rgba(255, 255, 255, 0.15)",
+                  backdropFilter: "blur(4px)",
+                  padding: "0.25rem 0.75rem",
+                  borderRadius: "20px",
+                  fontSize: "0.8rem",
+                  fontWeight: 600,
+                  marginBottom: "0.5rem",
+                  border: "1px solid rgba(255, 255, 255, 0.2)",
+                }}
+              >
+                🛡️ Air-Gapped Zero Enclave Active
+              </div>
+              <h2
+                style={{
+                  margin: "0 0 0.25rem",
+                  color: "white",
+                  borderBottom: "none",
+                  padding: 0,
+                  fontSize: "1.6rem",
+                }}
+              >
+                Project Zero
+              </h2>
+              <p
+                style={{
+                  margin: 0,
+                  color: "rgba(255, 255, 255, 0.8)",
+                  fontSize: "0.9rem",
+                }}
+              >
+                Multi-Tier Persona Matrix & Cryptographic Peer Trust Enclave
+              </p>
+            </div>
+
             <div
               style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "0.4rem",
-                background: "rgba(255, 255, 255, 0.15)",
-                backdropFilter: "blur(4px)",
-                padding: "0.25rem 0.75rem",
-                borderRadius: "20px",
-                fontSize: "0.8rem",
-                fontWeight: 600,
-                marginBottom: "0.5rem",
-                border: "1px solid rgba(255, 255, 255, 0.2)",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "flex-end",
+                gap: "0.75rem",
               }}
             >
-              🛡️ Air-Gapped Zero Enclave Active
-            </div>
-            <h2
-              style={{
-                margin: "0 0 0.25rem",
-                color: "white",
-                borderBottom: "none",
-                padding: 0,
-                fontSize: "1.6rem",
-              }}
-            >
-              Project Zero
-            </h2>
-            <p
-              style={{
-                margin: 0,
-                color: "rgba(255, 255, 255, 0.8)",
-                fontSize: "0.9rem",
-              }}
-            >
-              Multi-Tier Persona Matrix & Cryptographic Peer Trust Enclave
-            </p>
-          </div>
+              <button
+                type="button"
+                onClick={() => setShowGraduationWizard(true)}
+                style={{
+                  padding: "0.55rem 1.1rem",
+                  background:
+                    "linear-gradient(135deg, #065f46 0%, #059669 100%)",
+                  color: "white",
+                  border: "1px solid rgba(255, 255, 255, 0.3)",
+                  borderRadius: "8px",
+                  fontWeight: 600,
+                  fontSize: "0.85rem",
+                  cursor: "pointer",
+                  boxShadow: "0 2px 6px rgba(0, 0, 0, 0.3)",
+                }}
+              >
+                👑 Claim Sovereign Custody
+              </button>
 
-          <div
-            style={{
-              display: "flex",
-              gap: "1rem",
-              background: "rgba(0, 0, 0, 0.2)",
-              padding: "0.75rem 1rem",
-              borderRadius: "8px",
-              fontSize: "0.85rem",
-            }}
-          >
+              <div
+                style={{
+                  display: "flex",
+                  gap: "1rem",
+                  background: "rgba(0, 0, 0, 0.2)",
+                  padding: "0.75rem 1rem",
+                  borderRadius: "8px",
+                  fontSize: "0.85rem",
+                }}
+              >
             <div style={{ textAlign: "center" }}>
               <div style={{ fontSize: "1.1rem", fontWeight: 700 }}>
                 {anchorCount}
@@ -190,6 +219,7 @@ export default function ProjectZero() {
               <div style={{ fontSize: "0.7rem", color: "#c7d2fe" }}>
                 Contacts
               </div>
+            </div>
             </div>
           </div>
         </div>
@@ -273,6 +303,13 @@ export default function ProjectZero() {
         onClose={() => setShowDisclosureModal(false)}
         profiles={profiles}
         contacts={contacts}
+        onRefresh={fetchData}
+      />
+
+      {/* Sovereign Graduation Wizard */}
+      <GraduationWizard
+        isOpen={showGraduationWizard}
+        onClose={() => setShowGraduationWizard(false)}
         onRefresh={fetchData}
       />
     </div>
