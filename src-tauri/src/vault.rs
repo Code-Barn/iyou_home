@@ -91,9 +91,16 @@ impl VaultStore {
     /// The default public-facing identity: first profile at Level 1+ /
     /// derivation index 1+. Never returns the Level 0 anchor.
     pub fn public_persona(&self) -> Option<&Profile> {
+        // Prefer the canonical primary persona (profile_id == "primary", level 1).
+        // This ensures tombstoned retired personas (level 2) are skipped.
         self.profiles
             .iter()
-            .find(|p| p.level >= 1 || p.derivation_index >= 1)
+            .find(|p| p.profile_id == DEFAULT_PERSONA_PROFILE_ID && p.level == 1)
+            .or_else(|| {
+                self.profiles
+                    .iter()
+                    .find(|p| p.level == 1 && p.derivation_index >= 1)
+            })
             .or_else(|| self.profiles.iter().find(|p| p.derivation_index == 1))
     }
 
@@ -779,6 +786,60 @@ pub fn remove_profile(vault: &mut VaultStore, profile_id: &str) -> Result<(), St
 
 pub fn list_profiles(vault: &VaultStore) -> Vec<Profile> {
     vault.profiles.clone()
+}
+
+/// Break-Glass Emergency Rotation: burn the active Level 1 Public Persona
+/// and mint a fresh one at the next available derivation index. The Level 0
+/// Anchor and all other profiles remain untouched.
+pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> {
+    let seed = decode_root_seed(vault)?;
+
+    // Locate the current active Level 1 profile.
+    let old_index = vault
+        .profiles
+        .iter()
+        .find(|p| p.level == 1 || (p.profile_id == DEFAULT_PERSONA_PROFILE_ID && p.derivation_index != 0))
+        .map(|p| p.derivation_index)
+        .ok_or("No active Level 1 profile to rotate")?;
+
+    // Compute the next uncollided derivation index (>= 2).
+    let max_index = vault
+        .profiles
+        .iter()
+        .map(|p| p.derivation_index)
+        .max()
+        .unwrap_or(1);
+    let new_index = std::cmp::max(2, max_index + 1);
+
+    // Tombstone the old Level 1 profile.
+    for p in vault.profiles.iter_mut() {
+        if p.derivation_index == old_index && (p.level == 1 || p.profile_id == DEFAULT_PERSONA_PROFILE_ID) {
+            p.profile_id = format!("retired_primary_{}", old_index);
+            p.profile_name = format!("{} (Retired)", p.profile_name);
+            p.level = 2;
+            p.is_system_reserved = false;
+        }
+    }
+
+    // Derive the fresh Level 1 identity.
+    let kp = derive_deterministic_keypair(&seed, new_index);
+    let nostr_hex = derive_secp256k1_pubkey_hex(&seed, new_index);
+
+    let new_persona = Profile {
+        profile_id: DEFAULT_PERSONA_PROFILE_ID.into(),
+        profile_name: "Primary Identity".into(),
+        derivation_index: new_index,
+        did: kp.did,
+        credentials: vec![],
+        nostr_pubkey_hex: nostr_hex,
+        level: 1,
+        is_system_reserved: false,
+    };
+
+    vault.profiles.push(new_persona.clone());
+    vault.profiles.sort_by_key(|p| p.derivation_index);
+
+    Ok(new_persona)
 }
 
 // ---------- Stream B: Poll Vote Ledger ----------
@@ -2000,6 +2061,84 @@ mod tests {
 
         // Duplicate DID ingest is rejected structurally.
         assert!(ingest_graduated_identity(&mut vault, did, &seed, &kek).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_rotate_public_persona_advances_index_and_preserves_anchor() {
+        let mut path = temp_dir();
+        path.push("test_vault_rotate.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        let seed = bs58::decode(&vault.root_seed_base58)
+            .into_vec()
+            .expect("Seed should decode");
+
+        // Snapshot the anchor before rotation.
+        let anchor_did = vault.profiles[0].did.clone();
+        let anchor_hex = vault.profiles[0].nostr_pubkey_hex.clone();
+        let anchor_index = vault.profiles[0].derivation_index;
+        assert_eq!(anchor_index, 0);
+        assert!(vault.profiles[0].is_system_reserved);
+
+        // Snapshot the old primary.
+        let old_primary_did = vault.profiles[1].did.clone();
+        assert_eq!(vault.profiles[1].derivation_index, 1);
+        assert_eq!(vault.profiles[1].level, 1);
+
+        // Execute rotation.
+        let new_persona =
+            rotate_public_persona(&mut vault).expect("Rotation must succeed");
+
+        // New persona: fresh derivation index, Level 1, profile_id == "primary".
+        assert_eq!(new_persona.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(new_persona.level, 1);
+        assert!(!new_persona.is_system_reserved);
+        assert!(new_persona.derivation_index >= 2);
+        assert_ne!(new_persona.did, old_primary_did);
+        assert!(new_persona.did.starts_with("did:key:"));
+        assert_eq!(new_persona.nostr_pubkey_hex.len(), 64);
+
+        // Deterministic derivation: re-derive and compare.
+        let expected_kp = derive_deterministic_keypair(&seed, new_persona.derivation_index);
+        assert_eq!(new_persona.did, expected_kp.did);
+        assert_eq!(
+            new_persona.nostr_pubkey_hex,
+            derive_secp256k1_pubkey_hex(&seed, new_persona.derivation_index)
+        );
+
+        // Anchor is untouched.
+        let anchor = &vault.profiles[0];
+        assert_eq!(anchor.profile_id, ANCHOR_PROFILE_ID);
+        assert_eq!(anchor.did, anchor_did);
+        assert_eq!(anchor.nostr_pubkey_hex, anchor_hex);
+        assert_eq!(anchor.derivation_index, 0);
+        assert!(anchor.is_system_reserved);
+
+        // Old primary is tombstoned at Level 2.
+        let tombstoned = vault.profiles.iter().find(|p| p.derivation_index == 1);
+        assert!(tombstoned.is_some());
+        let t = tombstoned.unwrap();
+        assert_eq!(t.level, 2);
+        assert!(t.profile_id.starts_with("retired_primary_"));
+        assert!(t.profile_name.contains("Retired"));
+
+        // Empty-id resolution returns the new primary.
+        let resolved = vault.get_profile_by_id("").expect("Empty id must resolve");
+        assert_eq!(resolved.did, new_persona.did);
+        assert_eq!(resolved.derivation_index, new_persona.derivation_index);
+
+        // get_profile_keypair resolves to the new primary keypair.
+        let kp = get_profile_keypair(&vault, "").expect("Keypair must resolve");
+        assert_eq!(kp.did, new_persona.did);
+
+        // Profiles are sorted by derivation_index.
+        let indices: Vec<u32> = vault.profiles.iter().map(|p| p.derivation_index).collect();
+        let mut sorted = indices.clone();
+        sorted.sort();
+        assert_eq!(indices, sorted);
 
         let _ = fs::remove_file(path);
     }

@@ -1603,6 +1603,34 @@ fn activate_sovereign_identity(
     save_preferences(&app, &prefs)
 }
 
+// ---------- Break-Glass Emergency Rotation ----------
+
+/// Burns the active Level 1 Public Persona and provisions a fresh one at the
+/// next available derivation index. The Level 0 Anchor and all other profiles
+/// remain untouched.
+#[tauri::command]
+fn rotate_primary_persona(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<vault::Profile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let new_profile = vault::rotate_public_persona(&mut vault)?;
+    vault::save_vault(&app, &vault)?;
+
+    // Point the active signer at the new primary.
+    {
+        let mut active = state.active_did.lock().unwrap();
+        *active = Some(new_profile.did.clone());
+    }
+
+    let mut prefs = load_preferences(&app);
+    prefs.active_profile_id = vault::DEFAULT_PERSONA_PROFILE_ID.to_string();
+    prefs.active_sovereign_did = None;
+    save_preferences(&app, &prefs)?;
+
+    Ok(new_profile)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1736,6 +1764,7 @@ pub fn run() {
             generate_transit_keypair,
             process_graduation_ingest,
             activate_sovereign_identity,
+            rotate_primary_persona,
         ]);
 
     builder
