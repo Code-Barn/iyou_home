@@ -174,7 +174,7 @@ function App() {
     <>
       <WsSignPopup />
       <main className="container">
-        <h1>iYou Home</h1>
+        <h1>iyou_home</h1>
 
         <div className="tabs">
           <button

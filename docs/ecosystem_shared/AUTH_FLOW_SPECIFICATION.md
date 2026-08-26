@@ -1,7 +1,7 @@
 # iyou_idp Authentication Flow — Authoritative Specification
 
 This document is the single source of truth for how authentication works in the
-iYou ecosystem. Every satellite relying party **must** conform to the flows and
+iyou_ ecosystem. Every satellite relying party **must** conform to the flows and
 contracts defined here.
 
 ---
@@ -113,18 +113,21 @@ DID verification, the server:
    {
      "success": true,
      "redirect_url": "https://{subdomain}.iyou.me/oidc/callback/?code=...&state=...",
+     "show_legal_disclaimer": true,
      "user": {
        "did": "did:key:z6Mk...",
        "is_new_user": false,
        "is_authenticated": true,
-       "session_id": "..."
+       "session_id": "...",
+       "show_legal_disclaimer": true
      }
    }
    ```
 
-6. The browser JS navigates the current window **inline** to `redirect_url`
-   via `window.location.href` — no new tab is opened. The satellite app
-   receives the authorization code at its callback URL in the same tab.
+6. **Legal Disclaimer Gate:**
+   - If `show_legal_disclaimer` is `true`, a blocking modal overlay ("Sovereign Network Access & Legal Notice") is presented establishing user cryptographic liability, node operator neutrality, and zero-tolerance content policies.
+   - The user acknowledges the notice and can optionally uncheck "Show this legal disclaimer on next login" to persist a bypass on future logins.
+   - Upon acknowledgment, the browser JS navigates the current window (`_self`) inline to `redirect_url` via `window.location.href`. If `show_legal_disclaimer` was already `false`, the redirect executes immediately. No new tab is opened; the satellite app receives the authorization code at its callback URL in the same tab.
 
 ### 4.3 Token Exchange (Satellite Server → IDP)
 
@@ -213,7 +216,7 @@ Returns standard OIDC claims plus custom DID claims (see Section 7).
 **Steps:**
 1. JS calls `POST /auth/challenge/` → receives UUID, stored in Redis for 300s
 2. JS opens WebSocket to `IDP_HOME_WS_URL`, sends `{type: "sign", challenge}`
-3. iYou Home prompts user to confirm, signs the challenge with their Ed25519 key
+3. iyou_home prompts user to confirm, signs the challenge with their Ed25519 key
 4. Returns a W3C Verifiable Presentation over WebSocket
 5. JS calls `POST /auth/verify/` with `{verifiable_presentation, challenge, next_url}`
 6. Server verifies VP → creates User → evaluates admin posture → login → builds OIDC code
@@ -596,7 +599,7 @@ At `/oidc/callback/`:
 |----------|---------|---------|
 | `IDP_BASE_URL` | OIDC issuer URL | `https://idp.iyou.me` |
 | `IDP_WUN_URL` | Default post-auth redirect | `https://wun.iyou.me` |
-| `IDP_HOME_URL` | iYou Home desktop URL | `https://home.iyou.me` |
+| `IDP_HOME_URL` | iyou_home desktop URL | `https://home.iyou.me` |
 | `IDP_HOME_WS_URL` | WebSocket endpoint for Tier 3 | `wss://home.iyou.me:9001/` |
 | `IDP_SECRET_KEY` | Django secret key | (random string) |
 | `IDP_DEBUG` | Django DEBUG mode | `False` in production |

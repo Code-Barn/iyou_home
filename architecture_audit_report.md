@@ -1,4 +1,4 @@
-# iYou Home Architecture Audit Report
+# iyou_home Architecture Audit Report
 
 ## Executive Summary
 

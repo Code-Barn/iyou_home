@@ -1,4 +1,4 @@
-# iYou Home: Sovereign Local Service Hub
+# iyou_home: Sovereign Local Service Hub
 
 A Tauri v2 desktop companion that manages local sovereign services (Nostr relay, Blossom, XMPP) and provides a **Signature Bridge** for browser-based identity providers (WUN, Polly) to sign Verifiable Credentials, Nostr events, and OIDC challenges using a local Ed25519 vault.
 

@@ -70,7 +70,7 @@ async function postToIdp<T>(
   const csrfToken = readCsrfToken();
   if (!csrfToken) {
     throw new Error(
-      "No CSRF token found in cookies. Please sign in to your iYou IdP account in this environment first.",
+      "No CSRF token found in cookies. Please sign in to your iyou_idp account in this environment first.",
     );
   }
 

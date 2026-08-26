@@ -146,11 +146,11 @@ async function registerAndAssertPrfSeed(
   const creation = (await navigator.credentials.create({
     publicKey: {
       challenge: randomBytes(32),
-      rp: { name: "iYou Home Sovereign Enclave" },
+      rp: { name: "iyou_home Sovereign Enclave" },
       user: {
         id: userId,
         name: "iyou-home-prf-seed",
-        displayName: "iYou Home — Local PRF Seed Credential",
+        displayName: "iyou_home — Local PRF Seed Credential",
       },
       timeout: PRF_ASSERTION_TIMEOUT_MS,
       pubKeyCredParams: [
