@@ -66,6 +66,9 @@ pub struct UserPreferences {
     /// precedence over `active_profile_id` during DID resolution.
     #[serde(default)]
     pub active_sovereign_did: Option<String>,
+    /// Unix timestamp of the last successful Sync-to-Home operation.
+    #[serde(default)]
+    pub last_synced_at: u64,
 }
 
 impl Default for UserPreferences {
@@ -76,6 +79,7 @@ impl Default for UserPreferences {
             auto_sign: false,
             last_active_tab: "services".to_string(),
             active_sovereign_did: None,
+            last_synced_at: 0,
         }
     }
 }
@@ -119,6 +123,20 @@ pub struct TransitKeypairPublic {
 pub struct GraduationConfirmPayload {
     pub receipt: serde_json::Value,
     pub signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SyncSummary {
+    pub events_ingested: usize,
+    pub blobs_mirrored: usize,
+    pub last_synced_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SyncStatus {
+    pub last_synced_at: u64,
+    pub local_notes_count: usize,
+    pub local_blobs_count: usize,
 }
 
 impl Default for WsState {
@@ -1031,7 +1049,7 @@ fn preferences_path(app: &AppHandle) -> PathBuf {
     path
 }
 
-fn load_preferences(app: &AppHandle) -> UserPreferences {
+pub(crate) fn load_preferences(app: &AppHandle) -> UserPreferences {
     let path = preferences_path(app);
     if !path.exists() {
         let prefs = UserPreferences::default();
@@ -1049,7 +1067,7 @@ fn load_preferences(app: &AppHandle) -> UserPreferences {
         })
 }
 
-fn save_preferences(app: &AppHandle, prefs: &UserPreferences) -> Result<(), String> {
+pub(crate) fn save_preferences(app: &AppHandle, prefs: &UserPreferences) -> Result<(), String> {
     let path = preferences_path(app);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1130,6 +1148,26 @@ fn sync_poll_ledger(
 }
 
 // ---------- Credential Vault Commands ----------
+
+#[tauri::command]
+fn import_verifiable_credential(
+    app: AppHandle,
+    profile_id: String,
+    vc_payload: String,
+) -> Result<vault::Profile, String> {
+    if profile_id.is_empty() {
+        return Err("profile_id must not be empty".to_string());
+    }
+
+    let vc_json: serde_json::Value = serde_json::from_str(&vc_payload)
+        .map_err(|e| format!("Invalid JSON payload: {}", e))?;
+
+    let mut vault = vault::load_vault(&app).map_err(|e| e.to_string())?;
+    let updated_profile = vault::add_credential_to_profile(&mut vault, &profile_id, vc_json)?;
+    vault::save_vault(&app, &vault)?;
+
+    Ok(updated_profile)
+}
 
 #[tauri::command]
 fn save_credential(
@@ -1631,10 +1669,233 @@ fn rotate_primary_persona(
     Ok(new_profile)
 }
 
+// ---------- Vault Disaster Recovery ----------
+
+#[tauri::command]
+fn reveal_master_seed(app: AppHandle) -> Result<String, String> {
+    let vault = vault::load_vault(&app)?;
+    vault::reveal_root_seed_hex(&vault)
+}
+
+#[tauri::command]
+fn create_vault_backup(app: AppHandle, password: String) -> Result<Vec<u8>, String> {
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let vault = vault::load_or_bootstrap_vault(&app)
+        .map_err(|e| format!("Failed to load vault: {}", e))?;
+    vault::export_vault_backup(&vault, &app_data, &password)
+}
+
+#[tauri::command]
+fn restore_vault_backup(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+    backup_bytes: Vec<u8>,
+    password: String,
+) -> Result<bool, String> {
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let result = vault::import_vault_backup(&app_data, &backup_bytes, &password)?;
+
+    // Reload vault into memory so the running state stays consistent.
+    if let Ok(v) = vault::load_vault(&app) {
+        if let Some(profile) = v.public_persona() {
+            let mut active = state.active_did.lock().unwrap();
+            *active = Some(profile.did.clone());
+        }
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn revoke_all_sessions(
+    app: AppHandle,
+    idp_url: Option<String>,
+) -> Result<String, String> {
+    let vault = vault::load_vault(&app).map_err(|e| e.to_string())?;
+    let envelope = vault::build_session_revocation_payload(&vault)?;
+
+    let target_url = idp_url
+        .unwrap_or_else(|| "https://iyou.me/api/auth/revoke-all/".to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let response = client
+        .post(&target_url)
+        .json(&envelope)
+        .send()
+        .await
+        .map_err(|e| format!("Network error contacting IdP ({}): {}", target_url, e))?;
+
+    let status = response.status();
+    if status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "All active web sessions revoked successfully.".to_string());
+        Ok(body)
+    } else {
+        let err_text = response.text().await.unwrap_or_default();
+        Err(format!("IdP returned error ({}): {}", status, err_text))
+    }
+}
+
+// ---------- sync-to-home ----------
+
+fn count_files_in_dir(dir: &std::path::Path) -> usize {
+    if !dir.exists() {
+        return 0;
+    }
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+#[tauri::command]
+fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
+    let prefs = load_preferences(&app);
+    let last_synced_at = prefs.last_synced_at;
+
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+
+    // Count local Nostr events
+    let db_path = app_data.join("nostr_events.db");
+    let local_notes_count = if db_path.exists() {
+        match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+                nostr_relay::count_events(&db).unwrap_or(0)
+            }
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
+    // Count local Blossom blobs
+    let blobs_dir = app_data.join("blobs");
+    let local_blobs_count = count_files_in_dir(&blobs_dir);
+
+    Ok(SyncStatus {
+        last_synced_at,
+        local_notes_count,
+        local_blobs_count,
+    })
+}
+
+#[tauri::command]
+async fn trigger_manual_sync(
+    app: AppHandle,
+    remote_relay_url: Option<String>,
+    remote_blossom_url: Option<String>,
+) -> Result<SyncSummary, String> {
+    let _ = remote_relay_url;
+    let remote_blossom = remote_blossom_url
+        .unwrap_or_else(|| "https://cdn.iyou.me".to_string());
+
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+
+    let blobs_dir = app_data.join("blobs");
+    let _ = std::fs::create_dir_all(&blobs_dir);
+
+    // Fetch manifest of blob hashes from the remote Blossom server's
+    // Blossom List endpoint (BUD-03). If unreachable, degrade gracefully.
+    let blobs_mirrored = match fetch_and_mirror_blobs(&remote_blossom, &blobs_dir).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Sync: blob mirror failed (offline?): {}", e);
+            0
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let mut prefs = load_preferences(&app);
+    prefs.last_synced_at = now;
+    let _ = save_preferences(&app, &prefs);
+
+    Ok(SyncSummary {
+        events_ingested: 0, // Event ingestion is handled by bridge SYNC_TO_HOME_REQUEST
+        blobs_mirrored,
+        last_synced_at: now,
+    })
+}
+
+/// Fetch the blob hash manifest from a remote Blossom server and mirror
+/// any missing blobs locally. Returns the count of newly mirrored blobs.
+async fn fetch_and_mirror_blobs(
+    remote_url: &str,
+    blobs_dir: &PathBuf,
+) -> Result<usize, String> {
+    // Try the Blossom List endpoint (BUD-03) first
+    let list_url = format!("{}/list", remote_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(&list_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach remote Blossom: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Remote Blossom returned {}", response.status()));
+    }
+
+    let items: Vec<serde_json::Value> = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse blob manifest: {}", e))?;
+
+    let mut mirrored = 0usize;
+    for item in items {
+        if let Some(hash) = item["sha256"].as_str() {
+            if let Ok(true) = blossom::mirror_blob_from_remote(hash, remote_url, blobs_dir).await {
+                // Only count if the file is new (was just written)
+                let path = blobs_dir.join(hash);
+                // Simple heuristic: file mod time < 5 seconds ago = newly written
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed.as_secs() < 5 {
+                                mirrored += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(mirrored)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install the process-level crypto provider for rustls 0.23+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let initial_services = HashMap::new();
     let service_state = ServiceState {
         services: Mutex::new(initial_services),
@@ -1750,6 +2011,7 @@ pub fn run() {
             calculate_vote_merkle_root,
             sync_poll_ledger,
             save_credential,
+            import_verifiable_credential,
             get_credentials,
             store_credential,
             delete_credential,
@@ -1765,6 +2027,12 @@ pub fn run() {
             process_graduation_ingest,
             activate_sovereign_identity,
             rotate_primary_persona,
+            reveal_master_seed,
+            create_vault_backup,
+            restore_vault_backup,
+            revoke_all_sessions,
+            get_sync_status,
+            trigger_manual_sync,
         ]);
 
     builder
@@ -1865,6 +2133,7 @@ mod tests {
             auto_sign: true,
             last_active_tab: "keys".to_string(),
             active_sovereign_did: None,
+            last_synced_at: 1756241000,
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");
@@ -1878,6 +2147,7 @@ mod tests {
         assert_eq!(loaded.default_signing_profile, "signing_profile");
         assert!(loaded.auto_sign);
         assert_eq!(loaded.last_active_tab, "keys");
+        assert_eq!(loaded.last_synced_at, 1756241000);
 
         let _ = std::fs::remove_file(path);
     }
@@ -1889,6 +2159,7 @@ mod tests {
         assert_eq!(prefs.default_signing_profile, "primary");
         assert!(!prefs.auto_sign);
         assert_eq!(prefs.last_active_tab, "services");
+        assert_eq!(prefs.last_synced_at, 0);
     }
 
     #[test]

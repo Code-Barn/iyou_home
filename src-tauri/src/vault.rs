@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use k256::schnorr::SigningKey as SecpSigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -185,6 +185,208 @@ pub fn decode_root_seed(vault: &VaultStore) -> Result<Vec<u8>, String> {
     bs58::decode(&vault.root_seed_base58)
         .into_vec()
         .map_err(|_| "Invalid root seed encoding".to_string())
+}
+
+/// Decode the base58 root seed and return its lowercase hex representation.
+pub fn reveal_root_seed_hex(vault: &VaultStore) -> Result<String, String> {
+    let seed = decode_root_seed(vault)?;
+    Ok(hex::encode(seed))
+}
+
+/// Derive an AES-256-GCM key from a password using HKDF-SHA256.
+fn derive_backup_key(password: &str, salt: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), password.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"iyou-home/backup/v1", &mut key)
+        .expect("HKDF expand should not fail for 32-byte output");
+    key
+}
+
+/// Pack the in-memory vault and data directory companion files into a plaintext JSON payload.
+fn pack_backup_payload(vault: &VaultStore, app_data_dir: &Path) -> Result<String, String> {
+    let vault_val = serde_json::to_value(vault)
+        .map_err(|e| format!("Failed to serialize vault: {}", e))?;
+
+    let contacts_path = app_data_dir.join("contacts.json");
+    let contacts_val: serde_json::Value = match fs::read(&contacts_path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!([]))
+        }
+        _ => serde_json::json!([]),
+    };
+
+    let prefs_path = app_data_dir.join("preferences.json");
+    let prefs_val: serde_json::Value = match fs::read(&prefs_path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    };
+
+    let exported_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let payload = serde_json::json!({
+        "vault": vault_val,
+        "contacts": contacts_val,
+        "preferences": prefs_val,
+        "manifest": {
+            "version": "2.0",
+            "exported_at": exported_at,
+            "app_version": "2.0.0"
+        }
+    });
+
+    serde_json::to_string(&payload).map_err(|e| format!("Failed to serialize payload: {}", e))
+}
+
+/// Encrypt a plaintext string with AES-256-GCM using a password-derived key.
+fn encrypt_payload(plaintext: &str, password: &str) -> Result<Vec<u8>, String> {
+    let mut salt = [0u8; 32];
+    OsRng.fill_bytes(&mut salt);
+
+    let key = derive_backup_key(password, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| format!("Failed to create cipher: {}", e))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+
+    let envelope = serde_json::json!({
+        "salt_b64": base64.encode(salt),
+        "nonce_b64": base64.encode(nonce_bytes),
+        "ciphertext_b64": base64.encode(&ciphertext),
+    });
+
+    serde_json::to_vec(&envelope).map_err(|e| format!("Failed to serialize envelope: {}", e))
+}
+
+/// Decrypt an AES-256-GCM envelope and return the plaintext.
+fn decrypt_payload(encrypted: &[u8], password: &str) -> Result<String, String> {
+    let envelope: serde_json::Value = serde_json::from_slice(encrypted)
+        .map_err(|e| format!("Invalid backup format: {}", e))?;
+
+    let salt_b64 = envelope["salt_b64"]
+        .as_str()
+        .ok_or("Missing salt_b64 in backup envelope")?;
+    let nonce_b64 = envelope["nonce_b64"]
+        .as_str()
+        .ok_or("Missing nonce_b64 in backup envelope")?;
+    let ciphertext_b64 = envelope["ciphertext_b64"]
+        .as_str()
+        .ok_or("Missing ciphertext_b64 in backup envelope")?;
+
+    let salt: [u8; 32] = base64
+        .decode(salt_b64)
+        .map_err(|e| format!("Invalid salt encoding: {}", e))?
+        .try_into()
+        .map_err(|_| "Salt must be 32 bytes".to_string())?;
+    let nonce_bytes: [u8; 12] = base64
+        .decode(nonce_b64)
+        .map_err(|e| format!("Invalid nonce encoding: {}", e))?
+        .try_into()
+        .map_err(|_| "Nonce must be 12 bytes".to_string())?;
+    let ciphertext = base64
+        .decode(ciphertext_b64)
+        .map_err(|e| format!("Invalid ciphertext encoding: {}", e))?;
+
+    let key = derive_backup_key(password, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| format!("Failed to create cipher: {}", e))?;
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_ref())
+        .map_err(|_| "Decryption failed — wrong password or corrupted backup".to_string())?;
+
+    String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8 in payload: {}", e))
+}
+
+/// Export the vault, contacts, and preferences as an encrypted `.iyoubackup` archive.
+///
+/// Returns the raw bytes of the encrypted JSON envelope ready for file download.
+pub fn export_vault_backup(
+    vault: &VaultStore,
+    app_data_dir: &Path,
+    password: &str,
+) -> Result<Vec<u8>, String> {
+    if password.is_empty() {
+        return Err("Password cannot be empty".to_string());
+    }
+    let plaintext = pack_backup_payload(vault, app_data_dir)?;
+    encrypt_payload(&plaintext, password)
+}
+
+/// Restore vault, contacts, and preferences from an encrypted `.iyoubackup` archive.
+///
+/// Decrypts the payload, validates the manifest, and atomically writes each file
+/// to the destination directory.
+pub fn import_vault_backup(
+    app_data_dir: &Path,
+    backup_bytes: &[u8],
+    password: &str,
+) -> Result<bool, String> {
+    if password.is_empty() {
+        return Err("Password cannot be empty".to_string());
+    }
+
+    let plaintext = decrypt_payload(backup_bytes, password)?;
+    let payload: serde_json::Value = serde_json::from_str(&plaintext)
+        .map_err(|e| format!("Invalid payload structure: {}", e))?;
+
+    // Validate manifest
+    let manifest = payload
+        .get("manifest")
+        .ok_or("Backup missing manifest.json")?;
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    if version != "2.0" {
+        return Err(format!(
+            "Unsupported backup version '{}'. Expected '2.0'.",
+            version
+        ));
+    }
+
+    fs::create_dir_all(app_data_dir)
+        .map_err(|e| format!("Failed to create data directory: {}", e))?;
+
+    // Atomic restore via .tmp staging (vault is base64 encoded by save_vault_inner)
+    if let Some(vault_val) = payload.get("vault") {
+        let vault_store: VaultStore = serde_json::from_value(vault_val.clone())
+            .map_err(|e| format!("Failed to parse vault structure: {}", e))?;
+        save_vault_inner(&app_data_dir.join("vault.json"), &vault_store)?;
+    }
+
+    if let Some(contacts_val) = payload.get("contacts") {
+        let contacts_bytes = serde_json::to_vec_pretty(contacts_val)
+            .map_err(|e| format!("Failed to serialize contacts: {}", e))?;
+        let tmp = app_data_dir.join("contacts.json.tmp");
+        atomic_write_bytes(&tmp, &contacts_bytes)?;
+        let dest = app_data_dir.join("contacts.json");
+        fs::rename(&tmp, &dest)
+            .map_err(|e| format!("Failed to finalize contacts.json: {}", e))?;
+    }
+
+    if let Some(prefs_val) = payload.get("preferences") {
+        let prefs_bytes = serde_json::to_vec_pretty(prefs_val)
+            .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+        let tmp = app_data_dir.join("preferences.json.tmp");
+        atomic_write_bytes(&tmp, &prefs_bytes)?;
+        let dest = app_data_dir.join("preferences.json");
+        fs::rename(&tmp, &dest)
+            .map_err(|e| format!("Failed to finalize preferences.json: {}", e))?;
+    }
+
+    Ok(true)
 }
 
 pub fn derive_secp256k1_secret_key(root_seed: &[u8], derivation_index: u32) -> [u8; 32] {
@@ -842,6 +1044,116 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
     Ok(new_persona)
 }
 
+/// Validate and ingest a W3C Verifiable Credential into a specified profile.
+/// Ensures standard W3C structural integrity (`@context`, `type`, `issuer`,
+/// `credentialSubject`, and cryptographic `proof`) before persisting.
+pub fn add_credential_to_profile(
+    vault: &mut VaultStore,
+    profile_id: &str,
+    vc_json: serde_json::Value,
+) -> Result<Profile, String> {
+    // 1. Validate W3C structural integrity
+    if vc_json.get("@context").is_none() {
+        return Err("Missing required W3C '@context' property".to_string());
+    }
+
+    let types = match vc_json.get("type") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<&str>>(),
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        _ => return Err("Missing or invalid 'type' property".to_string()),
+    };
+
+    if !types.contains(&"VerifiableCredential") {
+        return Err("Credential 'type' must include 'VerifiableCredential'".to_string());
+    }
+
+    let issuer_did = match vc_json.get("issuer") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(obj)) => obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => return Err("Missing required 'issuer' property".to_string()),
+    };
+    if issuer_did.is_empty() {
+        return Err("Invalid 'issuer' property".to_string());
+    }
+
+    let credential_subject = match vc_json.get("credentialSubject") {
+        Some(serde_json::Value::Object(obj)) => obj,
+        _ => return Err("Missing required 'credentialSubject' property".to_string()),
+    };
+
+    let proof = match vc_json.get("proof") {
+        Some(serde_json::Value::Object(obj)) if !obj.is_empty() => obj,
+        _ => return Err("Missing required 'proof' object with cryptographic signature".to_string()),
+    };
+    let _ = proof;
+
+    // Extract identifier
+    let vc_id = vc_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4()));
+
+    let subject_did = credential_subject
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let credential_type = types
+        .into_iter()
+        .find(|t| *t != "VerifiableCredential")
+        .unwrap_or("VerifiableCredential")
+        .to_string();
+
+    let fidelity_score = credential_subject
+        .get("fidelityScore")
+        .or_else(|| vc_json.get("fidelityScore"))
+        .and_then(|v| v.as_f64());
+
+    let expiration_date = vc_json
+        .get("expirationDate")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let raw_payload = vc_json.to_string();
+
+    let vault_credential = VaultCredential {
+        vc_id: vc_id.clone(),
+        issuer_did,
+        subject_did,
+        credential_type,
+        fidelity_score,
+        expiration_date,
+        raw_payload,
+    };
+
+    let profile = vault
+        .profiles
+        .iter_mut()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+    if let Some(existing) = profile
+        .credentials
+        .iter_mut()
+        .find(|c| c.vc_id == vc_id)
+    {
+        *existing = vault_credential;
+    } else {
+        profile.credentials.push(vault_credential);
+    }
+
+    Ok(profile.clone())
+}
+
 // ---------- Stream B: Poll Vote Ledger ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -983,10 +1295,163 @@ pub fn calculate_vote_merkle_root(records: &[VoteRecord]) -> String {
     hex::encode(layer[0])
 }
 
+/// Build and sign a sovereign Global Session Revocation payload.
+/// Uses the Level 1 Public Persona's Ed25519 key to sign a structured revocation
+/// envelope destined for the Identity Provider (`iyou_idp`).
+pub fn build_session_revocation_payload(vault: &VaultStore) -> Result<serde_json::Value, String> {
+    let persona = vault
+        .public_persona()
+        .ok_or_else(|| "No active Level 1 public persona found in vault".to_string())?;
+
+    let seed = bs58::decode(&vault.root_seed_base58)
+        .into_vec()
+        .map_err(|_| "Invalid root seed encoding".to_string())?;
+
+    let keypair = derive_deterministic_keypair(&seed, persona.derivation_index);
+
+    let mut nonce_bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = hex::encode(nonce_bytes);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    let payload = serde_json::json!({
+        "action": "GLOBAL_SESSION_REVOKE",
+        "sub": keypair.did,
+        "timestamp": timestamp,
+        "nonce": nonce,
+    });
+
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("Failed to serialize revocation payload: {}", e))?;
+
+    let signature = keypair.signing_key.sign(&payload_bytes);
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    Ok(serde_json::json!({
+        "payload": payload,
+        "signature": sig_hex,
+        "did": keypair.did,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signature, Verifier};
     use std::env::temp_dir;
+
+    #[test]
+    fn test_add_credential_to_profile_valid_and_deduplicated() {
+        let mut path = temp_dir();
+        path.push("test_vc_import_vault.json");
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let vc_json = serde_json::json!({
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "id": "urn:uuid:test-credential-1234",
+            "type": ["VerifiableCredential", "CivicVotingCredential"],
+            "issuer": "did:key:z6MkqGieZ3...",
+            "issuanceDate": "2026-08-26T00:00:00Z",
+            "expirationDate": "2027-08-26T00:00:00Z",
+            "credentialSubject": {
+                "id": "did:key:z6MkuP1...",
+                "votingDistrict": "Global-01",
+                "fidelityScore": 3.0
+            },
+            "proof": {
+                "type": "Ed25519Signature2020",
+                "proofValue": "z3m..."
+            }
+        });
+
+        // 1. Ingest into primary profile
+        let profile = add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, vc_json.clone())
+            .expect("Should import valid VC");
+        assert_eq!(profile.credentials.len(), 1);
+        assert_eq!(profile.credentials[0].vc_id, "urn:uuid:test-credential-1234");
+        assert_eq!(profile.credentials[0].credential_type, "CivicVotingCredential");
+        assert_eq!(profile.credentials[0].fidelity_score, Some(3.0));
+
+        // 2. Re-ingesting same VC updates in place (deduplication)
+        let mut vc_updated = vc_json.clone();
+        vc_updated["credentialSubject"]["fidelityScore"] = serde_json::json!(2.5);
+        let profile2 = add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, vc_updated)
+            .expect("Should update existing VC");
+        assert_eq!(profile2.credentials.len(), 1);
+        assert_eq!(profile2.credentials[0].fidelity_score, Some(2.5));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_add_credential_to_profile_validation_failures() {
+        let mut path = temp_dir();
+        path.push("test_vc_invalid_vault.json");
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        // Missing @context
+        let missing_context = serde_json::json!({
+            "type": ["VerifiableCredential"],
+            "issuer": "did:key:z1",
+            "credentialSubject": {},
+            "proof": { "sig": "..." }
+        });
+        assert!(add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, missing_context).is_err());
+
+        // Missing proof
+        let missing_proof = serde_json::json!({
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "type": ["VerifiableCredential"],
+            "issuer": "did:key:z1",
+            "credentialSubject": {}
+        });
+        assert!(add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, missing_proof).is_err());
+
+        // Missing type
+        let missing_type = serde_json::json!({
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "issuer": "did:key:z1",
+            "credentialSubject": {},
+            "proof": { "sig": "..." }
+        });
+        assert!(add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, missing_type).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_build_session_revocation_payload_signature_valid() {
+        let mut path = temp_dir();
+        path.push("test_revocation_vault.json");
+        let vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let envelope = build_session_revocation_payload(&vault).expect("Should build revocation payload");
+        assert_eq!(envelope["payload"]["action"].as_str().unwrap(), "GLOBAL_SESSION_REVOKE");
+        assert!(envelope["payload"]["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(envelope["payload"]["nonce"].as_str().unwrap().len(), 32);
+
+        let did = envelope["did"].as_str().unwrap();
+        assert_eq!(envelope["payload"]["sub"].as_str().unwrap(), did);
+
+        // Verify the Ed25519 signature
+        let sig_hex = envelope["signature"].as_str().unwrap();
+        let sig_bytes = hex::decode(sig_hex).expect("Valid signature hex");
+        let sig = Signature::from_slice(&sig_bytes).expect("Valid signature structure");
+
+        let payload_bytes = serde_json::to_vec(&envelope["payload"]).expect("Valid payload serialization");
+
+        let persona = vault.public_persona().unwrap();
+        let seed = bs58::decode(&vault.root_seed_base58).into_vec().unwrap();
+        let kp = derive_deterministic_keypair(&seed, persona.derivation_index);
+
+        kp.verifying_key.verify(&payload_bytes, &sig).expect("Signature must verify");
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn test_derivation_is_deterministic() {
@@ -2141,5 +2606,200 @@ mod tests {
         assert_eq!(indices, sorted);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_reveal_master_seed_matches_decoded_root_seed() {
+        let seed = vec![0x42u8; 32];
+        let vault = VaultStore {
+            root_seed_base58: bs58::encode(&seed).into_string(),
+            profiles: vec![],
+            sovereign_identities: vec![],
+        };
+
+        let hex = reveal_root_seed_hex(&vault).expect("Should reveal seed");
+        assert_eq!(hex.len(), 64, "Hex seed must be 64 characters (32 bytes)");
+        assert_eq!(hex, hex::encode(&seed), "Hex must match the original seed bytes");
+
+        let decoded = decode_root_seed(&vault).expect("Should decode seed");
+        assert_eq!(decoded, seed);
+    }
+
+    #[test]
+    fn test_backup_export_and_restore_round_trip() {
+        let tmp = std::env::temp_dir().join("iyou_test_backup_roundtrip");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Create a vault with 2 profiles
+        let seed = vec![0xA1u8; 32];
+        let mut vault = VaultStore {
+            root_seed_base58: bs58::encode(&seed).into_string(),
+            profiles: vec![],
+            sovereign_identities: vec![],
+        };
+        vault.profiles = initial_profiles(&seed);
+
+        // Write vault.json
+        let vault_json = serde_json::to_string_pretty(&vault).unwrap();
+        fs::write(tmp.join("vault.json"), &vault_json).unwrap();
+
+        // Write a mock contacts.json
+        let contacts = serde_json::json!({
+            "contacts": [{
+                "peer_id": "test-peer-1",
+                "display_name": "Alice",
+                "trust_level": "Level1",
+                "disclosed_aliases": [],
+                "attestation_receipt": null,
+                "created_at": 1700000000,
+                "updated_at": 1700000000
+            }]
+        });
+        fs::write(
+            tmp.join("contacts.json"),
+            serde_json::to_string_pretty(&contacts).unwrap(),
+        )
+        .unwrap();
+
+        // Write a mock preferences.json
+        let prefs = serde_json::json!({
+            "active_profile_id": "primary",
+            "default_signing_profile": "primary",
+            "auto_sign": false,
+            "last_active_tab": "enclave"
+        });
+        fs::write(
+            tmp.join("preferences.json"),
+            serde_json::to_string_pretty(&prefs).unwrap(),
+        )
+        .unwrap();
+
+        // Export backup
+        let password = "correct-horse-battery";
+        let backup_bytes = export_vault_backup(&vault, &tmp, password)
+            .expect("Export should succeed");
+        assert!(!backup_bytes.is_empty(), "Backup should not be empty");
+
+        // Restore into an empty directory
+        let restore_dir = std::env::temp_dir().join("iyou_test_backup_restore");
+        let _ = fs::remove_dir_all(&restore_dir);
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let result = import_vault_backup(&restore_dir, &backup_bytes, password);
+        assert!(result.is_ok(), "Restore should succeed: {:?}", result.err());
+
+        // Verify restored vault (uses canonical load_vault_from_path)
+        let restored_vault = load_vault_from_path(&restore_dir.join("vault.json"))
+            .expect("Restored vault must load cleanly");
+        assert_eq!(restored_vault.profiles.len(), vault.profiles.len());
+        assert_eq!(restored_vault.root_seed_base58, vault.root_seed_base58);
+        for (orig, restored) in vault.profiles.iter().zip(restored_vault.profiles.iter()) {
+            assert_eq!(orig.profile_id, restored.profile_id);
+            assert_eq!(orig.did, restored.did);
+        }
+
+        // Verify restored contacts
+        let restored_contacts: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(restore_dir.join("contacts.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored_contacts["contacts"][0]["display_name"],
+            "Alice"
+        );
+
+        // Verify restored preferences
+        let restored_prefs: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(restore_dir.join("preferences.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_prefs["active_profile_id"], "primary");
+
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&restore_dir);
+    }
+
+    #[test]
+    fn test_backup_export_with_missing_or_empty_companion_files() {
+        let tmp = std::env::temp_dir().join("iyou_test_backup_empty_companions");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Create empty contacts.json file and omit preferences.json completely
+        fs::write(tmp.join("contacts.json"), b"").unwrap();
+
+        let vault = VaultStore {
+            root_seed_base58: bs58::encode(vec![0x77u8; 32]).into_string(),
+            profiles: vec![Profile {
+                profile_id: "primary".to_string(),
+                profile_name: "Primary Persona".to_string(),
+                derivation_index: 1,
+                did: "did:key:z6MkkTest".to_string(),
+                credentials: vec![],
+                nostr_pubkey_hex: "0123456789abcdef".to_string(),
+                level: 1,
+                is_system_reserved: false,
+            }],
+            sovereign_identities: vec![],
+        };
+
+        let backup_bytes = export_vault_backup(&vault, &tmp, "safe-password")
+            .expect("Export with missing/empty companion files should succeed");
+        assert!(!backup_bytes.is_empty());
+
+        // Restore into a fresh target
+        let restore_dir = std::env::temp_dir().join("iyou_test_backup_empty_companions_restore");
+        let _ = fs::remove_dir_all(&restore_dir);
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let res = import_vault_backup(&restore_dir, &backup_bytes, "safe-password");
+        assert!(res.is_ok());
+
+        let restored_vault = load_vault_from_path(&restore_dir.join("vault.json")).unwrap();
+        assert_eq!(restored_vault.profiles.len(), 1);
+
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&restore_dir);
+    }
+
+    #[test]
+    fn test_backup_restore_fails_with_invalid_password() {
+        let tmp = std::env::temp_dir().join("iyou_test_backup_badpw");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Create a minimal vault
+        let vault = VaultStore {
+            root_seed_base58: bs58::encode(vec![0x55u8; 32]).into_string(),
+            profiles: vec![],
+            sovereign_identities: vec![],
+        };
+
+        let backup_bytes = export_vault_backup(&vault, &tmp, "correct-password")
+            .expect("Export should succeed");
+
+        // Try to restore with wrong password
+        let restore_dir = std::env::temp_dir().join("iyou_test_backup_badpw_restore");
+        let _ = fs::remove_dir_all(&restore_dir);
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let result = import_vault_backup(&restore_dir, &backup_bytes, "wrong-password");
+        assert!(result.is_err(), "Restore with wrong password should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Decryption failed") || err.contains("wrong password"),
+            "Error should indicate wrong password: {}",
+            err
+        );
+
+        // Verify nothing was written
+        assert!(
+            !restore_dir.join("vault.json").exists(),
+            "vault.json should not exist after failed restore"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&restore_dir);
     }
 }
