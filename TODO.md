@@ -1,23 +1,112 @@
 # TODO — iyou_home (Tauri/Rust Local Enclave)
 
-**Orchestrated from:** `omni_social` (central hub)
-**Last synced:** 2026-07-13
+**Codified from:** `docs/RELEASE_SPEC_V2.md`  
+**Last updated:** 2026-08-26
 
 ---
 
-## Layer 0 — Ecosystem Standardization
+## Day 1 Release Roadmap
 
-> iyou_home is a Tauri/Rust desktop app — no Django templates or ecosystem bar includes.
-
-- [x] PKCE ingress verified (consumer of iyou_idp OIDC) — **Done 2026-07-13**
-
-## Layer 2 — Security Hardening
-
-- [ ] **[Critical] SEC-002 — Remove bundled Let's Encrypt private key:** `production.key` embedded via `env!()` in the Tauri binary. Replace with ephemeral, locally-generated self-signed certs trusted via local CA authority. Prevents extraction and local MITM on `wss://home.iyou.me:9001`.
-- [ ] **[High] SEC-003 — did_rust submodule pinning:** Enforce commit-hash alignment between `iyou_home/libs/did_rust/` and `iyou_idp/crates/did_rust/` via CI. Prevents silent `serde_json` serialization drift.
-- [ ] **[High] SEC-004 — Central SPOF mitigation:** Investigate offline-capable auth fallback when iyou_idp is unreachable.
-- [ ] **[Medium] SEC-005 — Polling → Push migration:** Replace 1-second HTTP polling in verification loops with WebSocket or SSE push model. Reduces network chatter and challenge-replay attack window.
-- [ ] **[Medium] SEC-006 — DNS hijack mitigation:** Evaluate certificate pinning or mTLS for `wss://home.iyou.me:9001` to prevent loopback traffic interception.
-- [ ] **Ecosystem Doc Organization:** Standardize repo layout to match iyou_wun precedent — root: `AGENT.md`, `README.md`; `docs/`: `DEVELOPER_GUIDE.md`, `DESIGN_DOC.md`, `TODO.md`, `ecosystem_shared/`, `archive/`.
+Execution phases ordered by dependency. Each phase produces a shippable increment.
 
 ---
+
+### Phase 1: Shell Harmonization & Tab Reordering
+
+> Unify the global frame, reorder tabs by user importance, and gate developer controls.
+
+- [x] **1.1** Add persistent top status bar with live daemon indicators (Bridge, Nostr, Blossom) and active persona pill — visible on all tabs
+- [x] **1.2** Expand container width from `800px` to `1024px` (`max-w-5xl`)
+- [x] **1.3** Reorder tabs: Enclave → Credentials → Vault → Services → Governance → Signer
+- [x] **1.4** Set default active tab to `enclave` on launch
+- [x] **1.5** Extract `ServiceSwitchPanel` from `App.tsx` into `src/components/ServiceSwitchPanel.tsx`
+- [x] **1.6** Remove "Coming Soon" entries (IPFS Cloud Archive, Polly) from service list
+- [x] **1.7** Hide port numbers behind "Technical Details" disclosure in Services tab
+- [x] **1.8** Add service descriptions under each daemon name
+- [x] **1.9** Add Developer Mode toggle (footer or `Cmd+Shift+D`) — gates Tab 6 visibility and debug controls
+- [x] **1.10** Hide "Auto-sign (dev)" checkbox in `WsSignPopup.tsx` behind dev mode
+- [x] **1.11** Gate `console.log` statements in `WsSignPopup.tsx` behind `import.meta.env.DEV`
+- [x] **1.12** Add icons to all tab labels for visual consistency
+- [x] **1.13** Migrate Enclave design tokens (tier colors, status colors, surface colors) into CSS custom properties in `:root`
+- [x] **1.14** Migrate Tabs 1–5 to use shared CSS design tokens
+
+**Verification:** `npx tsc --noEmit` clean, `npm run build` succeeds, `npx vitest run` 22/22 pass. Status bar renders on all tabs. Tab order matches spec. Dev mode toggle hides/shows Tab 6.
+
+---
+
+### Phase 2: Vault Disaster Recovery Engine
+
+> Build encrypted backup/restore and master seed reveal for identity continuity.
+
+- [x] **2.1** Rename tab from "Backup & Recovery" to "Vault & Recovery"; update heading to "Identity Vault"
+- [x] **2.2** Replace "Generate did:key" button with "Create New Vault" + explanatory copy
+- [x] **2.3** Remove multi-persona redirect banner from `KeysManager.tsx`
+- [x] **2.4** Show persona context (name, level, index) alongside active DID display
+- [x] **2.5** Implement Master Seed Reveal modal: typed confirmation (`REVEAL MY SEED`), 10-second countdown, one-time display, auto-dismiss after 30s
+- [x] **2.6** Implement `.iyoubackup` encrypted archive export: password-protected (HKDF-SHA256 + AES-256-GCM) packaging of `vault.json` + `contacts.json` + `preferences.json` + manifest
+- [x] **2.7** Implement `.iyoubackup` import: password-derived decryption, manifest validation, user-confirmed merge/replace
+- [x] **2.8** Move seed import form (DID + Base58 key) behind "Advanced" disclosure toggle
+- [x] **2.9** Add unit tests for `.iyoubackup` round-trip: create → export → fresh import → verify profiles match
+
+**Verification:** `cargo test` 60/60 pass. Seed reveal modal requires typed confirmation. Export produces valid `.iyoubackup`; import on fresh vault restores all profiles and contacts.
+
+---
+
+### Phase 3: Governance & Merkle Consensus Station
+
+> Replace the developer IPFS viewer with a user-facing poll integrity auditor.
+
+- [x] **3.1** Create `src/components/GovernanceAuditor.tsx` with plain-language UI
+- [x] **3.2** Implement source selector: IPFS CID (manual) or Blossom BUD-01 vote snapshot (browse/paste)
+- [x] **3.3** Implement snapshot fetch and poll summary display (title, vote count, asserted Merkle root)
+- [x] **3.4** Implement local Merkle root computation via `invoke("calculate_vote_merkle_root")`
+- [x] **3.5** Implement audit result display: green "Verified" badge (match) or red "Tampered" alert with root comparison
+- [x] **3.6** Rename tab from "IPFS Cloud Archive" to "Governance Auditor" with ballot icon
+- [x] **3.7** Deprecate `IpfsArchiveViewer.tsx` (remove import from `App.tsx`, retain file for reference)
+- [x] **3.8** Add persona selector to `TrustAssets.tsx` for browsing credentials across all personas
+- [x] **3.9** Add credential type search/filter to `TrustAssets.tsx`
+- [x] **3.10** Improve TrustAssets empty state with "How to get credentials" guidance
+
+**Verification:** Governance tab renders with CID input and snapshot display. Merkle audit produces match/mismatch result. TrustAssets shows persona dropdown and filters credentials by type.
+
+---
+
+### Phase 4: Sync-to-Home Local Mirroring Pipeline
+
+> Enable offline-first data residency by mirroring remote events into local daemons.
+
+- [x] **4.1** Implement Bridge batch event ingestion: fetch remote Nostr events (Kinds 1, 1063, 1111, 30023) from upstream relay and write to local SQLite (`:9003`)
+- [x] **4.2** Implement Bridge media blob mirroring: fetch content-addressed blobs from upstream Blossom and store locally (`:9002`)
+- [x] **4.3** Add sync status indicator to Services tab and Global Status Bar: "Last synced: {timestamp}"
+- [x] **4.4** Implement incremental sync: track high-water mark timestamp, ingest missing events/blobs
+- [x] **4.5** Add error handling for upstream unreachable: graceful degradation with local cache fallback
+
+**Verification:** After sync, local Nostr relay contains remote events. Local Blossom contains mirrored blobs. Sync status visible in Services tab and Global Status Bar.
+
+---
+
+### Phase 5: Global Session Revocation & Universal Credential Ingest
+
+> Sovereign session kill-switch and W3C VC structural validation import.
+
+- [x] **5.1** Implement `build_session_revocation_payload` in `vault.rs`: generates signed `GLOBAL_SESSION_REVOKE` token using Level 1 Ed25519 key
+- [x] **5.2** Add `revoke_all_sessions` Tauri IPC command: HTTP POST signed revocation envelope to `https://iyou.me/api/auth/revoke-all/`
+- [x] **5.3** Add "Active Web Sessions" Kill-Switch card and confirmation modal in `KeysManager.tsx`
+- [x] **5.4** Add Sovereign Data Redundancy banner to `KeysManager.tsx` explaining local export, home Blossom node, and public Nostr relays
+- [x] **5.5** Move manual vault re-initialization into high-friction collapsed Danger Zone at bottom of `KeysManager.tsx`
+- [x] **5.6** Implement `add_credential_to_profile` in `vault.rs`: verifies W3C structural integrity (`@context`, `type`, `issuer`, `credentialSubject`, `proof`) with deduplication
+- [x] **5.7** Add `import_verifiable_credential` Tauri IPC command
+- [x] **5.8** Add `[ + Import Credential ]` modal in `TrustAssets.tsx` with JSON textarea and `.json` file upload support
+
+**Verification:** `cargo test` 66/66 pass, `npx vitest run` 30/30 pass. Revocation dispatches signed envelope. W3C VCs import cleanly with validation.
+
+---
+
+## Standing Security Backlog
+
+Carried forward from previous TODO. Not phased — to be addressed as capacity allows.
+
+- [x] **SEC-002** — Runtime domain certificate loading (`production.crt` / `production.key`) from `{app_data}/certs/` with ephemeral self-signed in-memory fallback.
+- [ ] **SEC-003** — Enforce `did_rust` submodule commit-hash alignment between `iyou_home` and `iyou_idp` via CI.
+- [ ] **SEC-006** — Evaluate certificate pinning or mTLS for `wss://home.iyou.me:9001`.
+- [x] **Ecosystem Doc Organization** — Standardize repo layout: root `AGENT.md`, `README.md`, `HOME_DEVELOPER_GUIDE.md`; `docs/`: `HOME_DEVELOPER_GUIDE.md`, `RELEASE_SPEC_V2.md`.

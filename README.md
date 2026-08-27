@@ -1,71 +1,78 @@
-# iyou_home: Sovereign Local Service Hub
+# iyou_home: Sovereign Local Service Hub & Identity Enclave (v2.0)
 
-A Tauri v2 desktop companion that manages local sovereign services (Nostr relay, Blossom, XMPP) and provides a **Signature Bridge** for browser-based identity providers (WUN, Polly) to sign Verifiable Credentials, Nostr events, and OIDC challenges using a local Ed25519 vault.
+`iyou_home` is a zero-custody, local-first identity enclave, Personal Data Store (PDS), and service switchboard built on Tauri v2 and Rust. It secures private key seeds, manages multi-tier persona derivations, orchestrates local P2P microservices, and serves cryptographic signatures to satellite web applications over a secure local WebSocket bridge (`wss://home.iyou.me:9001`).
 
-## Features
+---
 
-- **Signature Bridge** (port 9001, always on) — WebSocket gateway for cross-origin signing: `sign`, `sign_event`, `sign_credential`, `ping`.
-- **Nostr Relay** (port 9003) — NIP-01 relay with SQLite storage, Ed25519 signature verification, vault-pubkey whitelist.
-- **Blossom Server** (port 9002) — BUD-01 blob store with SHA-256 content addressing.
-- **XMPP Chat** (port 5222) — Minimal embedded XMPP server with SASL PLAIN, TCP and WebSocket transports.
-- **Auto-Start** — Service preferences persisted to `{app_data}/auto_start.json`, restored on launch.
-- **Vault Identity** — Ed25519 keypair stored locally, never exposed to the frontend context.
-- **PNA Compliant** — `Access-Control-Allow-Private-Network: true` on all preflight responses (required by Safari/Chrome).
+## Key Features
 
-## Signature Bridge Protocol
+- **🛡️ Project Zero Enclave**: Multi-tier persona management (Level 0 Air-Gapped Anchor, Level 1 Public Persona, Level 2+ Contextual Burners), Break-Glass persona rotation, and Contact Enclave with 3-tier trust badges.
+- **📜 Trust Assets & Credential Vault**: Sovereign W3C Verifiable Credential repository with persona filtering, keyword search, and universal JSON/file import with W3C structural validation.
+- **🔑 Disaster Recovery & Global Revocation**: Master seed reveal (with typed confirmation & auto-dismiss), password-encrypted `.iyoubackup` export/restore, and Global Session Revocation Kill-Switch (`GLOBAL_SESSION_REVOKE`).
+- **⚙️ Sovereign Service Switchboard**:
+  - **Signature Bridge** (`127.0.0.1:9001` / `wss://home.iyou.me:9001`) — Cross-origin signing gateway for `iyou_wun`, `iyou_poly`, `iyou_talk`.
+  - **Nostr Relay** (`127.0.0.1:9003`) — Embedded NIP-01 SQLite relay with BIP-340 Schnorr signature verification.
+  - **Blossom Server** (`127.0.0.1:9002`) — BUD-01 content-addressed blob server.
+  - **XMPP Mesh** (`127.0.0.1:5222`) — Embedded local XMPP communication mesh.
+- **🔄 Sync-to-Home Local Mirroring Pipeline**: Ingests batch Nostr events and content-addressed Blossom media blobs from upstream servers into local residency.
+- **🗳️ Governance Auditor**: Cold poll integrity auditor with local second-preimage resistant SHA-256 Merkle root computation over IPFS and Blossom BUD-01 vote snapshots.
 
-All messages are JSON over WebSocket to `ws://127.0.0.1:9001`.
+---
 
-| Type | Incoming | Outgoing |
-|---|---|---|
-| `sign` | `{"type":"sign","challenge":"..."}` | `{"type":"signature","vp":{...}}` |
-| `sign_event` | `{"type":"sign_event","event":{...}}` | `{"type":"signed_event","event":{...}}` |
-| `sign_credential` | `{"type":"sign_credential","credential":{...},"holder_did":"..."}` | `{"type":"signed_credential","vc":{...}}` |
-| `ping` | `{"type":"ping"}` | `{"type":"pong"}` |
+## Prerequisites
 
-- `holder_did` is optional — defaults to the vault DID when omitted.
-- `sign_credential` credential type array is parsed for a human-readable title (e.g. `"family_membership"` → `"Family Membership Signing Request"`).
+- **Rust & Cargo**: `>= 1.78.0`
+- **Node.js & npm**: `>= 20.x`
+- **Tauri v2 CLI**: System build tools (Xcode CLI on macOS, build-essential / webkit2gtk on Linux)
 
-## Networking
-
-**All services bind to `127.0.0.1` only.** No public or LAN exposure.
-
-Private Network Access (PNA) headers (`Access-Control-Allow-Private-Network: true`) are injected into every OPTIONS preflight and WebSocket upgrade response, required by Safari and Chrome when a public HTTPS origin connects to a local endpoint.
-
-## Identity Model
-
-**Passwords are deprecated.** The primary authentication flow is the OIDC/DID loop through the Signature Bridge. The XMPP service uses a local auto-generated password file for SASL PLAIN transport auth only — all higher-level identity operations use the vault Ed25519 keypair.
-
-## Project Structure
-
-```
-src-tauri/src/
-├── lib.rs          — Core: WS dispatcher, Tauri commands, auto-start, shutdown
-├── vault.rs        — Ed25519 keypair persistence (loaded DID)
-├── blossom.rs      — BUD-01 blob server on 127.0.0.1:9002
-├── nostr_relay.rs  — NIP-01 WebSocket relay on 127.0.0.1:9003
-└── prosody.rs      — Minimal XMPP server on 127.0.0.1:5222
-
-src/
-├── App.tsx                     — Service switch panel UI
-├── components/
-│   ├── WsSignPopup.tsx         — Signing approval modal
-│   └── SovereignSigner.tsx     — Manual challenge paste UI
-└── __tests__/
-    └── App.test.tsx
-```
+---
 
 ## Getting Started
 
-See [HOME_DEVELOPER_GUIDE.md](./HOME_DEVELOPER_GUIDE.md) for setup instructions, architecture details, and known risks.
-
-## did_rust Parity (SEC-003)
-
-`libs/did_rust` is a git submodule of the shared crypto library. Its pin must always match what `iyou_idp` and `iyou_mobile` consume, otherwise signature verification and handshake behavior diverge between services.
-
 ```bash
-git submodule update --remote --merge libs/did_rust    # sync to did_rust main
-bash ../did_rust/scripts/check_did_submodules.sh       # verify parity (exit 0)
+# 1. Clone the repository
+git clone https://github.com/byers-brands/iyou_home.git
+cd iyou_home
+
+# 2. Install frontend dependencies
+npm install
+
+# 3. Launch the Tauri desktop app in development mode
+npm run tauri dev
 ```
 
-Invariants and troubleshooting: `../did_rust/docs/strategy/SECURITY_HARDENING.md`.
+---
+
+## Verification & Testing
+
+```bash
+# Execute backend Rust unit and integration tests (66 tests)
+cargo test --manifest-path src-tauri/Cargo.toml
+
+# Run TypeScript typechecking & Vite production build
+npx tsc --noEmit && npm run build
+
+# Run Vitest test runner (30 unit tests)
+npx vitest run
+```
+
+---
+
+## Network Architecture & Invariants
+
+All local daemons bind strictly to IPv4 loopback `127.0.0.1`. No service ever listens on `0.0.0.0` or public network interfaces.
+
+| Service | Port | Protocol | Binding | Purpose |
+|---|---|---|---|---|
+| **Signature Bridge** | `9001` | WSS (TLS) | `127.0.0.1` | Cross-origin signing and satellite bridge |
+| **Blossom Server** | `9002` | HTTP / BUD-01 | `127.0.0.1` | Local SHA-256 media and file blob store |
+| **Nostr Relay** | `9003` | WS / NIP-01 | `127.0.0.1` | Local SQLite-backed Nostr event relay |
+| **XMPP Mesh** | `5222` | WSS (TLS) | `127.0.0.1` | P2P mesh chat and real-time signaling |
+
+---
+
+## Documentation
+
+- [AGENT.md](./AGENT.md) — Root operational contract, invariants, and Tauri IPC command registry.
+- [HOME_DEVELOPER_GUIDE.md](./docs/HOME_DEVELOPER_GUIDE.md) — Comprehensive technical reference, cryptographic derivation engine, and wire protocol details.
+- [TODO.md](./TODO.md) — Release roadmap and completed implementation phases.
