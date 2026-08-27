@@ -339,3 +339,129 @@ fn query_events(db: &Arc<Mutex<rusqlite::Connection>>, filters: &[Value]) -> Vec
 pub fn derive_vault_pubkey_from_verifying(vk: &VerifyingKey) -> Result<String, String> {
     Ok(base64.encode(vk.to_bytes()))
 }
+
+/// Batch-ingest Nostr events into the local SQLite store without signature
+/// verification. Used by the Sync-to-Home pipeline for events already
+/// validated by the upstream source. Returns the count of events written.
+pub fn ingest_batch_events(
+    events: &[Value],
+    db: &Arc<Mutex<rusqlite::Connection>>,
+) -> Result<usize, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let mut ingested = 0u32;
+
+    for event in events {
+        let id = match event["id"].as_str() {
+            Some(v) => v,
+            None => continue,
+        };
+        let pubkey = match event["pubkey"].as_str() {
+            Some(v) => v,
+            None => continue,
+        };
+        let kind = match event["kind"].as_i64() {
+            Some(v) => v,
+            None => continue,
+        };
+        let created_at = match event["created_at"].as_i64() {
+            Some(v) => v,
+            None => continue,
+        };
+        let tags = match event["tags"].as_array() {
+            Some(v) => v,
+            None => continue,
+        };
+        let content = match event["content"].as_str() {
+            Some(v) => v,
+            None => continue,
+        };
+        let sig = match event["sig"].as_str() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // INSERT OR IGNORE ensures idempotent writes on repeated syncs
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                pubkey,
+                created_at,
+                kind,
+                serde_json::to_string(tags).unwrap_or_default(),
+                content,
+                sig
+            ],
+        );
+
+        if let Ok(changed) = result {
+            if changed > 0 {
+                ingested += 1;
+            }
+        }
+    }
+
+    Ok(ingested as usize)
+}
+
+/// Return the total number of events stored in the local relay.
+pub fn count_events(db: &Arc<Mutex<rusqlite::Connection>>) -> Result<usize, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(count as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ingest_batch_events_idempotent() {
+        let db_conn = rusqlite::Connection::open_in_memory().unwrap();
+        db_conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                tags TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sig TEXT NOT NULL
+            );",
+        ).unwrap();
+        let db = Arc::new(Mutex::new(db_conn));
+
+        let events = vec![
+            serde_json::json!({
+                "id": "e111111111111111111111111111111111111111111111111111111111111111",
+                "pubkey": "p111111111111111111111111111111111111111111111111111111111111111",
+                "created_at": 1700000000,
+                "kind": 1,
+                "tags": [],
+                "content": "Hello Sovereign World",
+                "sig": "s111111111111111111111111111111111111111111111111111111111111111"
+            }),
+            serde_json::json!({
+                "id": "e222222222222222222222222222222222222222222222222222222222222222",
+                "pubkey": "p111111111111111111111111111111111111111111111111111111111111111",
+                "created_at": 1700000001,
+                "kind": 30023,
+                "tags": [["d", "article-slug"]],
+                "content": "# Longform post",
+                "sig": "s222222222222222222222222222222222222222222222222222222222222222"
+            }),
+        ];
+
+        let ingested = ingest_batch_events(&events, &db).unwrap();
+        assert_eq!(ingested, 2);
+        assert_eq!(count_events(&db).unwrap(), 2);
+
+        // Re-ingest the exact same events — should be a no-op (0 newly written)
+        let reingested = ingest_batch_events(&events, &db).unwrap();
+        assert_eq!(reingested, 0);
+        assert_eq!(count_events(&db).unwrap(), 2);
+    }
+}

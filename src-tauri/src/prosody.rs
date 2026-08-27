@@ -64,9 +64,10 @@ pub async fn start_xmpp_server(
             return;
         }
     };
-    let config = match ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
+    let config = match ServerConfig::builder_with_provider(Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())
+        .and_then(|b| b.with_no_client_auth().with_single_cert(certs, key).map_err(|e| e.to_string()))
     {
         Ok(c) => c,
         Err(e) => {

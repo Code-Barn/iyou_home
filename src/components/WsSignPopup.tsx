@@ -64,7 +64,7 @@ export default function WsSignPopup() {
   useEffect(() => {
     const channel = new Channel<string>();
     channel.onmessage = (data) => {
-      console.log("REACT: Received message via direct channel pipe:", data);
+      if (import.meta.env.DEV) console.log("REACT: Received message via direct channel pipe:", data);
       try {
         const parsed = JSON.parse(data);
         const profile_id = parsed.profile_id || undefined;
@@ -94,7 +94,7 @@ export default function WsSignPopup() {
       }
     };
     invoke("register_challenge_pipe", { channel });
-    console.log("REACT: Challenge channel registered with backend");
+    if (import.meta.env.DEV) console.log("REACT: Challenge channel registered with backend");
 
     // Load profiles and active profile
     loadProfiles();
@@ -135,7 +135,7 @@ export default function WsSignPopup() {
         console.warn("REACT: Auto-sign blocked for Anchor Level 0 identity");
         return;
       }
-      console.log("REACT: Auto-sign enabled, approving immediately");
+      if (import.meta.env.DEV) console.log("REACT: Auto-sign enabled, approving immediately");
       handleResponse(true);
     }
   }, [autoSign, request, profiles, activeProfileId, isProcessing]);
@@ -145,7 +145,7 @@ export default function WsSignPopup() {
     setIsProcessing(true);
 
     try {
-      console.log("[TAURI_SIGN] Triggering response submission...");
+      if (import.meta.env.DEV) console.log("[TAURI_SIGN] Triggering response submission...");
 
       if (request.type === "sign_event") {
         await invoke("submit_ws_event_response", {
@@ -153,7 +153,7 @@ export default function WsSignPopup() {
           approved,
           profileId: request.profile_id || null,
         });
-        console.log("REACT: submit_ws_event_response succeeded");
+        if (import.meta.env.DEV) console.log("REACT: submit_ws_event_response succeeded");
       } else if (request.type === "sign_credential") {
         await invoke("submit_ws_credential_response", {
           credentialJson: JSON.stringify(request.credential),
@@ -161,7 +161,7 @@ export default function WsSignPopup() {
           approved,
           profileId: request.profile_id || null,
         });
-        console.log("REACT: submit_ws_credential_response succeeded");
+        if (import.meta.env.DEV) console.log("REACT: submit_ws_credential_response succeeded");
       } else if (request.type === "POLY_CREDENTIAL_REQUEST") {
         await invoke("submit_ws_credential_presentation", {
           credentialType: request.required_credential_type,
@@ -169,7 +169,7 @@ export default function WsSignPopup() {
           approved,
           profileId: request.profile_id || null,
         });
-        console.log("REACT: submit_ws_credential_presentation succeeded");
+        if (import.meta.env.DEV) console.log("REACT: submit_ws_credential_presentation succeeded");
       } else {
         await invoke("submit_ws_response", {
           id: "",
@@ -177,10 +177,10 @@ export default function WsSignPopup() {
           approved,
           profileId: request.profile_id || null,
         });
-        console.log("REACT: submit_ws_response succeeded");
+        if (import.meta.env.DEV) console.log("REACT: submit_ws_response succeeded");
       }
 
-      console.log("[TAURI_SIGN] Submission accepted. Draining network buffers...");
+      if (import.meta.env.DEV) console.log("[TAURI_SIGN] Submission accepted. Draining network buffers...");
       // Enforce a secure 250ms async hold window to allow the Rust TCP stack to flush cleanly
       await new Promise((resolve) => setTimeout(resolve, 250));
     } catch (err) {
@@ -399,21 +399,23 @@ export default function WsSignPopup() {
             alignItems: "center",
           }}
         >
-          <label
-            style={{
-              fontSize: "0.8rem",
-              display: "flex",
-              alignItems: "center",
-              gap: "0.3rem",
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={autoSign}
-              onChange={(e) => setAutoSign(e.target.checked)}
-            />
-            Auto-sign (dev)
-          </label>
+          {import.meta.env.DEV && (
+            <label
+              style={{
+                fontSize: "0.8rem",
+                display: "flex",
+                alignItems: "center",
+                gap: "0.3rem",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={autoSign}
+                onChange={(e) => setAutoSign(e.target.checked)}
+              />
+              Auto-sign (dev)
+            </label>
+          )}
           <div style={{ display: "flex", gap: "1rem" }}>
             <button
               onClick={() => handleResponse(false)}

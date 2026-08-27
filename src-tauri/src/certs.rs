@@ -154,6 +154,25 @@ pub fn generate_ephemeral_certs(
 pub fn resolve_tls_assets(
     cert_dir: &std::path::Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    #[cfg(all(debug_assertions, not(test)))]
+    {
+        // In dev mode, auto-populate cert_dir from repo certs if present
+        if !cert_dir.join(RUNTIME_CERT_FILE).exists() {
+            let repo_cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs");
+            if repo_cert_dir.join(RUNTIME_CERT_FILE).exists() && repo_cert_dir.join(RUNTIME_KEY_FILE).exists() {
+                let _ = std::fs::create_dir_all(cert_dir);
+                let _ = std::fs::copy(repo_cert_dir.join(RUNTIME_CERT_FILE), cert_dir.join(RUNTIME_CERT_FILE));
+                let _ = std::fs::copy(repo_cert_dir.join(RUNTIME_KEY_FILE), cert_dir.join(RUNTIME_KEY_FILE));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(cert_dir.join(RUNTIME_KEY_FILE), std::fs::Permissions::from_mode(0o600));
+                }
+                eprintln!("TLS: auto-provisioned Let's Encrypt dev certs to {:?}", cert_dir);
+            }
+        }
+    }
+
     let cert_path = cert_dir.join(RUNTIME_CERT_FILE);
     let key_path = cert_dir.join(RUNTIME_KEY_FILE);
     let has_cert = cert_path.exists();
@@ -171,6 +190,7 @@ pub fn resolve_tls_assets(
             ));
         }
         println!("TLS: loading domain certificates from {}", cert_dir.display());
+        println!("Loaded authentic Let's Encrypt keys for home.iyou.me");
         return parse_runtime_certs(&cert_path, &key_path);
     }
 

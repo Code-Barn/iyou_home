@@ -19,5 +19,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Install the process-level crypto provider for rustls 0.23+
+    let _ = rustls::crypto::ring::default_provider().install_default();
     iyou_home_lib::run()
 }

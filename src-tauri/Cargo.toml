@@ -27,8 +27,8 @@ serde_json = "1"
 did_rust = { path = "../libs/did_rust" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
-tokio-rustls = "0.26"
-rustls = "0.23"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
 futures-util = "0.3"
@@ -50,3 +50,4 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 aes-gcm = "0.10"
 zeroize = "1"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }

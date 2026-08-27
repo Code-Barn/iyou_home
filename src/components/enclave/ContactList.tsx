@@ -26,6 +26,13 @@ interface ContactListProps {
   onOpenDisclosure: () => void;
 }
 
+function isInnerCircle(trustLevel: TrustLevel | string): boolean {
+  const norm = String(trustLevel || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  return norm === "level0" || norm.includes("inner");
+}
+
 function truncateString(str: string, lead = 16, tail = 8): string {
   if (!str) return "";
   if (str.length <= lead + tail + 3) return str;
@@ -94,6 +101,27 @@ export default function ContactList({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Masking & Reveal State (Level 0 peers only)
+  const [revealedPeers, setRevealedPeers] = useState<Set<string>>(new Set());
+  const [pendingCopyContact, setPendingCopyContact] = useState<PeerContact | null>(null);
+
+  const formatMaskedKey = (key: string): string => {
+    if (!key) return "";
+    if (key.startsWith("did:")) {
+      return `${key.slice(0, 12)}••••••••••••••••••••••••••••••••${key.slice(-4)}`;
+    }
+    return `${key.slice(0, 8)}••••••••••••••••••••••••••••••••${key.slice(-4)}`;
+  };
+
+  const togglePeerReveal = (peerId: string) => {
+    setRevealedPeers((prev) => {
+      const next = new Set(prev);
+      if (next.has(peerId)) next.delete(peerId);
+      else next.add(peerId);
+      return next;
+    });
+  };
 
   const copyToClipboard = async (text: string, label: string) => {
     try {
@@ -291,6 +319,26 @@ export default function ContactList({
         </div>
       )}
 
+      {/* Level 0 Routing Micro-copy */}
+      {contacts.some((c) => isInnerCircle(c.trust_level)) && (
+        <div
+          style={{
+            padding: "0.5rem 0.75rem",
+            background: "#eff6ff",
+            border: "1px solid #bfdbfe",
+            borderRadius: "6px",
+            fontSize: "0.78rem",
+            color: "#1e40af",
+            marginBottom: "1rem",
+            lineHeight: 1.45,
+          }}
+        >
+          Inner Circle (Level 0) peer keys are masked by default and require
+          confirmation to copy. Live communications route through your{" "}
+          <strong>Level 1 persona</strong>.
+        </div>
+      )}
+
       {contacts.length === 0 ? (
         <div
           style={{
@@ -429,17 +477,36 @@ export default function ContactList({
                         color: "#4b5563",
                       }}
                     >
-                      <span title={contact.peer_id}>
-                        {truncateString(contact.peer_id, 24, 10)}
+                      <span title={isInnerCircle(contact.trust_level) && !revealedPeers.has(contact.peer_id) ? "Hidden — click 🙈 to reveal" : contact.peer_id}>
+                        {isInnerCircle(contact.trust_level) && !revealedPeers.has(contact.peer_id)
+                          ? formatMaskedKey(contact.peer_id)
+                          : truncateString(contact.peer_id, 24, 10)}
                       </span>
+                      {isInnerCircle(contact.trust_level) && (
+                        <button
+                          type="button"
+                          onClick={() => togglePeerReveal(contact.peer_id)}
+                          style={{
+                            padding: "0.1rem 0.4rem",
+                            fontSize: "0.7rem",
+                          }}
+                          title={revealedPeers.has(contact.peer_id) ? "Hide peer key" : "Reveal peer key"}
+                        >
+                          {revealedPeers.has(contact.peer_id) ? "🙈" : "👁️"}
+                        </button>
+                      )}
                       <button
                         type="button"
-                        onClick={() =>
-                          copyToClipboard(
-                            contact.peer_id,
-                            `peer-id-${contact.peer_id}`,
-                          )
-                        }
+                        onClick={() => {
+                          if (isInnerCircle(contact.trust_level)) {
+                            setPendingCopyContact(contact);
+                          } else {
+                            copyToClipboard(
+                              contact.peer_id,
+                              `peer-id-${contact.peer_id}`,
+                            );
+                          }
+                        }}
                         style={{
                           padding: "0.1rem 0.4rem",
                           fontSize: "0.7rem",
@@ -777,6 +844,122 @@ export default function ContactList({
               </button>
               <button type="button" onClick={() => setViewingReceipt(null)}>
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Level 0 Peer Key Copy Confirmation Modal */}
+      {pendingCopyContact && (
+        <div
+          className="modal-overlay"
+          onClick={() => setPendingCopyContact(null)}
+        >
+          <div
+            className="modal-content"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              maxWidth: "480px",
+              border: "1px solid #fecaca",
+              boxShadow: "0 4px 24px rgba(220,38,38,0.12)",
+            }}
+          >
+            <h3 style={{ marginTop: 0, color: "#dc2626" }}>
+              ⚠️ Copy Inner Circle Key
+            </h3>
+            <p style={{ fontSize: "0.9rem", color: "#374151", lineHeight: 1.5 }}>
+              You are about to copy the <strong>Level 0 (Inner Circle)</strong> peer
+              identifier for{" "}
+              <strong>{pendingCopyContact.display_name}</strong>:
+            </p>
+            <pre
+              style={{
+                background: "#fef2f2",
+                padding: "0.75rem",
+                borderRadius: "6px",
+                fontSize: "0.8rem",
+                fontFamily: "monospace",
+                wordBreak: "break-all",
+                border: "1px solid #fecaca",
+                color: "#991b1b",
+              }}
+            >
+              {pendingCopyContact.peer_id}
+            </pre>
+            <div
+              style={{
+                background: "#fffbeb",
+                border: "1px solid #fde68a",
+                borderRadius: "6px",
+                padding: "0.75rem",
+                marginBottom: "1rem",
+                fontSize: "0.8rem",
+                color: "#92400e",
+                lineHeight: 1.5,
+              }}
+            >
+              This is an Inner Circle key. Handle with care — do not paste into
+              group chats, public channels, or untrusted applications.
+            </div>
+            <div
+              style={{
+                background: "#eff6ff",
+                border: "1px solid #bfdbfe",
+                borderRadius: "6px",
+                padding: "0.75rem",
+                marginBottom: "1rem",
+                fontSize: "0.8rem",
+                color: "#1e40af",
+                lineHeight: 1.5,
+              }}
+            >
+              <strong>Note:</strong> Live communications with this peer always route
+              through your <strong>Level 1 persona</strong> — this Inner Circle key
+              is for out-of-band verification only.
+            </div>
+            <div
+              style={{
+                display: "flex",
+                gap: "0.75rem",
+                justifyContent: "flex-end",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setPendingCopyContact(null)}
+                style={{
+                  padding: "0.5rem 1rem",
+                  background: "#f3f4f6",
+                  color: "#374151",
+                  border: "1px solid #d1d5db",
+                  borderRadius: "6px",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const contact = pendingCopyContact;
+                  setPendingCopyContact(null);
+                  if (contact) {
+                    await copyToClipboard(
+                      contact.peer_id,
+                      `peer-id-${contact.peer_id}`,
+                    );
+                  }
+                }}
+                style={{
+                  padding: "0.5rem 1rem",
+                  background: "#dc2626",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  fontWeight: 600,
+                }}
+              >
+                Copy Key
               </button>
             </div>
           </div>

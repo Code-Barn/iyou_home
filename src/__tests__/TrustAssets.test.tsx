@@ -33,12 +33,16 @@ const mockProfiles = [
     profile_name: "Primary Identity",
     derivation_index: 0,
     did: mockDid,
+    level: 1,
+    is_system_reserved: false,
   },
   {
     profile_id: "alt",
     profile_name: "Alt Persona",
     derivation_index: 1,
     did: "did:key:zalt789",
+    level: 2,
+    is_system_reserved: false,
   },
 ];
 
@@ -238,13 +242,13 @@ describe("TrustAssets", () => {
     });
 
     const inspectButton = screen.getByText(
-      "Inspect Cryptographic Evidence Document",
+      "View Raw Credential",
     );
     fireEvent.click(inspectButton);
 
     await waitFor(() => {
       expect(
-        screen.getByText("Cryptographic Evidence Document"),
+        screen.getByText("Raw Credential"),
       ).toBeInTheDocument();
     });
     expect(
@@ -256,7 +260,7 @@ describe("TrustAssets", () => {
 
     await waitFor(() => {
       expect(
-        screen.queryByText("Cryptographic Evidence Document"),
+        screen.queryByText("Raw Credential"),
       ).not.toBeInTheDocument();
     });
   });

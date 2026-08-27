@@ -431,6 +431,83 @@ where
                     });
                 } else if json["type"] == "OMNI_SIGN_REQUEST" {
                     handle_omni_sign_request(json, &app_handle, &response_tx).await;
+                } else if json["type"] == "SYNC_TO_HOME_REQUEST" {
+                    // Sync-to-Home: batch-ingest Nostr events and mirror blobs
+                    let events = json["events"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let blob_hashes = json["blob_hashes"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let source_blossom_url = json["source_blossom_url"]
+                        .as_str()
+                        .unwrap_or("https://cdn.iyou.me")
+                        .to_string();
+
+                    // Resolve paths from AppHandle
+                    let app_data = match app_handle.path().app_local_data_dir() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("Sync failed: {}", e)
+                                }).to_string().into(),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    // 1. Ingest Nostr events into local SQLite
+                    let db_path = app_data.join("nostr_events.db");
+                    let mut events_ingested = 0usize;
+                    if !events.is_empty() {
+                        match rusqlite::Connection::open(&db_path) {
+                            Ok(conn) => {
+                                let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+                                match crate::nostr_relay::ingest_batch_events(&events, &db) {
+                                    Ok(n) => events_ingested = n,
+                                    Err(e) => eprintln!("Sync: event ingestion failed: {}", e),
+                                }
+                            }
+                            Err(e) => eprintln!("Sync: failed to open nostr db: {}", e),
+                        }
+                    }
+
+                    // 2. Mirror blobs from upstream Blossom
+                    let blobs_dir = app_data.join("blobs");
+                    let _ = std::fs::create_dir_all(&blobs_dir);
+                    let mut blobs_mirrored = 0usize;
+                    for hash_val in &blob_hashes {
+                        if let Some(hash) = hash_val.as_str() {
+                            if let Ok(true) = crate::blossom::mirror_blob_from_remote(
+                                hash,
+                                &source_blossom_url,
+                                &blobs_dir,
+                            ).await {
+                                blobs_mirrored += 1;
+                            }
+                        }
+                    }
+
+                    // 3. Update last_synced_at timestamp
+                    let now = chrono::Utc::now().timestamp() as u64;
+                    {
+                        let mut prefs = crate::load_preferences(&app_handle);
+                        prefs.last_synced_at = now;
+                        let _ = crate::save_preferences(&app_handle, &prefs);
+                    }
+
+                    let _ = response_tx.send(Message::Text(
+                        serde_json::json!({
+                            "type": "sync_to_home_completed",
+                            "events_ingested": events_ingested,
+                            "blobs_mirrored": blobs_mirrored,
+                            "last_synced_at": now
+                        }).to_string().into(),
+                    ));
                 } else {
                     println!("DEBUG: Received unknown JSON structure: {}", text);
                 }
@@ -494,9 +571,10 @@ async fn listen_on(addrs: &str, app: AppHandle) {
         }
     };
 
-    let config = match ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
+    let config = match ServerConfig::builder_with_provider(Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())
+        .and_then(|b| b.with_no_client_auth().with_single_cert(certs, key).map_err(|e| e.to_string()))
     {
         Ok(c) => c,
         Err(e) => {

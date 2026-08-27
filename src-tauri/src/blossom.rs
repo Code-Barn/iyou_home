@@ -260,3 +260,90 @@ fn detect_mime_type(data: &[u8]) -> &'static str {
     }
     "application/octet-stream"
 }
+
+/// Mirror a single blob from a remote Blossom server into the local store.
+/// Returns `true` if the blob was fetched and written (or already existed),
+/// `false` if the remote was unreachable, and an error on validation failure.
+pub async fn mirror_blob_from_remote(
+    hash: &str,
+    remote_url: &str,
+    blobs_dir: &PathBuf,
+) -> Result<bool, String> {
+    if !is_valid_hash(hash) {
+        return Err(format!("Invalid hash format: {}", hash));
+    }
+
+    let local_path = blobs_dir.join(hash);
+    if local_path.exists() {
+        return Ok(true);
+    }
+
+    let url = format!("{}/{}", remote_url.trim_end_matches('/'), hash);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let response = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Blossom mirror fetch failed for {}: {}", hash, e);
+            return Ok(false);
+        }
+    };
+
+    if !response.status().is_success() {
+        eprintln!(
+            "Blossom mirror returned {} for {}",
+            response.status(),
+            hash
+        );
+        return Ok(false);
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
+
+    let computed = format!("{:x}", Sha256::digest(&bytes));
+    if computed != hash {
+        return Err(format!(
+            "SHA-256 mismatch: expected {}, got {}",
+            hash, computed
+        ));
+    }
+
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create blobs directory: {}", e))?;
+    }
+
+    fs::write(&local_path, &bytes)
+        .await
+        .map_err(|e| format!("Failed to write blob: {}", e))?;
+
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_hash() {
+        assert!(is_valid_hash("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert!(!is_valid_hash("short"));
+        assert!(!is_valid_hash("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015az")); // non-hex 'z'
+    }
+
+    #[test]
+    fn test_detect_mime_type() {
+        assert_eq!(detect_mime_type(b"\x89PNG\r\n\x1a\n"), "image/png");
+        assert_eq!(detect_mime_type(b"GIF89a"), "image/gif");
+        assert_eq!(detect_mime_type(b"%PDF-1.4"), "application/pdf");
+        assert_eq!(detect_mime_type(b"{\"key\":\"value\"}"), "application/json");
+        assert_eq!(detect_mime_type(b"Hello world text"), "text/plain; charset=utf-8");
+    }
+}

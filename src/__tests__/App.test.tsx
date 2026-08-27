@@ -30,8 +30,6 @@ const mockInvoke = vi.hoisted(() =>
           Blossom: "stopped",
           Nostr: "stopped",
           Chat: "stopped",
-          "IPFS Cloud Archive": "stopped",
-          Polly: "stopped",
         });
       case "toggle_service":
         return new Promise((resolve) =>
@@ -40,6 +38,48 @@ const mockInvoke = vi.hoisted(() =>
             0,
           ),
         );
+      case "get_active_did":
+        return Promise.resolve("did:key:z6Mku...");
+      case "list_profiles":
+        return Promise.resolve([
+          {
+            profile_id: "primary",
+            profile_name: "Primary Identity",
+            derivation_index: 1,
+            did: "did:key:z6Mku...",
+            credentials: [],
+            nostr_pubkey_hex: "00",
+            level: 1,
+            is_system_reserved: false,
+          },
+        ]);
+      case "get_sync_status":
+        return Promise.resolve({
+          last_synced_at: 1756241000,
+          local_notes_count: 14,
+          local_blobs_count: 2,
+        });
+      case "trigger_manual_sync":
+        return Promise.resolve({
+          events_ingested: 14,
+          blobs_mirrored: 2,
+          last_synced_at: 1756241000,
+        });
+      case "revoke_all_sessions":
+        return Promise.resolve("All active web sessions revoked successfully.");
+      case "get_credentials":
+        return Promise.resolve([]);
+      case "import_verifiable_credential":
+        return Promise.resolve({
+          profile_id: "primary",
+          profile_name: "Primary Identity",
+          derivation_index: 1,
+          did: "did:key:z6Mku...",
+          credentials: [],
+          nostr_pubkey_hex: "00",
+          level: 1,
+          is_system_reserved: false,
+        });
       default:
         return Promise.resolve();
     }
@@ -53,32 +93,63 @@ vi.mock("@tauri-apps/api/core", () => ({
   })),
 }));
 
+vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
+  writeText: vi.fn().mockResolvedValue(undefined),
+}));
+
 describe("App", () => {
   beforeEach(() => {
     mockInvoke.mockClear();
   });
 
-  it("renders the service switch panel", () => {
+  it("renders all main tabs", () => {
     render(<App />);
-    expect(screen.getByText("Service Switch Panel")).toBeInTheDocument();
+    // Tab buttons are inside .tabs container; status bar also has button text matching "Enclave"
+    const tabs = document.querySelector(".tabs");
+    expect(tabs?.textContent).toContain("Enclave");
+    expect(tabs?.textContent).toContain("Credentials");
+    expect(tabs?.textContent).toContain("Vault");
+    expect(tabs?.textContent).toContain("Services");
+    expect(tabs?.textContent).toContain("Governance");
+  });
+
+  it("defaults to Enclave tab on launch", () => {
+    render(<App />);
+    const tabs = document.querySelector(".tabs");
+    const enclaveTab = tabs?.querySelector("button.active");
+    expect(enclaveTab).toBeTruthy();
+    expect(enclaveTab?.textContent).toContain("Enclave");
+  });
+
+  it("renders status bar with daemon indicators", () => {
+    render(<App />);
+    expect(screen.getByText("iyou_home")).toBeInTheDocument();
     expect(screen.getByText("SigBridge")).toBeInTheDocument();
     expect(screen.getByText("Nostr")).toBeInTheDocument();
     expect(screen.getByText("Blossom")).toBeInTheDocument();
-    expect(screen.getByText("Chat")).toBeInTheDocument();
-    expect(screen.getAllByText("IPFS Cloud Archive").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("Polly")).toBeInTheDocument();
   });
 
-  it("shows ports for active services", () => {
+  it("navigates to Services tab and renders service list", async () => {
     render(<App />);
-    expect(screen.getByText(":9001")).toBeInTheDocument();
-    expect(screen.getByText(":9002")).toBeInTheDocument();
-    expect(screen.getByText(":9003")).toBeInTheDocument();
-    expect(screen.getByText(":5222")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Services/i }));
+    });
+
+    expect(screen.getByRole("heading", { name: "Services" })).toBeInTheDocument();
+    expect(screen.getAllByText("SigBridge").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("Blossom").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("Nostr").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Chat")).toBeInTheDocument();
+    expect(screen.getByText("Routes external signing requests to your local vault")).toBeInTheDocument();
   });
 
   it("calls the toggle_service command when a start button is clicked", async () => {
     render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Services/i }));
+    });
 
     const startButtons = screen.getAllByRole("button", {
       name: /start/i,
@@ -104,6 +175,10 @@ describe("App", () => {
 
   it("handles service stop correctly", async () => {
     render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Services/i }));
+    });
 
     const startButtons = screen.getAllByRole("button", {
       name: /start/i,
@@ -135,22 +210,149 @@ describe("App", () => {
     });
   });
 
-  it("renders the Project Zero tab button and navigates to Project Zero", async () => {
+  it("renders Developer Mode toggle in footer", () => {
     render(<App />);
-    const enclaveTabBtn = screen.getByRole("button", {
-      name: /Project Zero 🛡️/i,
+    expect(screen.getByText("Developer Mode")).toBeInTheDocument();
+  });
+
+  it("Developer Mode toggle shows Manual Signer tab", async () => {
+    render(<App />);
+
+    // Manual Signer tab should not be visible by default
+    expect(screen.queryByRole("button", { name: /Manual Signer/i })).not.toBeInTheDocument();
+
+    // Toggle dev mode
+    const devToggle = screen.getByText("Developer Mode");
+    await act(async () => {
+      fireEvent.click(devToggle);
     });
-    expect(enclaveTabBtn).toBeInTheDocument();
+
+    // Manual Signer tab should now be visible
+    expect(screen.getByRole("button", { name: /Manual Signer/i })).toBeInTheDocument();
+  });
+
+  it("navigates to Enclave tab and shows Project Zero", async () => {
+    render(<App />);
+
+    // Enclave is default — should already show Project Zero content
+    await waitFor(() => {
+      expect(screen.getByText("Project Zero")).toBeInTheDocument();
+    });
+  });
+
+  it("renders Sync to Home card in Services tab and handles manual sync", async () => {
+    render(<App />);
 
     await act(async () => {
-      fireEvent.click(enclaveTabBtn);
+      fireEvent.click(screen.getByRole("button", { name: /Services/i }));
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Project Zero")).toBeInTheDocument();
-      expect(
-        screen.getByText("🛡️ Air-Gapped Zero Enclave Active"),
-      ).toBeInTheDocument();
+      expect(screen.getByText(/Sync to Home/i)).toBeInTheDocument();
+      expect(screen.getByText(/Notes: 14 \| Blobs: 2/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /Sync Now/i })).toBeInTheDocument();
+    });
+
+    const syncNowButton = screen.getByRole("button", { name: /Sync Now/i });
+    await act(async () => {
+      fireEvent.click(syncNowButton);
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("trigger_manual_sync");
+      expect(mockInvoke).toHaveBeenCalledWith("get_sync_status");
+    });
+  });
+
+  it("renders Sync indicator in global status bar", async () => {
+    render(<App />);
+    expect(screen.getByText("Sync")).toBeInTheDocument();
+  });
+
+  it("navigates to Vault tab, renders redundancy banner and handles session revocation", async () => {
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Vault/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sovereign Data Redundancy/i)).toBeInTheDocument();
+      expect(screen.getByText(/Active Web Sessions/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /Revoke All Web Sessions/i })).toBeInTheDocument();
+    });
+
+    const revokeBtn = screen.getByRole("button", { name: /Revoke All Web Sessions/i });
+    await act(async () => {
+      fireEvent.click(revokeBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Confirm Global Session Revocation/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /Confirm Revocation/i })).toBeInTheDocument();
+    });
+
+    const confirmBtn = screen.getByRole("button", { name: /Confirm Revocation/i });
+    await act(async () => {
+      fireEvent.click(confirmBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("revoke_all_sessions");
+      expect(screen.getByText(/All active web sessions revoked successfully/i)).toBeInTheDocument();
+    });
+  });
+
+  it("navigates to Trust Assets tab, opens import modal and imports a credential", async () => {
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Credentials/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sovereign Credential Repository/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /\+ Import Credential/i })).toBeInTheDocument();
+    });
+
+    const openImportBtn = screen.getByRole("button", { name: /\+ Import Credential/i });
+    await act(async () => {
+      fireEvent.click(openImportBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Import Verifiable Credential/i)).toBeInTheDocument();
+      expect(screen.getByPlaceholderText(/Paste raw W3C Verifiable Credential/i)).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText(/Paste raw W3C Verifiable Credential/i);
+    await act(async () => {
+      fireEvent.change(textarea, {
+        target: {
+          value: JSON.stringify({
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "type": ["VerifiableCredential"],
+            "issuer": "did:key:z123",
+            "credentialSubject": { "id": "did:key:z456" },
+            "proof": { "sig": "abc" },
+          }),
+        },
+      });
+    });
+
+    const submitBtn = screen.getByRole("button", { name: /Verify & Save to Vault/i });
+    await act(async () => {
+      fireEvent.click(submitBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "import_verifiable_credential",
+        expect.objectContaining({
+          vcPayload: expect.stringContaining("VerifiableCredential"),
+        }),
+      );
+      expect(screen.getByText(/Credential imported successfully/i)).toBeInTheDocument();
     });
   });
 });
