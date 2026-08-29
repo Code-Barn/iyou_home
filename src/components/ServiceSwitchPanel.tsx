@@ -17,6 +17,8 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import BlossomBrowser from "./BlossomBrowser";
+import SovereignFootprint from "./SovereignFootprint";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -291,6 +293,12 @@ export default function ServiceSwitchPanel() {
           </div>
         </div>
       </div>
+
+      {/* Sovereign Ecosystem Footprint Matrix */}
+      <SovereignFootprint />
+
+      {/* Offline Media Vault */}
+      <BlossomBrowser />
 
       {/* Technical Details Disclosure */}
       <div style={{ marginTop: "1.5rem" }}>

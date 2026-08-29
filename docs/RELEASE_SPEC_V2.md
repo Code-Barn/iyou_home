@@ -1,7 +1,7 @@
 # Release Specification V2 — `iyou_home`
 
 **Status:** DRAFT  
-**Date:** 2026-08-26  
+**Date:** 2026-08-26  (Revised: 2026-08-29 — Phases 9 & 10 Launch Readiness codified)  
 **Supersedes:** UI Audit Report (2026-08-26), RELEASE_SPEC_V1 (if exists)  
 **Codifies:** Day 1 public release baseline for `iyou_home` Tauri desktop application
 
@@ -369,6 +369,92 @@ Before Day 1 release, all of the following must pass:
 | 14 | Security | Master Seed Reveal requires typed confirmation + countdown |
 | 15 | Persistence | Vault round-trip: create → export `.iyoubackup` → import on fresh data → verify profiles match |
 | 16 | Governance | Merkle root audit: fetch snapshot → compute → compare → verify match/mismatch display |
+| 17 | Security | First-Run Master Seed Confirmation gates Enclave access until seed words verified |
+| 18 | Security | OS biometric / PIN app lock engages on launch, wake, and configured inactivity auto-lock |
+| 19 | Persistence | `.iyoubackup` export bundles all `{app_data}/ledgers/` files plus core JSON ledgers |
+| 20 | Security | Vault re-authentication gate fires on seed reveal, `.iyoubackup` export, and Danger Zone purge |
+| 21 | Mesh | Quick Dispatch publishes Kinds 1 / 1063 / 30023 to local `:9003` and remote relays |
+| 22 | Governance | Governance Auditor defaults to Blossom BUD-01 verification (IPFS demoted to advanced) |
+| 23 | UX | Offline Sovereign Footprint tile matrix reflects live local satellite counts with deep links |
+
+---
+
+## 8. Launch Readiness: Phases 9 & 10
+
+The final release milestones harden device access, mesh publishing, and offline data residency. Phases proceed in order — access gating (Phase 9) must land before the publishing surfaces of Phase 10.
+
+### 8.1 Phase 9: Enclave Access Security & Vault Preservation
+
+> Gate device and vault access behind physical identity checks; make disaster recovery archives complete.
+
+#### 9.1 First-Run Master Seed Confirmation
+
+On first launch, the dashboard remains locked until the user demonstrates custody of the root seed:
+
+1. Onboarding challenge displays 3 randomly selected seed words from the freshly minted vault.
+2. User must type the words back — or verify a typed acknowledgment — before the Enclave dashboard becomes accessible.
+3. A failed challenge resets with a fresh random selection; the full seed is never revealed during this step.
+4. Success writes `first_run_seed_confirmed` (timestamp only) to `preferences.json` for audit.
+
+#### 9.2 OS Biometric / PIN App Lock
+
+Local screen guard protecting the app on launch and on wake:
+
+- Uses the OS biometric prompt (macOS Touch ID / Windows Hello) or a user-configured device PIN as fallback.
+- Configurable inactivity auto-lock: **15 min (default)**, 5 min, 1 hour, or Never.
+- The lock screen re-engages on launch and on wake from sleep.
+- The lock gate controls UI rendering only — it never asserts vault decryption.
+
+#### 9.3 Dynamic `.iyoubackup` Ledger Bundling
+
+`export_vault_backup` enumerates `{app_data}/ledgers/` at export time and bundles every file found there alongside `vault.json`, `contacts.json`, `pairing.json`, and `preferences.json`:
+
+| Item | Handling |
+|---|---|
+| `vault.json`, `contacts.json`, `pairing.json`, `preferences.json` | Sealed exactly as today |
+| `{app_data}/ledgers/*` | New `ledgers/` directory inside the archive, every file included dynamically |
+| Manifest | Gains `ledger_entries` array (relative path + SHA-256 per file) |
+| Import | Bundled ledgers restored only on user-confirmed full replace |
+
+#### 9.4 Vault Re-Authentication Gate
+
+High-stakes actions force a fresh biometric / PIN check regardless of any active session grace period:
+
+- Master Seed reveal
+- `.iyoubackup` export
+- Danger Zone purge / vault re-initialization
+
+The gate reuses the 9.2 local biometric / PIN prompt and writes a timestamped audit entry on success.
+
+### 8.2 Phase 10: Mesh Publishing, Governance & Data Footprint
+
+> Publish to the local mesh, verify integrity from the default Blossom-first lens, and surface the sovereign data footprint.
+
+#### 10.1 Quick Dispatch Modal
+
+Top-bar **[ ✍️ Dispatch ]** action supporting three publish surfaces:
+
+| Kind | Type | Composer |
+|---|---|---|
+| 1 | Text note | Plain text compose |
+| 1063 | Blossom media | File upload to local Blossom, live-tracked, then referenced in the event |
+| 30023 | Civic poll definition | Structured poll composer |
+
+Every dispatch double-broadcasts to the local relay (`:9003`) and configured remote relays.
+
+#### 10.2 Blossom-First Governance Auditor
+
+- Blossom BUD-01 snapshot ingest + local Merkle-root verification becomes the default view.
+- IPFS CID entry is demoted behind an "Advanced" disclosure toggle.
+
+#### 10.3 Offline Sovereign Footprint
+
+Metric tile matrix reporting live local counts with deep links into each satellite view:
+
+- `nostr.db` event count (local relay, Kinds 1 / 1063 / 30023 / 10002)
+- Blossom media blob count
+- Poll records (Kind 30023 definitions + vote snapshots)
+- Ledger documents in `{app_data}/ledgers/`
 
 ---
 

@@ -738,3 +738,14 @@ textarea {
     cursor: pointer;
     accent-color: var(--color-text-muted, #6b7280);
 }
+
+@keyframes slide-in-right {
+    from {
+        transform: translateX(100%);
+        opacity: 0.6;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}

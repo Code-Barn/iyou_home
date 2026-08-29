@@ -17,13 +17,17 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Profile, PeerContact } from "../../lib/types";
+import { Profile, PeerContact, ChatPeerTarget } from "../../lib/types";
 import PersonaMatrix from "./PersonaMatrix";
 import ContactList from "./ContactList";
 import DisclosureModal from "./DisclosureModal";
 import GraduationWizard from "./GraduationWizard";
 
-export default function ProjectZero() {
+interface ProjectZeroProps {
+  onRequestChat?: (target: ChatPeerTarget) => void;
+}
+
+export default function ProjectZero({ onRequestChat }: ProjectZeroProps) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [contacts, setContacts] = useState<PeerContact[]>([]);
   const [activeDid, setActiveDid] = useState<string | null>(null);
@@ -292,6 +296,7 @@ export default function ProjectZero() {
               contacts={contacts}
               onRefresh={fetchData}
               onOpenDisclosure={() => setShowDisclosureModal(true)}
+              onOpenChat={(target) => onRequestChat?.(target)}
             />
           )}
         </>

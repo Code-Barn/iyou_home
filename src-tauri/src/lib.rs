@@ -25,7 +25,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -38,7 +37,10 @@ mod bridge;
 mod certs;
 mod contacts;
 mod nostr_relay;
+mod omemo;
+mod pairing;
 mod prosody;
+mod tray;
 mod vault;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -69,6 +71,23 @@ pub struct UserPreferences {
     /// Unix timestamp of the last successful Sync-to-Home operation.
     #[serde(default)]
     pub last_synced_at: u64,
+    /// True once the user has completed the first-run master seed backup
+    /// ceremony. Defaults to false on a fresh vault so the dashboard stays
+    /// gated until the seed is verified.
+    #[serde(default)]
+    pub seed_backup_confirmed: bool,
+    /// Whether the OS biometric / PIN app-lock screen guard is enabled.
+    #[serde(default)]
+    pub app_lock_enabled: bool,
+    /// Inactivity auto-lock timeout in minutes (5, 15, 60, or 0 = disabled).
+    #[serde(default)]
+    pub inactivity_timeout_minutes: u32,
+    /// SHA-256 of the local 6-digit PIN, never the PIN itself.
+    #[serde(default)]
+    pub app_lock_pin_hash: Option<String>,
+    /// SHA-256 of the WebAuthn PRF seed hex, never the PRF seed itself.
+    #[serde(default)]
+    pub app_lock_prf_hash: Option<String>,
 }
 
 impl Default for UserPreferences {
@@ -80,6 +99,11 @@ impl Default for UserPreferences {
             last_active_tab: "services".to_string(),
             active_sovereign_did: None,
             last_synced_at: 0,
+            seed_backup_confirmed: false,
+            app_lock_enabled: false,
+            inactivity_timeout_minutes: 15,
+            app_lock_pin_hash: None,
+            app_lock_prf_hash: None,
         }
     }
 }
@@ -137,6 +161,14 @@ pub struct SyncStatus {
     pub last_synced_at: u64,
     pub local_notes_count: usize,
     pub local_blobs_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LocalBlobInfo {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mime_type: String,
+    pub created_at: u64,
 }
 
 impl Default for WsState {
@@ -1678,6 +1710,149 @@ fn reveal_master_seed(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_vault_status(app: AppHandle) -> Result<bool, String> {
+    match vault::load_vault(&app) {
+        Ok(_) => Ok(true),
+        // First-run: no vault yet is a normal empty state, not an error.
+        Err(vault::VaultLoadError::NotFound) => Ok(false),
+        // Corruption/IO faults must surface, never be masked.
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+fn set_seed_backup_confirmed(app: AppHandle, confirmed: bool) -> Result<(), String> {
+    let mut prefs = load_preferences(&app);
+    prefs.seed_backup_confirmed = confirmed;
+    save_preferences(&app, &prefs)
+}
+
+// ---------- Device pairing ----------
+
+#[tauri::command]
+fn pair_begin(state: State<'_, pairing::PairFrameState>) -> Result<pairing::PairFrameResponse, String> {
+    pairing::begin_pairing(&state)
+}
+
+#[tauri::command]
+fn pair_seal_seed_for_device(
+    app: AppHandle,
+    state: State<'_, pairing::PairFrameState>,
+    frame_id: String,
+    mobile_x25519_pub_hex: String,
+    device_did: String,
+    verification_code: String,
+) -> Result<Vec<u8>, String> {
+    pairing::seal_seed_for_device(
+        &app,
+        &state,
+        &frame_id,
+        &mobile_x25519_pub_hex,
+        &device_did,
+        &verification_code,
+    )
+}
+
+#[tauri::command]
+fn pair_confirm(
+    app: AppHandle,
+    state: State<'_, pairing::PairFrameState>,
+    frame_id: String,
+    device_did: String,
+    device_name: String,
+) -> Result<pairing::PairedDeviceRecord, String> {
+    pairing::confirm_pairing(&app, &state, &frame_id, &device_did, &device_name)
+}
+
+#[tauri::command]
+fn pair_list_devices(app: AppHandle) -> Result<Vec<pairing::PairedDeviceRecord>, String> {
+    pairing::list_devices(&app)
+}
+
+#[tauri::command]
+fn pair_revoke_device(app: AppHandle, device_id: String) -> Result<bool, String> {
+    pairing::revoke_device(&app, &device_id)
+}
+
+// ---------------------------------------------------------------------------
+// OMEMO / XMPP chat: Level 1 persona fail-closed guard for every command.
+// The raw anchor (Level 0) can never be used for live communication.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatSessionCredentials {
+    pub jid: String,
+    pub pubkey_hex: String,
+    pub wss_url: String,
+}
+
+fn require_l1_persona(vault: &vault::VaultStore) -> Result<vault::Profile, String> {
+    let persona = vault
+        .public_persona()
+        .ok_or_else(|| "No Level 1 public persona available — create one before using chat".to_string())?;
+    if persona.is_anchor() || persona.derivation_index == 0 {
+        return Err("Level 0 anchor persona cannot be used for chat".to_string());
+    }
+    Ok(persona.clone())
+}
+
+fn l1_persona_jid(
+    app: &AppHandle,
+) -> Result<(vault::Profile, String, String), String> {
+    let vault = vault::load_or_bootstrap_vault(app)
+        .map_err(|e| format!("Failed to load vault: {}", e))?;
+    let persona = require_l1_persona(&vault)?;
+    let keypair = vault::get_profile_keypair(&vault, &persona.profile_id)
+        .map_err(|e| format!("Failed to derive persona keypair: {}", e))?;
+    let pubkey_hex = keypair.verifying_key.to_bytes();
+    let pubkey_hex = hex::encode(pubkey_hex);
+    let jid = format!("{}@127.0.0.1", pubkey_hex);
+    Ok((persona, jid, pubkey_hex))
+}
+
+#[tauri::command]
+fn get_chat_session_credentials(app: AppHandle) -> Result<ChatSessionCredentials, String> {
+    let (_persona, jid, pubkey_hex) = l1_persona_jid(&app)?;
+    Ok(ChatSessionCredentials {
+        jid,
+        pubkey_hex,
+        wss_url: "wss://home.iyou.me:5222".to_string(),
+    })
+}
+
+/// Publish this enclave's OMEMO bundle under its own Level 1 JID.
+///
+/// `bundle_json` may be empty (generate + publish the enclave device bundle)
+/// or an already-signed bundle payload to validate and re-record.
+#[tauri::command]
+fn omemo_publish_bundle(app: AppHandle, bundle_json: String) -> Result<bool, String> {
+    let (_persona, jid, _pubkey_hex) = l1_persona_jid(&app)?;
+    if bundle_json.trim().is_empty() {
+        omemo::publish_local_bundle(&app, &jid)?;
+        return Ok(true);
+    }
+    let mut store = omemo::load_omemo_store(&app)?;
+    omemo::publish_bundle_in_memory(&mut store, &jid, &bundle_json)?;
+    omemo::save_omemo_store(&app, &store)?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn omemo_fetch_peer_bundle(app: AppHandle, peer_jid: String) -> Result<Option<String>, String> {
+    let bare = prosody::normalize_bare_jid(&peer_jid);
+    omemo::fetch_bundle_for(&app, &bare)
+}
+
+#[tauri::command]
+fn omemo_list_devices(
+    app: AppHandle,
+    peer_jid: String,
+) -> Result<Vec<omemo::OmemoDeviceInfo>, String> {
+    let bare = prosody::normalize_bare_jid(&peer_jid);
+    omemo::list_peer_devices(&app, &bare)
+}
+
+#[tauri::command]
 fn create_vault_backup(app: AppHandle, password: String) -> Result<Vec<u8>, String> {
     let app_data = app
         .path()
@@ -1686,6 +1861,27 @@ fn create_vault_backup(app: AppHandle, password: String) -> Result<Vec<u8>, Stri
     let vault = vault::load_or_bootstrap_vault(&app)
         .map_err(|e| format!("Failed to load vault: {}", e))?;
     vault::export_vault_backup(&vault, &app_data, &password)
+}
+
+#[tauri::command]
+fn write_binary_file(path: String, contents: Vec<u8>) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("Path must not be empty".to_string());
+    }
+    let dest = std::path::Path::new(&path);
+    vault::atomic_write_bytes(dest, &contents)
+}
+
+#[tauri::command]
+fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
+    if path.is_empty() {
+        return Err("Path must not be empty".to_string());
+    }
+    let src = std::path::Path::new(&path);
+    if src.is_dir() {
+        return Err(format!("{} is a directory", path));
+    }
+    std::fs::read(src).map_err(|e| format!("Failed to read {}: {}", path, e))
 }
 
 #[tauri::command]
@@ -1750,17 +1946,132 @@ async fn revoke_all_sessions(
 
 // ---------- sync-to-home ----------
 
-fn count_files_in_dir(dir: &std::path::Path) -> usize {
-    if !dir.exists() {
+/// Count plain files whose names are valid 64-char lowercase SHA-256 hex
+/// hashes. Replaces the previous dir-walk heuristic so `get_sync_status`
+/// only counts real blobs, never stray files in the blobs directory.
+fn count_valid_local_blobs(blobs_dir: &std::path::Path) -> usize {
+    if !blobs_dir.exists() {
         return 0;
     }
-    match std::fs::read_dir(dir) {
+    match std::fs::read_dir(blobs_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter(|e| {
+                let file_name = e.file_name();
+                let name = file_name.to_string_lossy();
+                blossom::is_valid_hash(&name) && name == name.to_ascii_lowercase()
+            })
             .count(),
         Err(_) => 0,
     }
+}
+
+// ---------- local blob browser ----------
+
+/// Best-effort file creation timestamp (Unix epoch seconds). Prefers the
+/// platform birth time (macOS), falling back to the modification time.
+fn file_created_at(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        let birth = meta.st_birthtime();
+        if birth > 0 {
+            return birth as u64;
+        }
+    }
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[tauri::command]
+fn list_local_blobs(app: AppHandle) -> Result<Vec<LocalBlobInfo>, String> {
+    let blobs_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("blobs");
+
+    let mut blobs = Vec::new();
+    if !blobs_dir.exists() {
+        return Ok(blobs);
+    }
+
+    for entry in std::fs::read_dir(&blobs_dir).map_err(|e| format!("Failed to read blobs dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read dir entry: {}", e))?;
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !blossom::is_valid_hash(&name) || name != name.to_ascii_lowercase() {
+            continue;
+        }
+        let path = entry.path();
+        let meta = std::fs::metadata(&path).map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+
+        let size_bytes = meta.len();
+        let created_at = file_created_at(&meta);
+
+        let mut head = vec![0u8; 64];
+        let read_len = {
+            use std::io::Read;
+            match std::fs::File::open(&path).and_then(|mut f| f.read(&mut head)) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Blossom head read failed for {}: {}", path.display(), e);
+                    0
+                }
+            }
+        };
+        head.truncate(read_len);
+        let mime_type = blossom::detect_mime_type(&head).to_string();
+
+        blobs.push(LocalBlobInfo {
+            sha256: name.to_string(),
+            size_bytes,
+            mime_type,
+            created_at,
+        });
+    }
+
+    blobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(blobs)
+}
+
+#[tauri::command]
+fn delete_local_blob(app: AppHandle, sha256: String) -> Result<bool, String> {
+    if !blossom::is_valid_hash(&sha256) || sha256 != sha256.to_ascii_lowercase() {
+        return Err("Invalid blob hash format".to_string());
+    }
+    let path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("blobs")
+        .join(&sha256);
+
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => {
+            std::fs::remove_file(&path).map_err(|e| format!("Failed to delete blob: {}", e))?;
+            Ok(true)
+        }
+        Ok(_) => Err("Path is not a blob file".to_string()),
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+fn get_local_blobs_count(app: AppHandle) -> Result<u64, String> {
+    let blobs_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("blobs");
+    Ok(count_valid_local_blobs(&blobs_dir) as u64)
 }
 
 #[tauri::command]
@@ -1787,9 +2098,9 @@ fn get_sync_status(app: AppHandle) -> Result<SyncStatus, String> {
         0
     };
 
-    // Count local Blossom blobs
+    // Count local Blossom blobs (validated 64-hex filenames only)
     let blobs_dir = app_data.join("blobs");
-    let local_blobs_count = count_files_in_dir(&blobs_dir);
+    let local_blobs_count = count_valid_local_blobs(&blobs_dir);
 
     Ok(SyncStatus {
         last_synced_at,
@@ -1889,6 +2200,249 @@ async fn fetch_and_mirror_blobs(
     Ok(mirrored)
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EcosystemFootprint {
+    pub social_notes_count: usize,
+    pub governance_ballots_count: usize,
+    pub evidence_records_count: usize,
+    pub kinship_entries_count: usize,
+    pub media_blobs_count: usize,
+    pub media_storage_bytes: u64,
+    pub registered_ledgers_count: usize,
+}
+
+#[tauri::command]
+fn get_ecosystem_footprint(app: AppHandle) -> Result<EcosystemFootprint, String> {
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+
+    // 1. Social notes / events count in nostr_events.db or nostr.db
+    let mut social_notes_count = 0;
+    for db_name in &["nostr_events.db", "nostr.db"] {
+        let db_path = app_data.join(db_name);
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+                social_notes_count += nostr_relay::count_events(&db).unwrap_or(0);
+            }
+        }
+    }
+
+    // 2. Media blobs count & byte size in blobs/
+    let blobs_dir = app_data.join("blobs");
+    let mut media_blobs_count = 0;
+    let mut media_storage_bytes: u64 = 0;
+    if blobs_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&blobs_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if blossom::is_valid_hash(&name) && name == name.to_ascii_lowercase() {
+                    media_blobs_count += 1;
+                    if let Ok(meta) = entry.metadata() {
+                        media_storage_bytes += meta.len();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Count governance ballots & polls
+    let mut governance_ballots_count = 0;
+    let poll_ledger_candidates = [
+        app_data.join("poll_ledger.json"),
+        app_data.join("ledgers").join("poll_ledger.json"),
+    ];
+    for path in &poll_ledger_candidates {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val.as_array() {
+                        governance_ballots_count = arr.len();
+                        break;
+                    } else if let Some(obj) = val.as_object() {
+                        if let Some(arr) = obj.get("votes").and_then(|v| v.as_array()) {
+                            governance_ballots_count = arr.len();
+                            break;
+                        } else if let Some(arr) = obj.get("records").and_then(|v| v.as_array()) {
+                            governance_ballots_count = arr.len();
+                            break;
+                        } else {
+                            governance_ballots_count = obj.len();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Evidence vault records count (hive_ledger.json)
+    let mut evidence_records_count = 0;
+    let hive_ledger_candidates = [
+        app_data.join("hive_ledger.json"),
+        app_data.join("ledgers").join("hive_ledger.json"),
+    ];
+    for path in &hive_ledger_candidates {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val.as_array() {
+                        evidence_records_count = arr.len();
+                        break;
+                    } else if let Some(obj) = val.as_object() {
+                        evidence_records_count = obj.len();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Kinship registry entries count (name_ledger.json)
+    let mut kinship_entries_count = 0;
+    let name_ledger_candidates = [
+        app_data.join("name_ledger.json"),
+        app_data.join("ledgers").join("name_ledger.json"),
+    ];
+    for path in &name_ledger_candidates {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val.as_array() {
+                        kinship_entries_count = arr.len();
+                        break;
+                    } else if let Some(obj) = val.as_object() {
+                        kinship_entries_count = obj.len();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Scan registered ledgers in ledgers/ and app_data
+    let mut registered_ledgers = std::collections::HashSet::new();
+    let ledgers_dir = app_data.join("ledgers");
+    if ledgers_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&ledgers_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".json") {
+                    registered_ledgers.insert(name);
+                }
+            }
+        }
+    }
+    let known_ledger_files = [
+        "vault.json",
+        "preferences.json",
+        "poll_ledger.json",
+        "hive_ledger.json",
+        "name_ledger.json",
+        "talk_journal.json",
+        "pairing.json",
+        "contacts.json",
+        "credentials.json",
+    ];
+    for filename in &known_ledger_files {
+        if app_data.join(filename).exists() {
+            registered_ledgers.insert(filename.to_string());
+        }
+    }
+
+    Ok(EcosystemFootprint {
+        social_notes_count,
+        governance_ballots_count,
+        evidence_records_count,
+        kinship_entries_count,
+        media_blobs_count,
+        media_storage_bytes,
+        registered_ledgers_count: registered_ledgers.len(),
+    })
+}
+
+#[tauri::command]
+fn dispatch_nostr_event(
+    app: AppHandle,
+    kind: u32,
+    content: String,
+    tags: Vec<Vec<String>>,
+    profile_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let (signing_key, _did) = resolve_profile_keypair(&app, profile_id)?;
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_bytes = verifying_key.to_bytes();
+    let pubkey_hex = hex::encode(pubkey_bytes);
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Time went backwards")?
+        .as_secs() as i64;
+
+    // NIP-01 serialized array for event id computation: [0, pubkey, created_at, kind, tags, content]
+    let tags_val = serde_json::to_value(&tags).map_err(|e| e.to_string())?;
+    let serialized = serde_json::to_string(&serde_json::json!([
+        0,
+        pubkey_hex,
+        created_at,
+        kind,
+        tags_val,
+        content
+    ]))
+    .map_err(|e| format!("Serialization failed: {}", e))?;
+
+    let event_id_hash = Sha256::digest(serialized.as_bytes());
+    let event_id_hex = hex::encode(event_id_hash);
+
+    // Ed25519 signature over event_id raw bytes
+    let signature = signing_key.sign(&event_id_hash);
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    let event = serde_json::json!({
+        "id": event_id_hex,
+        "pubkey": pubkey_hex,
+        "created_at": created_at,
+        "kind": kind,
+        "tags": tags,
+        "content": content,
+        "sig": sig_hex,
+    });
+
+    // Store in local nostr_events.db if available
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let db_path = app_data.join("nostr_events.db");
+    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                tags TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sig TEXT NOT NULL
+            );",
+            [],
+        );
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                event_id_hex,
+                pubkey_hex,
+                created_at,
+                kind as i64,
+                serde_json::to_string(&tags).unwrap_or_default(),
+                content,
+                sig_hex
+            ],
+        );
+    }
+
+    Ok(event)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1905,11 +2459,13 @@ pub fn run() {
     };
     let ws_state = WsState::default();
     let transit_state = TransitState::default();
+    let pairing_state = pairing::PairFrameState::default();
 
     let builder = tauri::Builder::default()
         .manage(service_state)
         .manage(ws_state)
         .manage(transit_state)
+        .manage(pairing_state)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1943,45 +2499,12 @@ pub fn run() {
                 bridge::start_ws_server(ws_handle).await;
             });
 
-            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let show_i =
-                tauri::menu::MenuItem::with_id(app, "show", "Show Hub", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
+            // Native System Tray
+            tray::build_tray(app)?;
 
-            let mut tray_builder = TrayIconBuilder::new()
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } => {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    _ => {}
-                });
-
-            let tray_icon = tauri::include_image!("./icons/tray-icon.png");
-            tray_builder = tray_builder
-                .icon(tray_icon)
-                .icon_as_template(true);
-            tray_builder.build(app)?;
+            // Native Application Menu (macOS Native Menu Bar & desktop shortcuts)
+            let app_menu = tray::build_app_menu(app)?;
+            let _ = app.set_menu(app_menu);
 
             Ok(())
         })
@@ -2029,14 +2552,38 @@ pub fn run() {
             activate_sovereign_identity,
             rotate_primary_persona,
             reveal_master_seed,
+            get_vault_status,
+            set_seed_backup_confirmed,
+            pair_begin,
+            pair_seal_seed_for_device,
+            pair_confirm,
+            pair_list_devices,
+            pair_revoke_device,
+            get_chat_session_credentials,
+            omemo_publish_bundle,
+            omemo_fetch_peer_bundle,
+            omemo_list_devices,
             create_vault_backup,
             restore_vault_backup,
             revoke_all_sessions,
+            write_binary_file,
+            read_binary_file,
+            list_local_blobs,
+            delete_local_blob,
+            get_local_blobs_count,
             get_sync_status,
             trigger_manual_sync,
+            get_ecosystem_footprint,
+            dispatch_nostr_event,
         ]);
 
     builder
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
@@ -2046,8 +2593,9 @@ pub fn run() {
                 ..
             } => {
                 if label == "main" {
-                    let window = app_handle.get_webview_window("main").unwrap();
-                    let _ = window.hide();
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
                     api.prevent_close();
                 }
             }
@@ -2135,6 +2683,11 @@ mod tests {
             last_active_tab: "keys".to_string(),
             active_sovereign_did: None,
             last_synced_at: 1756241000,
+            seed_backup_confirmed: true,
+            app_lock_enabled: true,
+            inactivity_timeout_minutes: 5,
+            app_lock_pin_hash: Some("deadbeef".to_string()),
+            app_lock_prf_hash: None,
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");
@@ -2149,6 +2702,10 @@ mod tests {
         assert!(loaded.auto_sign);
         assert_eq!(loaded.last_active_tab, "keys");
         assert_eq!(loaded.last_synced_at, 1756241000);
+        assert!(loaded.seed_backup_confirmed);
+        assert!(loaded.app_lock_enabled);
+        assert_eq!(loaded.inactivity_timeout_minutes, 5);
+        assert_eq!(loaded.app_lock_pin_hash.as_deref(), Some("deadbeef"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -2161,6 +2718,11 @@ mod tests {
         assert!(!prefs.auto_sign);
         assert_eq!(prefs.last_active_tab, "services");
         assert_eq!(prefs.last_synced_at, 0);
+        assert!(!prefs.seed_backup_confirmed);
+        assert!(!prefs.app_lock_enabled);
+        assert_eq!(prefs.inactivity_timeout_minutes, 15);
+        assert!(prefs.app_lock_pin_hash.is_none());
+        assert!(prefs.app_lock_prf_hash.is_none());
     }
 
     #[test]
@@ -2223,5 +2785,24 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_ecosystem_footprint_structure() {
+        let footprint = EcosystemFootprint {
+            social_notes_count: 42,
+            governance_ballots_count: 5,
+            evidence_records_count: 12,
+            kinship_entries_count: 3,
+            media_blobs_count: 7,
+            media_storage_bytes: 1048576,
+            registered_ledgers_count: 6,
+        };
+
+        let json = serde_json::to_string(&footprint).expect("Should serialize");
+        let parsed: EcosystemFootprint = serde_json::from_str(&json).expect("Should deserialize");
+        assert_eq!(parsed.social_notes_count, 42);
+        assert_eq!(parsed.media_storage_bytes, 1048576);
+        assert_eq!(parsed.registered_ledgers_count, 6);
     }
 }

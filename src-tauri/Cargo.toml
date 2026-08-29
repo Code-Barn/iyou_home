@@ -51,3 +51,6 @@ hkdf = "0.12"
 aes-gcm = "0.10"
 zeroize = "1"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+qrcode = { version = "0.14", default-features = false }
+flate2 = "1"
+crc32fast = "1"

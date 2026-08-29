@@ -1,7 +1,7 @@
 # TODO — iyou_home (Tauri/Rust Local Enclave)
 
 **Codified from:** `docs/RELEASE_SPEC_V2.md`  
-**Last updated:** 2026-08-26
+**Last updated:** 2026-08-29
 
 ---
 
@@ -99,6 +99,31 @@ Execution phases ordered by dependency. Each phase produces a shippable incremen
 - [x] **5.8** Add `[ + Import Credential ]` modal in `TrustAssets.tsx` with JSON textarea and `.json` file upload support
 
 **Verification:** `cargo test` 66/66 pass, `npx vitest run` 30/30 pass. Revocation dispatches signed envelope. W3C VCs import cleanly with validation.
+
+---
+
+### Phase 9: Enclave Access Security & Vault Preservation
+
+> Gate device and vault access behind physical identity checks; make disaster recovery archives complete.
+
+- [ ] **9.1** First-Run Master Seed Confirmation: Interactive onboarding challenge requiring users to type back 3 random seed words or verify typed acknowledgment before gaining dashboard access.
+- [ ] **9.2** OS Biometric / PIN App Lock: Local screen guard on launch and wake; configurable inactivity auto-lock (default: 15 min; 5m, 15m, 1h, Never).
+- [ ] **9.3** Dynamic `.iyoubackup` Ledger Bundling: Ensure `export_vault_backup` archives all files in `{app_data}/ledgers/` dynamically alongside `vault.json`, `contacts.json`, `pairing.json`, and `preferences.json`.
+- [ ] **9.4** Vault Re-Authentication Gate: Force biometric / PIN check on high-stakes actions (revealing seed, exporting vault, Danger Zone purge) regardless of active session grace period.
+
+**Verification:** Fresh install blocks Enclave until seed confirmation passes. App lock engages on launch/wake and at configured inactivity timeout. `.iyoubackup` export contains every `ledgers/` file; import on a fresh vault restores all profiles, contacts, and ledgers. Seed reveal / export / purge each require a fresh biometric or PIN check.
+
+---
+
+### Phase 10: Mesh Publishing, Governance & Data Footprint
+
+> Publish to the local mesh, verify integrity from the default Blossom-first lens, and surface the sovereign data footprint.
+
+- [ ] **10.1** Quick Dispatch Modal: Top-bar `[ ✍️ Dispatch ]` action supporting Kind 1 text notes, Kind 1063 Blossom uploads, and Kind 30023 civic poll definitions (double-broadcast to `:9003` and remote relays).
+- [ ] **10.2** Blossom-First Governance Auditor: Make Blossom BUD-01 / local Merkle root verification the default view, demoting IPFS to an advanced toggle.
+- [ ] **10.3** Offline Sovereign Footprint: Metric tile matrix displaying local counts across satellites (`nostr.db` events, Blossom media, poll records, ledger documents) with deep links.
+
+**Verification:** Dispatch modal publishes Kinds 1 / 1063 / 30023 to `:9003` and remote relays, with 1063 uploads landed in local Blossom. Governance Auditor defaults to BUD-01 verification with IPFS behind an advanced toggle. Footprint matrix reflects live local counts and deep-links into each satellite view.
 
 ---
 

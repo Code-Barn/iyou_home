@@ -18,9 +18,11 @@
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { vi } from "vitest";
 import App from "../App";
+import { DEFAULT_USER_PREFERENCES } from "../lib/types";
+import { sha256Hex } from "../lib/appLock";
 
-const mockInvoke = vi.hoisted(() =>
-  vi.fn((cmd: string, args?: Record<string, unknown>) => {
+const { mockInvoke, defaultMockHandler } = vi.hoisted(() => {
+  const handler = (cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
       case "get_auto_start_settings":
         return Promise.resolve({ Blossom: true, Nostr: true, Chat: true });
@@ -83,8 +85,12 @@ const mockInvoke = vi.hoisted(() =>
       default:
         return Promise.resolve();
     }
-  }),
-);
+  };
+  const mockInvoke = vi.fn(handler);
+  return { mockInvoke, defaultMockHandler: handler };
+});
+
+const eventListeners: Record<string, ((event: any) => void)[]> = {};
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: mockInvoke,
@@ -93,24 +99,58 @@ vi.mock("@tauri-apps/api/core", () => ({
   })),
 }));
 
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((event: string, handler: (event: any) => void) => {
+    if (!eventListeners[event]) {
+      eventListeners[event] = [];
+    }
+    eventListeners[event].push(handler);
+    return Promise.resolve(() => {
+      eventListeners[event] = (eventListeners[event] || []).filter((h) => h !== handler);
+    });
+  }),
+  emit: vi.fn((event: string, payload?: any) => {
+    eventListeners[event]?.forEach((h) => h({ payload }));
+    return Promise.resolve();
+  }),
+}));
+
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
   writeText: vi.fn().mockResolvedValue(undefined),
 }));
 
 describe("App", () => {
   beforeEach(() => {
-    mockInvoke.mockClear();
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(defaultMockHandler);
+    Object.keys(eventListeners).forEach((k) => delete eventListeners[k]);
   });
 
   it("renders all main tabs", () => {
     render(<App />);
     // Tab buttons are inside .tabs container; status bar also has button text matching "Enclave"
     const tabs = document.querySelector(".tabs");
+    expect(tabs?.textContent).toContain("Messages");
     expect(tabs?.textContent).toContain("Enclave");
     expect(tabs?.textContent).toContain("Credentials");
     expect(tabs?.textContent).toContain("Vault");
     expect(tabs?.textContent).toContain("Services");
     expect(tabs?.textContent).toContain("Governance");
+  });
+
+  it("navigates to the Messages tab and renders the split-pane inbox", async () => {
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Messages/i }));
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Select a conversation or start a new encrypted chat"),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /Start New Chat/i })).toBeInTheDocument();
+    });
   });
 
   it("defaults to Enclave tab on launch", () => {
@@ -353,6 +393,81 @@ describe("App", () => {
         }),
       );
       expect(screen.getByText(/Credential imported successfully/i)).toBeInTheDocument();
+    });
+  });
+
+  it("renders FirstRunSeedGate overlay on greenfield initialization when seed backup is unconfirmed", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_vault_status") return Promise.resolve(true);
+      if (cmd === "get_user_preferences")
+        return Promise.resolve({
+          ...DEFAULT_USER_PREFERENCES,
+          seed_backup_confirmed: false,
+        });
+      if (cmd === "reveal_master_seed")
+        return Promise.resolve(
+          "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        );
+      return defaultMockHandler(cmd, args);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Master Seed Backup/i)).toBeInTheDocument();
+    });
+  });
+
+  it("renders AppLockOverlay when app_lock_enabled is set and unlocks on valid PIN", async () => {
+    const pin = "123456";
+    const pinHash = await sha256Hex(pin);
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_vault_status") return Promise.resolve(true);
+      if (cmd === "get_user_preferences")
+        return Promise.resolve({
+          ...DEFAULT_USER_PREFERENCES,
+          seed_backup_confirmed: true,
+          app_lock_enabled: true,
+          app_lock_pin_hash: pinHash,
+        });
+      return defaultMockHandler(cmd, args);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText("iyou_home is locked")).toBeInTheDocument();
+    });
+
+    const pinInput = screen.getByPlaceholderText("••••••");
+    const unlockBtn = screen.getByRole("button", { name: "Unlock" });
+
+    await act(async () => {
+      fireEvent.change(pinInput, { target: { value: pin } });
+    });
+
+    await act(async () => {
+      fireEvent.click(unlockBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("iyou_home is locked")).not.toBeInTheDocument();
+    });
+  });
+
+  it("locks the app upon receiving the native tray app://lock event", async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(eventListeners["app://lock"]?.length).toBeGreaterThan(0);
+    });
+
+    await act(async () => {
+      eventListeners["app://lock"]?.forEach((h) => h({}));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("iyou_home is locked")).toBeInTheDocument();
     });
   });
 });

@@ -202,6 +202,30 @@ fn derive_backup_key(password: &str, salt: &[u8; 32]) -> [u8; 32] {
     key
 }
 
+/// Enumerate `.json` ledger files inside `{app_data}/ledgers/` (if present).
+///
+/// The directory is optional and may not exist on fresh installs; this never
+/// fails — it simply returns an empty vector. Files are sorted for a stable
+/// archive manifest.
+fn collect_ledger_files(app_data_dir: &Path) -> Vec<PathBuf> {
+    let ledgers_dir = app_data_dir.join("ledgers");
+    let Ok(entries) = std::fs::read_dir(&ledgers_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 /// Pack the in-memory vault and data directory companion files into a plaintext JSON payload.
 fn pack_backup_payload(vault: &VaultStore, app_data_dir: &Path) -> Result<String, String> {
     let vault_val = serde_json::to_value(vault)
@@ -223,19 +247,47 @@ fn pack_backup_payload(vault: &VaultStore, app_data_dir: &Path) -> Result<String
         _ => serde_json::json!({}),
     };
 
+    let pairing_path = app_data_dir.join("pairing.json");
+    let pairing_val: serde_json::Value = match fs::read(&pairing_path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    };
+
+    // Dynamically bundle every JSON file found in {app_data}/ledgers/.
+    let mut ledgers_map = serde_json::Map::new();
+    for path in collect_ledger_files(app_data_dir) {
+        if let Ok(bytes) = fs::read(&path) {
+            if bytes.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    ledgers_map.insert(name.to_string(), value);
+                }
+            }
+        }
+    }
+
     let exported_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
+    let ledger_file_count = ledgers_map.len();
+
     let payload = serde_json::json!({
         "vault": vault_val,
         "contacts": contacts_val,
         "preferences": prefs_val,
+        "pairing": pairing_val,
+        "ledgers": serde_json::Value::Object(ledgers_map),
         "manifest": {
             "version": "2.0",
             "exported_at": exported_at,
-            "app_version": "2.0.0"
+            "app_version": "2.0.0",
+            "ledger_file_count": ledger_file_count
         }
     });
 
@@ -384,6 +436,37 @@ pub fn import_vault_backup(
         let dest = app_data_dir.join("preferences.json");
         fs::rename(&tmp, &dest)
             .map_err(|e| format!("Failed to finalize preferences.json: {}", e))?;
+    }
+
+    if let Some(pairing_val) = payload.get("pairing") {
+        let pairing_bytes = serde_json::to_vec_pretty(pairing_val)
+            .map_err(|e| format!("Failed to serialize pairing: {}", e))?;
+        let tmp = app_data_dir.join("pairing.json.tmp");
+        atomic_write_bytes(&tmp, &pairing_bytes)?;
+        let dest = app_data_dir.join("pairing.json");
+        fs::rename(&tmp, &dest)
+            .map_err(|e| format!("Failed to finalize pairing.json: {}", e))?;
+    }
+
+    // Dynamically restore ledger files bundled under payload["ledgers"]. Each
+    // file lands in {app_data}/ledgers/ via .tmp staging + atomic rename.
+    // Filenames are sanitized to a single safe basename to block traversal.
+    if let Some(ledgers) = payload.get("ledgers").and_then(|l| l.as_object()) {
+        let ledgers_dir = app_data_dir.join("ledgers");
+        for (name, value) in ledgers.iter() {
+            let file_name = Path::new(name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.starts_with('.') && n.ends_with(".json"))
+                .ok_or_else(|| format!("Unsafe ledger filename in backup: '{}'", name))?;
+            let ledger_bytes = serde_json::to_vec_pretty(value)
+                .map_err(|e| format!("Failed to serialize ledger '{}': {}", file_name, e))?;
+            let tmp = ledgers_dir.join(format!("{}.tmp", file_name));
+            atomic_write_bytes(&tmp, &ledger_bytes)?;
+            let dest = ledgers_dir.join(file_name);
+            fs::rename(&tmp, &dest)
+                .map_err(|e| format!("Failed to finalize ledger '{}': {}", file_name, e))?;
+        }
     }
 
     Ok(true)
@@ -2718,6 +2801,116 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&restore_dir);
+    }
+
+    #[test]
+    fn test_backup_round_trip_includes_pairing_and_ledger_files() {
+        let tmp = std::env::temp_dir().join("iyou_test_backup_ledgers");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let seed = vec![0xB2u8; 32];
+        let vault = VaultStore {
+            root_seed_base58: bs58::encode(&seed).into_string(),
+            profiles: initial_profiles(&seed),
+            sovereign_identities: vec![],
+        };
+        fs::write(tmp.join("vault.json"), serde_json::to_string_pretty(&vault).unwrap()).unwrap();
+
+        fs::write(
+            tmp.join("pairing.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "devices": [{
+                    "device_id": "pair-1",
+                    "device_name": "Test Handset",
+                    "created_at": 1700000000
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Third-party ledger documents live under {app_data}/ledgers/.
+        let ledgers_dir = tmp.join("ledgers");
+        fs::create_dir_all(&ledgers_dir).unwrap();
+        let hive = serde_json::json!({ "hives": [{ "name": "garden-1", "sensors": 3 }] });
+        let name = serde_json::json!({ "reservations": [{ "nick": "alice", "expires": 1710000000 }] });
+        let talk = serde_json::json!({ "conversations": [{ "peer": "bob", "count": 4 }] });
+        let vendor = serde_json::json!({ "custom": { "flag": true, "seq": 7 } });
+        for (file, value) in [
+            ("hive_ledger.json", &hive),
+            ("name_ledger.json", &name),
+            ("talk_journal.json", &talk),
+            ("third_party_ledger.json", &vendor),
+        ] {
+            fs::write(
+                ledgers_dir.join(file),
+                serde_json::to_string_pretty(value).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let password = "ledger-password";
+        let backup_bytes = export_vault_backup(&vault, &tmp, password)
+            .expect("Export should succeed with ledgers present");
+        assert!(!backup_bytes.is_empty(), "Backup should not be empty");
+
+        let restore_dir = std::env::temp_dir().join("iyou_test_backup_ledgers_restore");
+        let _ = fs::remove_dir_all(&restore_dir);
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        import_vault_backup(&restore_dir, &backup_bytes, password)
+            .expect("Restore with ledgers should succeed");
+
+        // Root pairing.json restored.
+        let restored_pairing: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(restore_dir.join("pairing.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_pairing["devices"][0]["device_name"], "Test Handset");
+
+        // Every bundled ledger file restored into {app_data}/ledgers/.
+        for (file, value) in [
+            ("hive_ledger.json", &hive),
+            ("name_ledger.json", &name),
+            ("talk_journal.json", &talk),
+            ("third_party_ledger.json", &vendor),
+        ] {
+            let restored: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(restore_dir.join("ledgers").join(file)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restored, *value, "Ledger {} should round-trip", file);
+        }
+
+        // A fresh import that has no ledgers still succeeds.
+        let fresh_dir = std::env::temp_dir().join("iyou_test_backup_ledgers_none");
+        let _ = fs::remove_dir_all(&fresh_dir);
+        fs::create_dir_all(&fresh_dir).unwrap();
+        import_vault_backup(&fresh_dir, &backup_bytes, password)
+            .expect("Restore into a dir without ledgers should succeed");
+
+        // Restore must tolerate a payload with no ledgers key (legacy archives).
+        let payload = serde_json::json!({
+            "vault": serde_json::to_value(&vault).unwrap(),
+            "contacts": serde_json::json!([]),
+            "preferences": serde_json::json!({}),
+            "manifest": { "version": "2.0" }
+        });
+        let plain = serde_json::to_string(&payload).unwrap();
+        let mut salt = [0u8; 32];
+        OsRng.fill_bytes(&mut salt);
+        let legacy_envelope = encrypt_payload(&plain, password).unwrap();
+        let legacy_dir = std::env::temp_dir().join("iyou_test_backup_legacy");
+        let _ = fs::remove_dir_all(&legacy_dir);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        import_vault_backup(&legacy_dir, &legacy_envelope, password)
+            .expect("Legacy archives without ledgers should restore");
+
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&restore_dir);
+        let _ = fs::remove_dir_all(&fresh_dir);
+        let _ = fs::remove_dir_all(&legacy_dir);
     }
 
     #[test]

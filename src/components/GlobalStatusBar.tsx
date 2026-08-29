@@ -19,6 +19,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Profile } from "../lib/types";
+import QuickDispatchModal from "./QuickDispatchModal";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -36,6 +37,7 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
   const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
   const [copiedDid, setCopiedDid] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<number>(0);
+  const [isDispatchOpen, setIsDispatchOpen] = useState(false);
 
   const pollStatuses = useCallback(async () => {
     try {
@@ -97,7 +99,7 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
   };
 
   const dotColor = (name: string): string => {
-    const s = statuses[name];
+    const s = statuses?.[name];
     if (name === "SigBridge") return "var(--color-success)";
     if (s === "running") return "var(--color-success)";
     if (s === "starting") return "var(--color-warning)";
@@ -105,7 +107,7 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
   };
 
   const dotLabel = (name: string): string => {
-    const s = statuses[name];
+    const s = statuses?.[name];
     if (name === "SigBridge") return `${name} — always active`;
     return `${name} — ${s || "unknown"}`;
   };
@@ -128,77 +130,112 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
   };
 
   return (
-    <div className="global-status-bar">
-      {/* Left cluster: Wordmark */}
-      <button
-        type="button"
-        className="status-bar-wordmark"
-        onClick={onNavigateEnclave}
-      >
-        <span className="wordmark-text">iyou_home</span>
-        <span className="wordmark-badge">v2.0 · Enclave Active</span>
-      </button>
+    <>
+      <div className="global-status-bar">
+        {/* Left cluster: Wordmark */}
+        <button
+          type="button"
+          className="status-bar-wordmark"
+          onClick={onNavigateEnclave}
+        >
+          <span className="wordmark-text">iyou_home</span>
+          <span className="wordmark-badge">v2.0 · Enclave Active</span>
+        </button>
 
-      {/* Center cluster: Daemon indicators + sync */}
-      <div className="status-bar-daemons">
-        {["SigBridge", "Nostr", "Blossom"].map((name) => (
+        {/* Center cluster: Daemon indicators + sync */}
+        <div className="status-bar-daemons">
+          {["SigBridge", "Nostr", "Blossom"].map((name) => (
+            <span
+              key={name}
+              className="daemon-indicator"
+              title={dotLabel(name)}
+            >
+              <span
+                className="daemon-dot"
+                style={{ backgroundColor: dotColor(name) }}
+              />
+              <span className="daemon-label">{name}</span>
+            </span>
+          ))}
           <span
-            key={name}
-            className="daemon-indicator"
-            title={dotLabel(name)}
+            className="daemon-indicator sync-indicator"
+            title={formatSyncLabel(lastSyncedAt)}
+            style={{ marginLeft: "0.5rem", opacity: 0.85 }}
           >
             <span
               className="daemon-dot"
-              style={{ backgroundColor: dotColor(name) }}
+              style={{
+                backgroundColor:
+                  lastSyncedAt === 0
+                    ? "#9ca3af"
+                    : (Date.now() / 1000 - lastSyncedAt) < 300
+                      ? "var(--color-success)"
+                      : "var(--color-warning)",
+              }}
             />
-            <span className="daemon-label">{name}</span>
+            <span className="daemon-label">Sync</span>
           </span>
-        ))}
-        <span
-          className="daemon-indicator sync-indicator"
-          title={formatSyncLabel(lastSyncedAt)}
-          style={{ marginLeft: "0.5rem", opacity: 0.85 }}
-        >
-          <span
-            className="daemon-dot"
+        </div>
+
+        {/* Right cluster: Quick Dispatch trigger + Active persona pill */}
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          <button
+            type="button"
+            className="status-bar-dispatch-btn"
+            onClick={() => setIsDispatchOpen(true)}
+            title="Quick Dispatcher (Note, Media Drop, Civic Poll)"
             style={{
-              backgroundColor:
-                lastSyncedAt === 0
-                  ? "#9ca3af"
-                  : (Date.now() / 1000 - lastSyncedAt) < 300
-                    ? "var(--color-success)"
-                    : "var(--color-warning)",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "0.35rem",
+              padding: "0.35rem 0.8rem",
+              background: "linear-gradient(135deg, #4338ca 0%, #312e81 100%)",
+              color: "#ffffff",
+              border: "1px solid rgba(199, 210, 254, 0.4)",
+              borderRadius: "999px",
+              fontSize: "0.78rem",
+              fontWeight: 700,
+              cursor: "pointer",
+              boxShadow: "0 1px 4px rgba(0,0,0,0.15)",
+              transition: "transform 0.1s, opacity 0.15s",
             }}
-          />
-          <span className="daemon-label">Sync</span>
-        </span>
+          >
+            <span>✍️</span>
+            <span>Dispatch</span>
+          </button>
+
+          <button
+            type="button"
+            className="status-bar-persona"
+            onClick={onNavigateEnclave}
+            title={activeProfile?.did || "No identity"}
+          >
+            <span className="persona-icon">{personaIcon}</span>
+            <span className="persona-label">{personaLabel}</span>
+            {activeProfile?.did && (
+              <>
+                <span className="persona-did">{truncateDid(activeProfile.did)}</span>
+                <span
+                  className="persona-copy"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleCopyDid();
+                  }}
+                  title="Copy DID"
+                >
+                  {copiedDid ? "\u2713" : "\uD83D\uDCCB"}
+                </span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
 
-      {/* Right cluster: Active persona pill */}
-      <button
-        type="button"
-        className="status-bar-persona"
-        onClick={onNavigateEnclave}
-        title={activeProfile?.did || "No identity"}
-      >
-        <span className="persona-icon">{personaIcon}</span>
-        <span className="persona-label">{personaLabel}</span>
-        {activeProfile?.did && (
-          <>
-            <span className="persona-did">{truncateDid(activeProfile.did)}</span>
-            <span
-              className="persona-copy"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleCopyDid();
-              }}
-              title="Copy DID"
-            >
-              {copiedDid ? "\u2713" : "\uD83D\uDCCB"}
-            </span>
-          </>
-        )}
-      </button>
-    </div>
+      {/* Quick Dispatch Modal */}
+      <QuickDispatchModal
+        isOpen={isDispatchOpen}
+        onClose={() => setIsDispatchOpen(false)}
+      />
+    </>
   );
 }

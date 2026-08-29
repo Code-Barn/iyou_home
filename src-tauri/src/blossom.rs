@@ -68,7 +68,13 @@ pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Re
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::PUT, Method::HEAD, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::PUT,
+            Method::HEAD,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let pna_layer = SetResponseHeaderLayer::appending(
@@ -82,6 +88,7 @@ pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Re
             get(handle_get)
                 .head(handle_head)
                 .put(handle_put)
+                .delete(handle_delete)
                 .options(handle_options),
         )
         .route(
@@ -89,6 +96,7 @@ pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Re
             get(handle_get)
                 .head(handle_head)
                 .put(handle_put)
+                .delete(handle_delete)
                 .options(handle_options),
         )
         .route("/", options(handle_options))
@@ -118,7 +126,7 @@ async fn handle_options() -> Response {
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            "GET, PUT, HEAD, OPTIONS",
+            "GET, PUT, HEAD, DELETE, OPTIONS",
         )
         .header(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
@@ -216,11 +224,34 @@ async fn handle_put(
     }
 }
 
-fn is_valid_hash(hash: &str) -> bool {
+async fn handle_delete(
+    Path(hash): Path<String>,
+    State(state): State<BlossomState>,
+) -> impl IntoResponse {
+    if !is_valid_hash(&hash) || hash != hash.to_ascii_lowercase() {
+        return (StatusCode::BAD_REQUEST, "Invalid hash format").into_response();
+    }
+
+    let file_path = state.blobs_dir.join(&hash);
+
+    match fs::metadata(&file_path).await {
+        Ok(meta) if meta.is_file() => match fs::remove_file(&file_path).await {
+            Ok(_) => (StatusCode::OK, "Deleted").into_response(),
+            Err(e) => {
+                eprintln!("Blossom delete error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Delete failed").into_response()
+            }
+        },
+        Ok(_) => (StatusCode::CONFLICT, "Path is not a blob file").into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
+}
+
+pub fn is_valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn detect_mime_type(data: &[u8]) -> &'static str {
+pub fn detect_mime_type(data: &[u8]) -> &'static str {
     if data.len() >= 4 {
         let magic: [u8; 4] = [data[0], data[1], data[2], data[3]];
         match &magic {

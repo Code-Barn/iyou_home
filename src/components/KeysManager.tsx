@@ -20,7 +20,21 @@ import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open } from "@tauri-apps/plugin-dialog";
 import { save } from "@tauri-apps/plugin-dialog";
-import { Profile } from "../lib/types";
+import type { Profile, UserPreferences } from "../lib/types";
+import { DEFAULT_USER_PREFERENCES } from "../lib/types";
+import {
+  INACTIVITY_TIMEOUT_OPTIONS,
+  isValidAppLockPin,
+  loadUserPreferences,
+  saveUserPreferences,
+  sha256Hex,
+} from "../lib/appLock";
+import {
+  DEFAULT_PRF_SALT,
+  getOrRegisterPrfSeed,
+  webauthnPrfSupported,
+} from "../lib/webauthnPrf";
+import DevicePairing from "./DevicePairing";
 
 function levelLabel(level: number): string {
   if (level === 0) return "L0 Anchor";
@@ -28,12 +42,37 @@ function levelLabel(level: number): string {
   return `L${level} Burner`;
 }
 
-export default function KeysManager() {
+export interface KeysManagerProps {
+  prefs?: UserPreferences | null;
+  onLockSettingsChange?: (next: UserPreferences) => void;
+}
+
+export default function KeysManager({
+  prefs: propPrefs,
+  onLockSettingsChange,
+}: KeysManagerProps = {}) {
   const [activeDid, setActiveDid] = useState<string | null>(null);
   const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+
+  // App Lock settings
+  const [appPrefs, setAppPrefs] = useState<UserPreferences | null>(propPrefs ?? null);
+  const [showPinModal, setShowPinModal] = useState(false);
+  const [newPin, setNewPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [lockErrorMessage, setLockErrorMessage] = useState<string | null>(null);
+  const [lockStatusMessage, setLockStatusMessage] = useState<string | null>(null);
+  const [biometricEnrolling, setBiometricEnrolling] = useState(false);
+
+  useEffect(() => {
+    if (propPrefs !== undefined) {
+      setAppPrefs(propPrefs);
+    } else {
+      loadUserPreferences().then(setAppPrefs);
+    }
+  }, [propPrefs]);
 
   // Seed reveal modal
   const [showSeedModal, setShowSeedModal] = useState(false);
@@ -197,23 +236,9 @@ export default function KeysManager() {
       });
 
       if (filePath) {
-        // Write bytes to file via Tauri fs
         await invoke("write_binary_file", {
           path: filePath,
-          data: bytes,
-        }).catch(async () => {
-          // Fallback: use download blob approach
-          const blob = new Blob([new Uint8Array(bytes)], {
-            type: "application/octet-stream",
-          });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = "iyou_home_backup.iyoubackup";
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
+          contents: bytes,
         });
       }
 
@@ -237,14 +262,9 @@ export default function KeysManager() {
 
       if (!selected) return;
 
-      // Read file contents
+      // Read file contents via native binary IPC
       const bytes = await invoke<number[]>("read_binary_file", {
         path: selected,
-      }).catch(async () => {
-        // Fallback: read via fetch if Tauri fs not available
-        const response = await fetch(selected as string);
-        const arrayBuf = await response.arrayBuffer();
-        return Array.from(new Uint8Array(arrayBuf));
       });
 
       setPendingRestoreBytes(bytes);
@@ -324,6 +344,128 @@ export default function KeysManager() {
       setShowRevokeModal(false);
     } finally {
       setRevokeLoading(false);
+    }
+  };
+
+  // --- App Lock & Inactivity Handlers ---
+  const handleToggleAppLock = async () => {
+    setLockErrorMessage(null);
+    setLockStatusMessage(null);
+    const current = appPrefs || DEFAULT_USER_PREFERENCES;
+    if (current.app_lock_enabled) {
+      const updated: UserPreferences = {
+        ...current,
+        app_lock_enabled: false,
+      };
+      try {
+        await saveUserPreferences(updated);
+        setAppPrefs(updated);
+        onLockSettingsChange?.(updated);
+        setLockStatusMessage("App lock disabled.");
+      } catch (err: any) {
+        setLockErrorMessage(`Failed to disable app lock: ${err.toString()}`);
+      }
+    } else {
+      if (current.app_lock_pin_hash) {
+        const updated: UserPreferences = {
+          ...current,
+          app_lock_enabled: true,
+        };
+        try {
+          await saveUserPreferences(updated);
+          setAppPrefs(updated);
+          onLockSettingsChange?.(updated);
+          setLockStatusMessage("App lock enabled.");
+        } catch (err: any) {
+          setLockErrorMessage(`Failed to enable app lock: ${err.toString()}`);
+        }
+      } else {
+        setShowPinModal(true);
+      }
+    }
+  };
+
+  const handleSavePin = async () => {
+    setLockErrorMessage(null);
+    if (!isValidAppLockPin(newPin)) {
+      setLockErrorMessage("PIN must be exactly 6 digits.");
+      return;
+    }
+    if (newPin !== confirmPin) {
+      setLockErrorMessage("PINs do not match.");
+      return;
+    }
+    try {
+      const pinHash = await sha256Hex(newPin);
+      const current = appPrefs || DEFAULT_USER_PREFERENCES;
+      const updated: UserPreferences = {
+        ...current,
+        app_lock_enabled: true,
+        app_lock_pin_hash: pinHash,
+      };
+      await saveUserPreferences(updated);
+      setAppPrefs(updated);
+      onLockSettingsChange?.(updated);
+      setShowPinModal(false);
+      setNewPin("");
+      setConfirmPin("");
+      setLockStatusMessage("PIN set and App Lock enabled.");
+    } catch (err: any) {
+      setLockErrorMessage(`Failed to save PIN: ${err.toString()}`);
+    }
+  };
+
+  const handleChangeTimeout = async (minutes: number) => {
+    const current = appPrefs || DEFAULT_USER_PREFERENCES;
+    const updated: UserPreferences = {
+      ...current,
+      inactivity_timeout_minutes: minutes,
+    };
+    try {
+      await saveUserPreferences(updated);
+      setAppPrefs(updated);
+      onLockSettingsChange?.(updated);
+    } catch (err: any) {
+      setLockErrorMessage(`Failed to update timeout: ${err.toString()}`);
+    }
+  };
+
+  const handleEnrollBiometrics = async () => {
+    setBiometricEnrolling(true);
+    setLockErrorMessage(null);
+    try {
+      const result = await getOrRegisterPrfSeed(DEFAULT_PRF_SALT);
+      const prfHash = await sha256Hex(result.prfSeedHex);
+      const current = appPrefs || DEFAULT_USER_PREFERENCES;
+      const updated: UserPreferences = {
+        ...current,
+        app_lock_prf_hash: prfHash,
+      };
+      await saveUserPreferences(updated);
+      setAppPrefs(updated);
+      onLockSettingsChange?.(updated);
+      setLockStatusMessage("Biometrics / Passkey enrolled successfully.");
+    } catch (err: any) {
+      setLockErrorMessage(`Biometric enrollment failed: ${err?.message ?? String(err)}`);
+    } finally {
+      setBiometricEnrolling(false);
+    }
+  };
+
+  const handleRemoveBiometrics = async () => {
+    setLockErrorMessage(null);
+    const current = appPrefs || DEFAULT_USER_PREFERENCES;
+    const updated: UserPreferences = {
+      ...current,
+      app_lock_prf_hash: null,
+    };
+    try {
+      await saveUserPreferences(updated);
+      setAppPrefs(updated);
+      onLockSettingsChange?.(updated);
+      setLockStatusMessage("Biometrics removed.");
+    } catch (err: any) {
+      setLockErrorMessage(`Failed to remove biometrics: ${err.toString()}`);
     }
   };
 
@@ -453,6 +595,9 @@ export default function KeysManager() {
         </ul>
       </div>
 
+      {/* Mobile Device Pairing */}
+      <DevicePairing />
+
       {/* Encrypted Backup & Recovery */}
       <div className="section">
         <h3>Encrypted Backup &amp; Recovery</h3>
@@ -501,6 +646,115 @@ export default function KeysManager() {
         >
           {"\uD83D\uDED1"} Revoke All Web Sessions
         </button>
+      </div>
+
+      {/* App Lock & Inactivity Guard */}
+      <div className="section">
+        <h3>{"\uD83D\uDD12"} App Lock &amp; Inactivity Guard</h3>
+        <p className="muted" style={{ marginBottom: "0.75rem" }}>
+          Require authentication to access iyou_home and automatically lock when inactive.
+        </p>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontWeight: 600 }}>
+            <input
+              type="checkbox"
+              checked={appPrefs?.app_lock_enabled ?? false}
+              onChange={handleToggleAppLock}
+            />
+            Enable App Lock
+          </label>
+
+          {appPrefs?.app_lock_enabled && (
+            <button
+              onClick={() => {
+                setLockErrorMessage(null);
+                setShowPinModal(true);
+              }}
+              style={{
+                fontSize: "0.85rem",
+                padding: "0.35rem 0.75rem",
+                background: "transparent",
+                border: "1px solid #d1d5db",
+              }}
+            >
+              {appPrefs?.app_lock_pin_hash ? "Change PIN" : "Set 6-Digit PIN"}
+            </button>
+          )}
+        </div>
+
+        {appPrefs?.app_lock_enabled && (
+          <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+              <label style={{ fontSize: "0.88rem", fontWeight: 500 }}>Auto-lock timeout:</label>
+              <select
+                value={appPrefs.inactivity_timeout_minutes}
+                onChange={(e) => handleChangeTimeout(Number(e.target.value))}
+                style={{
+                  padding: "0.35rem 0.6rem",
+                  borderRadius: "6px",
+                  border: "1px solid #d1d5db",
+                  background: "#fff",
+                  fontSize: "0.88rem",
+                }}
+              >
+                {INACTIVITY_TIMEOUT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {webauthnPrfSupported() && (
+              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.25rem" }}>
+                {appPrefs.app_lock_prf_hash ? (
+                  <>
+                    <span style={{ fontSize: "0.85rem", color: "#16a34a" }}>
+                      {"\u2713"} Biometrics / Passkey enrolled
+                    </span>
+                    <button
+                      onClick={handleRemoveBiometrics}
+                      style={{
+                        fontSize: "0.8rem",
+                        padding: "0.25rem 0.5rem",
+                        background: "transparent",
+                        border: "1px solid #ef4444",
+                        color: "#dc2626",
+                      }}
+                    >
+                      Remove Biometrics
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={handleEnrollBiometrics}
+                    disabled={biometricEnrolling}
+                    style={{
+                      fontSize: "0.85rem",
+                      padding: "0.35rem 0.75rem",
+                      background: "transparent",
+                      border: "1px solid #d1d5db",
+                    }}
+                  >
+                    {biometricEnrolling ? "Enrolling…" : "\uD83D\uDC64 Enroll Biometrics / Passkey"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {lockStatusMessage && (
+          <p style={{ fontSize: "0.85rem", color: "#16a34a", marginTop: "0.5rem" }}>
+            {lockStatusMessage}
+          </p>
+        )}
+        {lockErrorMessage && (
+          <p style={{ fontSize: "0.85rem", color: "#dc2626", marginTop: "0.5rem" }}>
+            {lockErrorMessage}
+          </p>
+        )}
       </div>
 
       {/* Master Seed Reveal */}
@@ -876,6 +1130,106 @@ export default function KeysManager() {
                 {revokeLoading ? "Revoking..." : "Confirm Revocation"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========== Set / Change App Lock PIN Modal ========== */}
+      {showPinModal && (
+        <div
+          className="modal-overlay"
+          onClick={() => {
+            setShowPinModal(false);
+            setNewPin("");
+            setConfirmPin("");
+            setLockErrorMessage(null);
+          }}
+        >
+          <div
+            className="modal-content"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: "400px" }}
+          >
+            <h3>{appPrefs?.app_lock_pin_hash ? "Change App Lock PIN" : "Set 6-Digit App Lock PIN"}</h3>
+            <p className="muted" style={{ fontSize: "0.85rem", marginBottom: "1rem" }}>
+              Enter a 6-digit numeric PIN to protect access to iyou_home.
+            </p>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSavePin();
+              }}
+            >
+              <div className="form-group">
+                <label>New 6-Digit PIN</label>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={newPin}
+                  onChange={(e) => setNewPin(e.target.value.replace(/\D/g, ""))}
+                  placeholder="6 digits"
+                  autoFocus
+                  required
+                />
+              </div>
+              <div className="form-group">
+                <label>Confirm PIN</label>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={confirmPin}
+                  onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, ""))}
+                  placeholder="Re-enter 6 digits"
+                  required
+                />
+              </div>
+              {lockErrorMessage && (
+                <div
+                  style={{
+                    marginBottom: "1rem",
+                    background: "#fef2f2",
+                    border: "1px solid #fecaca",
+                    color: "#b91c1c",
+                    padding: "0.5rem 0.75rem",
+                    borderRadius: "6px",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  {lockErrorMessage}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: "0.75rem", justifyContent: "flex-end", marginTop: "1rem" }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowPinModal(false);
+                    setNewPin("");
+                    setConfirmPin("");
+                    setLockErrorMessage(null);
+                  }}
+                  style={{
+                    background: "#f3f4f6",
+                    border: "1px solid #d1d5db",
+                    color: "var(--color-text-secondary)",
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={newPin.length !== 6 || confirmPin.length !== 6}
+                  style={{
+                    background: "#137333",
+                    color: "white",
+                    opacity: newPin.length !== 6 || confirmPin.length !== 6 ? 0.5 : 1,
+                  }}
+                >
+                  Save PIN
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

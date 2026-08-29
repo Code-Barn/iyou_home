@@ -2312,13 +2312,16 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "chrono",
+ "crc32fast",
  "did_rust",
  "ed25519-dalek",
+ "flate2",
  "futures-util",
  "hex",
  "hkdf",
  "http",
  "k256",
+ "qrcode",
  "quick-xml 0.31.0",
  "rand 0.8.6",
  "rcgen",
@@ -3348,6 +3351,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3424,7 +3433,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

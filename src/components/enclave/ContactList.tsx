@@ -18,12 +18,13 @@
 import React, { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { PeerContact, TrustLevel } from "../../lib/types";
+import { ChatPeerTarget, PeerContact, TrustLevel } from "../../lib/types";
 
 interface ContactListProps {
   contacts: PeerContact[];
   onRefresh: () => void | Promise<void>;
   onOpenDisclosure: () => void;
+  onOpenChat: (target: ChatPeerTarget) => void;
 }
 
 function isInnerCircle(trustLevel: TrustLevel | string): boolean {
@@ -81,6 +82,7 @@ export default function ContactList({
   contacts,
   onRefresh,
   onOpenDisclosure,
+  onOpenChat,
 }: ContactListProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [showUpsertModal, setShowUpsertModal] = useState(false);
@@ -534,6 +536,28 @@ export default function ContactList({
                       }}
                     >
                       ✏️ Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActionError(null);
+                        setActionSuccess(null);
+                        onOpenChat({
+                          peerId: contact.peer_id,
+                          displayName: contact.display_name,
+                        });
+                      }}
+                      style={{
+                        padding: "0.25rem 0.6rem",
+                        fontSize: "0.75rem",
+                        background: "#eff6ff",
+                        color: "#1d4ed8",
+                        border: "1px solid #bfdbfe",
+                        borderRadius: "4px",
+                      }}
+                      title={`Open an OMEMO-sealed chat with ${contact.display_name} in Messages`}
+                    >
+                      💬 Chat
                     </button>
                     <button
                       type="button"
