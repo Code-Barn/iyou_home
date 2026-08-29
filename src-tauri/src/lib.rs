@@ -1977,9 +1977,10 @@ pub fn run() {
                     _ => {}
                 });
 
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
-            }
+            let tray_icon = tauri::include_image!("./icons/tray-icon.png");
+            tray_builder = tray_builder
+                .icon(tray_icon)
+                .icon_as_template(true);
             tray_builder.build(app)?;
 
             Ok(())
