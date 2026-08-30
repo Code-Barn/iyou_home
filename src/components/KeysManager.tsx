@@ -18,9 +18,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { open } from "@tauri-apps/plugin-dialog";
-import { save } from "@tauri-apps/plugin-dialog";
-import type { Profile, UserPreferences } from "../lib/types";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import type { Profile, UpdateMetadata, UpdatePolicy, UpdatePreferences, UserPreferences } from "../lib/types";
 import { DEFAULT_USER_PREFERENCES } from "../lib/types";
 import {
   INACTIVITY_TIMEOUT_OPTIONS,
@@ -35,6 +34,7 @@ import {
   webauthnPrfSupported,
 } from "../lib/webauthnPrf";
 import DevicePairing from "./DevicePairing";
+import UpdateVettingModal from "./updater/UpdateVettingModal";
 
 function levelLabel(level: number): string {
   if (level === 0) return "L0 Anchor";
@@ -45,14 +45,20 @@ function levelLabel(level: number): string {
 export interface KeysManagerProps {
   prefs?: UserPreferences | null;
   onLockSettingsChange?: (next: UserPreferences) => void;
+  activeProfile?: Profile | null;
+  setActiveProfile?: (profile: Profile | null) => void;
 }
 
 export default function KeysManager({
   prefs: propPrefs,
   onLockSettingsChange,
+  activeProfile: propActiveProfile,
+  setActiveProfile: propSetActiveProfile,
 }: KeysManagerProps = {}) {
-  const [activeDid, setActiveDid] = useState<string | null>(null);
-  const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
+  const [localActiveDid, setLocalActiveDid] = useState<string | null>(null);
+  const [localActiveProfile, setLocalActiveProfile] = useState<Profile | null>(null);
+  const activeProfile = propActiveProfile !== undefined ? propActiveProfile : localActiveProfile;
+  const activeDid = activeProfile?.did || localActiveDid;
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -65,6 +71,88 @@ export default function KeysManager({
   const [lockErrorMessage, setLockErrorMessage] = useState<string | null>(null);
   const [lockStatusMessage, setLockStatusMessage] = useState<string | null>(null);
   const [biometricEnrolling, setBiometricEnrolling] = useState(false);
+
+  // Updater settings & rollback
+  const [updatePrefs, setUpdatePrefs] = useState<UpdatePreferences>({
+    policy: "manual",
+    release_channel: "stable",
+    custom_manifest_url: null,
+    last_checked_at: null,
+    ignored_version: null,
+  });
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateStatusMessage, setUpdateStatusMessage] = useState<string | null>(null);
+  const [vettedUpdate, setVettedUpdate] = useState<UpdateMetadata | null>(null);
+  const [showVettingModal, setShowVettingModal] = useState(false);
+
+  const [hasRollback, setHasRollback] = useState(false);
+  const [rollbackLoading, setRollbackLoading] = useState(false);
+  const [showRollbackConfirm, setShowRollbackConfirm] = useState(false);
+  const [rollbackStatusMessage, setRollbackStatusMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<UpdatePreferences>("get_update_preferences")
+      .then((p) => {
+        if (p) setUpdatePrefs(p);
+      })
+      .catch(() => {});
+    invoke<boolean>("has_rollback_binary")
+      .then(setHasRollback)
+      .catch(() => {});
+  }, []);
+
+  const handleUpdatePolicyChange = async (policy: UpdatePolicy) => {
+    const next: UpdatePreferences = { ...updatePrefs, policy };
+    setUpdatePrefs(next);
+    try {
+      await invoke("set_update_preferences", { prefs: next });
+    } catch (e) {
+      console.error("Failed to save update policy:", e);
+    }
+  };
+
+  const handleReleaseChannelChange = async (release_channel: string) => {
+    const next: UpdatePreferences = { ...updatePrefs, release_channel };
+    setUpdatePrefs(next);
+    try {
+      await invoke("set_update_preferences", { prefs: next });
+    } catch (e) {
+      console.error("Failed to save release channel:", e);
+    }
+  };
+
+  const handleCheckUpdates = async () => {
+    setUpdateChecking(true);
+    setUpdateStatusMessage(null);
+    try {
+      const meta = await invoke<UpdateMetadata | null>("check_for_update_vetting", { force: true });
+      if (meta) {
+        setVettedUpdate(meta);
+        setShowVettingModal(true);
+      } else {
+        setUpdateStatusMessage("✓ Your sovereign node is up to date.");
+        setTimeout(() => setUpdateStatusMessage(null), 4000);
+      }
+    } catch (err: any) {
+      setUpdateStatusMessage(`Check failed: ${err?.toString() || "Network unreachable"}`);
+    } finally {
+      setUpdateChecking(false);
+    }
+  };
+
+  const handleExecuteRollback = async () => {
+    setRollbackLoading(true);
+    setRollbackStatusMessage(null);
+    try {
+      await invoke("rollback_to_previous_binary");
+      setRollbackStatusMessage("✅ Binary rolled back successfully! Please restart iyou_home.");
+      setShowRollbackConfirm(false);
+    } catch (err: any) {
+      setRollbackStatusMessage(`Rollback failed: ${err?.toString()}`);
+    } finally {
+      setRollbackLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (propPrefs !== undefined) {
@@ -108,15 +196,22 @@ export default function KeysManager({
         invoke<string | null>("get_active_did"),
         invoke<Profile[]>("list_profiles"),
       ]);
-      setActiveDid(did);
-      if (did && profiles) {
-        const match = profiles.find((p) => p.did === did);
-        setActiveProfile(match || null);
+      setLocalActiveDid(did);
+      if (profiles && profiles.length > 0) {
+        const match =
+          (did ? profiles.find((p) => p.did === did) : null) ||
+          profiles.find((p) => p.active === true) ||
+          profiles.find((p) => p.level === 1) ||
+          profiles[0];
+        setLocalActiveProfile(match || null);
+        if (match && propSetActiveProfile) {
+          propSetActiveProfile(match);
+        }
       }
     } catch (err: any) {
       setError(err.toString());
     }
-  }, []);
+  }, [propSetActiveProfile]);
 
   useEffect(() => {
     fetchData();
@@ -757,6 +852,124 @@ export default function KeysManager({
         )}
       </div>
 
+      {/* Software Updates & Verification */}
+      <div className="section" style={{ marginTop: "1rem" }}>
+        <h3>Software Updates & Verification</h3>
+        <p className="muted" style={{ marginBottom: "0.85rem" }}>
+          Control remote update polling and cryptographically inspect release binaries before execution.
+        </p>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", marginBottom: "1rem" }}>
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
+            <input
+              type="radio"
+              name="update_policy"
+              value="locked"
+              checked={updatePrefs.policy === "locked"}
+              onChange={() => handleUpdatePolicyChange("locked")}
+              style={{ marginTop: "0.2rem" }}
+            />
+            <div>
+              <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
+                🔒 Air-Gapped / Locked
+              </div>
+              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
+                Zero network polling. Disables all remote version checks and auto-update triggers.
+              </div>
+            </div>
+          </label>
+
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
+            <input
+              type="radio"
+              name="update_policy"
+              value="manual"
+              checked={updatePrefs.policy === "manual"}
+              onChange={() => handleUpdatePolicyChange("manual")}
+              style={{ marginTop: "0.2rem" }}
+            />
+            <div>
+              <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
+                👁️ Manual Review (Recommended)
+              </div>
+              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
+                Poll on demand or surface subtle notifications; require manual cryptographic signature inspection before applying.
+              </div>
+            </div>
+          </label>
+
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
+            <input
+              type="radio"
+              name="update_policy"
+              value="auto"
+              checked={updatePrefs.policy === "auto"}
+              onChange={() => handleUpdatePolicyChange("auto")}
+              style={{ marginTop: "0.2rem" }}
+            />
+            <div>
+              <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
+                ⚡ Automatic
+              </div>
+              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
+                Download verified updates in background and prompt to restart.
+              </div>
+            </div>
+          </label>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.75rem" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <span style={{ fontSize: "0.82rem", color: "#475569", fontWeight: 600 }}>Release Channel:</span>
+            <select
+              value={updatePrefs.release_channel}
+              onChange={(e) => handleReleaseChannelChange(e.target.value)}
+              style={{
+                fontSize: "0.82rem",
+                padding: "0.25rem 0.6rem",
+                borderRadius: "6px",
+                border: "1px solid #cbd5e1",
+                background: "#ffffff",
+              }}
+            >
+              <option value="stable">Stable (Verified)</option>
+              <option value="beta">Beta (Preview)</option>
+            </select>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleCheckUpdates}
+            disabled={updateChecking}
+            style={{
+              fontSize: "0.82rem",
+              padding: "0.4rem 0.9rem",
+              background: "#2563eb",
+              color: "#ffffff",
+              border: "none",
+              borderRadius: "6px",
+              fontWeight: 600,
+              cursor: updateChecking ? "not-allowed" : "pointer",
+            }}
+          >
+            {updateChecking ? "Checking Manifest…" : "🔄 Check for Updates Now"}
+          </button>
+        </div>
+
+        {updateStatusMessage && (
+          <div
+            style={{
+              marginTop: "0.75rem",
+              fontSize: "0.82rem",
+              fontWeight: 600,
+              color: updateStatusMessage.startsWith("✓") ? "#16a34a" : "#dc2626",
+            }}
+          >
+            {updateStatusMessage}
+          </div>
+        )}
+      </div>
+
       {/* Master Seed Reveal */}
       <div className="section">
         <h3>Master Seed</h3>
@@ -817,7 +1030,7 @@ export default function KeysManager({
         </div>
       </details>
 
-      {/* Danger Zone: Wipe & Reset */}
+      {/* Danger Zone: Wipe & Reset + Binary Rollback */}
       <details
         className="mt-8 border border-red-900/40 rounded-lg p-4 bg-red-950/10"
         style={{
@@ -837,7 +1050,7 @@ export default function KeysManager({
             color: "#dc2626",
           }}
         >
-          ⚠️ Danger Zone: Wipe &amp; Reset Enclave Vault
+          ⚠️ Danger Zone: Wipe &amp; Reset &amp; Binary Rollback
         </summary>
         <div
           className="mt-3 text-xs text-slate-400 space-y-2"
@@ -864,6 +1077,38 @@ export default function KeysManager({
           >
             {isGenerating ? "Wiping & Regenerating..." : "Wipe & Regenerate Vault"}
           </button>
+
+          {/* Binary Rollback Section */}
+          <div style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid rgba(220, 38, 38, 0.2)" }}>
+            <div style={{ fontWeight: 600, fontSize: "0.85rem", color: "#991b1b", marginBottom: "0.3rem" }}>
+              One-Click Binary Rollback
+            </div>
+            <p style={{ margin: "0 0 0.6rem 0", lineHeight: "1.4", fontSize: "0.8rem" }}>
+              {hasRollback
+                ? "A staged snapshot of your prior binary exists (bin/iyou-home.previous). If a newly installed version exhibits faults, you can immediately revert to the previous executable."
+                : "No previous binary snapshot found on disk. Rollback snapshots are automatically staged during updates."}
+            </p>
+            <button
+              type="button"
+              onClick={() => setShowRollbackConfirm(true)}
+              disabled={!hasRollback || rollbackLoading}
+              style={{
+                background: hasRollback ? "#fee2e2" : "#f1f5f9",
+                border: hasRollback ? "1px solid #f87171" : "1px solid #cbd5e1",
+                color: hasRollback ? "#991b1b" : "#94a3b8",
+                fontWeight: 600,
+                fontSize: "0.8rem",
+                cursor: hasRollback ? "pointer" : "not-allowed",
+              }}
+            >
+              {rollbackLoading ? "Restoring Previous Binary…" : "⏪ Rollback to Previous Version"}
+            </button>
+            {rollbackStatusMessage && (
+              <p style={{ marginTop: "0.5rem", fontSize: "0.82rem", color: "#16a34a", fontWeight: 600 }}>
+                {rollbackStatusMessage}
+              </p>
+            )}
+          </div>
         </div>
       </details>
 
@@ -1233,6 +1478,69 @@ export default function KeysManager({
           </div>
         </div>
       )}
+
+      {/* ========== Rollback Confirmation Modal ========== */}
+      {showRollbackConfirm && (
+        <div className="modal-overlay" onClick={() => setShowRollbackConfirm(false)}>
+          <div
+            className="modal-content"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: "460px" }}
+          >
+            <h3 style={{ color: "#dc2626" }}>Confirm Binary Rollback</h3>
+            <p className="muted" style={{ fontSize: "0.85rem", lineHeight: "1.5", marginBottom: "1rem" }}>
+              Are you sure you want to replace the current executable with the previous binary snapshot? This will restore the prior version. You should restart the application after rollback.
+            </p>
+            <div style={{ display: "flex", gap: "0.75rem", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                onClick={() => setShowRollbackConfirm(false)}
+                disabled={rollbackLoading}
+                style={{
+                  background: "#f3f4f6",
+                  border: "1px solid #d1d5db",
+                  color: "var(--color-text-secondary)",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteRollback}
+                disabled={rollbackLoading}
+                style={{
+                  background: "#dc2626",
+                  border: "1px solid #b91c1c",
+                  color: "#ffffff",
+                  fontWeight: 600,
+                }}
+              >
+                {rollbackLoading ? "Restoring…" : "Confirm Rollback"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========== Update Vetting Modal ========== */}
+      <UpdateVettingModal
+        isOpen={showVettingModal}
+        onClose={() => setShowVettingModal(false)}
+        updateMetadata={vettedUpdate}
+        onInstallComplete={() => {
+          setHasRollback(true);
+          setShowVettingModal(false);
+        }}
+        onSkipVersion={async (version) => {
+          const next = { ...updatePrefs, ignored_version: version };
+          setUpdatePrefs(next);
+          try {
+            await invoke("set_update_preferences", { prefs: next });
+          } catch (e) {
+            console.error("Failed to save ignored version:", e);
+          }
+        }}
+      />
     </div>
   );
 }

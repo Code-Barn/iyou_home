@@ -166,8 +166,29 @@ describe("SovereigntyStatusPanel", () => {
     currentDiagnostics = mockDiagnosticsFull;
   });
 
-  it("renders the 5 sovereignty checklist capabilities in sovereign state", async () => {
+  it("renders compact 40px summary banner by default and expands on click", async () => {
     render(<SovereigntyStatusPanel />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sovereignty Health: 5\/5 Checks Operational/i)).toBeInTheDocument();
+      expect(screen.getByText(/5\/5 Sovereign Enclave/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /Expand Diagnostic Matrix ▾/i })).toBeInTheDocument();
+    });
+
+    // Expand
+    fireEvent.click(screen.getByRole("button", { name: /Expand Diagnostic Matrix ▾/i }));
+
+    expect(screen.getByText(/Private Enclave Sovereignty HUD/i)).toBeInTheDocument();
+    expect(screen.getByText(/Key Custody & Hardware Air-Gap/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Collapse ▴/i })).toBeInTheDocument();
+
+    // Collapse
+    fireEvent.click(screen.getByRole("button", { name: /Collapse ▴/i }));
+    expect(screen.getByText(/Sovereignty Health: 5\/5 Checks Operational/i)).toBeInTheDocument();
+  });
+
+  it("renders the 5 sovereignty checklist capabilities in sovereign state when expanded", async () => {
+    render(<SovereigntyStatusPanel defaultExpanded={true} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Private Enclave Sovereignty HUD/i)).toBeInTheDocument();
@@ -182,7 +203,7 @@ describe("SovereigntyStatusPanel", () => {
 
   it("renders action buttons for unfulfilled checks in partial autonomy state", async () => {
     currentDiagnostics = mockDiagnosticsPartial;
-    render(<SovereigntyStatusPanel />);
+    render(<SovereigntyStatusPanel defaultExpanded={true} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Start Local Relay/i)).toBeInTheDocument();
@@ -195,7 +216,7 @@ describe("SovereigntyStatusPanel", () => {
   it("calls toggle_service when Start Local Relay button is clicked", async () => {
     currentDiagnostics = mockDiagnosticsPartial;
     const onServiceToggled = vi.fn();
-    render(<SovereigntyStatusPanel onServiceToggled={onServiceToggled} />);
+    render(<SovereigntyStatusPanel defaultExpanded={true} onServiceToggled={onServiceToggled} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Start Local Relay/i)).toBeInTheDocument();
@@ -216,7 +237,7 @@ describe("SovereigntyStatusPanel", () => {
   it("calls toggle_service when Start Local Blossom button is clicked", async () => {
     currentDiagnostics = mockDiagnosticsPartial;
     const onServiceToggled = vi.fn();
-    render(<SovereigntyStatusPanel onServiceToggled={onServiceToggled} />);
+    render(<SovereigntyStatusPanel defaultExpanded={true} onServiceToggled={onServiceToggled} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Start Local Blossom/i)).toBeInTheDocument();
@@ -236,7 +257,7 @@ describe("SovereigntyStatusPanel", () => {
 
   it("adds a new public relay via inline input", async () => {
     currentDiagnostics = mockDiagnosticsPartial;
-    render(<SovereigntyStatusPanel />);
+    render(<SovereigntyStatusPanel defaultExpanded={true} />);
 
     await waitFor(() => {
       expect(screen.getByText(/\+ Add Relay/i)).toBeInTheDocument();
@@ -259,7 +280,7 @@ describe("SovereigntyStatusPanel", () => {
 
   it("opens backup modal on Export Backup click and triggers backup generation", async () => {
     currentDiagnostics = mockDiagnosticsPartial;
-    render(<SovereigntyStatusPanel />);
+    render(<SovereigntyStatusPanel defaultExpanded={true} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Export Backup/i)).toBeInTheDocument();

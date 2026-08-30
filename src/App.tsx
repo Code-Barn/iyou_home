@@ -18,7 +18,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ChatPeerTarget, UserPreferences } from "./lib/types";
+import type { ChatPeerTarget, PersonaProfile, UserPreferences } from "./lib/types";
 import { inactivityMinutesToMs, loadUserPreferences } from "./lib/appLock";
 import AppLockOverlay from "./components/auth/AppLockOverlay";
 import FirstRunSeedGate from "./components/auth/FirstRunSeedGate";
@@ -63,6 +63,7 @@ const DEV_MODE_KEY = "iyou_home_dev_mode";
 
 function App() {
   const [activeTab, setActiveTab] = useState<TabId>("enclave");
+  const [activeProfile, setActiveProfile] = useState<PersonaProfile | null>(null);
   const [selectedChatPeer, setSelectedChatPeer] = useState<ChatPeerTarget | null>(null);
   const [showDevMode, setShowDevMode] = useState<boolean>(() => {
     try {
@@ -109,6 +110,43 @@ function App() {
     },
     [prefs?.app_lock_enabled],
   );
+
+  // Load active persona / profile on boot
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const profiles = await invoke<PersonaProfile[]>("list_profiles");
+        if (!mounted || !profiles || profiles.length === 0) return;
+        const active =
+          profiles.find((p) => p.active === true) ||
+          profiles.find((p) => (p.level === 1 || p.derivation_index === 1) && !p.is_system_reserved) ||
+          profiles.find((p) => p.level !== 0 && p.derivation_index !== 0) ||
+          null;
+        if (active) {
+          setActiveProfile(active);
+        }
+      } catch {
+        // best-effort
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Listen for active profile changes emitted by the backend
+  useEffect(() => {
+    let unlistenPromise = listen<PersonaProfile>("profile://changed", (event) => {
+      if (event.payload) {
+        setActiveProfile(event.payload);
+      }
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, []);
 
   // Load stored preferences + vault existence once at boot.
   useEffect(() => {
@@ -217,7 +255,11 @@ function App() {
   return (
     <>
       <WsSignPopup />
-      <GlobalStatusBar onNavigateEnclave={() => setActiveTab("enclave")} />
+      <GlobalStatusBar
+        onNavigateEnclave={() => setActiveTab("enclave")}
+        activeProfile={activeProfile}
+        setActiveProfile={setActiveProfile}
+      />
 
       <main className="container">
         <div className="tabs">
@@ -239,12 +281,20 @@ function App() {
               onClearInitialPeer={() => setSelectedChatPeer(null)}
             />
           )}
-          {activeTab === "enclave" && <ProjectZero onRequestChat={openChat} />}
+          {activeTab === "enclave" && (
+            <ProjectZero
+              onRequestChat={openChat}
+              activeProfile={activeProfile}
+              setActiveProfile={setActiveProfile}
+            />
+          )}
           {activeTab === "assets" && <TrustAssets />}
           {activeTab === "vault" && (
             <KeysManager
               prefs={prefs}
               onLockSettingsChange={handleLockPreferencesChange}
+              activeProfile={activeProfile}
+              setActiveProfile={setActiveProfile}
             />
           )}
           {activeTab === "services" && <ServiceSwitchPanel />}

@@ -24,6 +24,7 @@ interface PersonaMatrixProps {
   profiles: Profile[];
   activeDid: string | null;
   onRefresh: () => void | Promise<void>;
+  onSetActiveProfile?: (profile: Profile | null) => void;
 }
 
 function truncateString(str: string, lead = 18, tail = 8): string {
@@ -36,6 +37,7 @@ export default function PersonaMatrix({
   profiles,
   activeDid,
   onRefresh,
+  onSetActiveProfile,
 }: PersonaMatrixProps) {
   const [newPersonaName, setNewPersonaName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -83,6 +85,10 @@ export default function PersonaMatrix({
     setActionError(null);
     setActionSuccess(null);
     try {
+      const selected = profiles.find((p) => p.profile_id === profileId);
+      if (selected && onSetActiveProfile) {
+        onSetActiveProfile(selected);
+      }
       await invoke("set_active_profile", { profileId });
       setActionSuccess(`Active persona switched to ${profileId}`);
       await onRefresh();

@@ -157,16 +157,21 @@ pub fn resolve_tls_assets(
     #[cfg(all(debug_assertions, not(test)))]
     {
         // In dev mode, auto-populate cert_dir from repo certs if present
-        if !cert_dir.join(RUNTIME_CERT_FILE).exists() {
+        let cert_dest = cert_dir.join(RUNTIME_CERT_FILE);
+        let key_dest = cert_dir.join(RUNTIME_KEY_FILE);
+        if !cert_dest.exists() || !key_dest.exists() {
             let repo_cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs");
-            if repo_cert_dir.join(RUNTIME_CERT_FILE).exists() && repo_cert_dir.join(RUNTIME_KEY_FILE).exists() {
+            let repo_cert = repo_cert_dir.join(RUNTIME_CERT_FILE);
+            let repo_key = repo_cert_dir.join(RUNTIME_KEY_FILE);
+            if repo_cert.exists() && repo_key.exists() {
                 let _ = std::fs::create_dir_all(cert_dir);
-                let _ = std::fs::copy(repo_cert_dir.join(RUNTIME_CERT_FILE), cert_dir.join(RUNTIME_CERT_FILE));
-                let _ = std::fs::copy(repo_cert_dir.join(RUNTIME_KEY_FILE), cert_dir.join(RUNTIME_KEY_FILE));
+                let _ = std::fs::copy(&repo_cert, &cert_dest);
+                let _ = std::fs::copy(&repo_key, &key_dest);
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(cert_dir.join(RUNTIME_KEY_FILE), std::fs::Permissions::from_mode(0o600));
+                    let _ = std::fs::set_permissions(&key_dest, std::fs::Permissions::from_mode(0o600));
+                    let _ = std::fs::set_permissions(&cert_dest, std::fs::Permissions::from_mode(0o600));
                 }
                 eprintln!("TLS: auto-provisioned Let's Encrypt dev certs to {:?}", cert_dir);
             }

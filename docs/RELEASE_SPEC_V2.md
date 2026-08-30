@@ -458,6 +458,56 @@ Metric tile matrix reporting live local counts with deep links into each satelli
 
 ---
 
+## 9. Services Layout, TLS Lifecycle & Release Vetting (Phases 11 & 12)
+
+> Streamline the node operator console, automate enclave TLS lifecycle maintenance, and establish a zero-trust cryptographic auto-update and rollback pipeline.
+
+### 9.1 Phase 11: Services Layout Reorganization & Dynamic TLS Maintenance
+
+#### 11.1 Collapsible Sovereignty HUD & Elevated Footprint
+- **Collapsible Sovereignty HUD (11.1):** A compact 40px summary banner rendered by default at the top of the Services tab (`🟢 Sovereign Node Healthy · 5/5 Checks Passed`), expanding to the full diagnostic matrix and one-click remediation controls upon user toggle.
+- **Sovereign Footprint Grid Elevation (11.2):** Positions the offline data footprint matrix (`SovereignFootprint.tsx`) prominently at the top of the Services tab directly beneath the HUD summary bar, providing instant visibility into local event counts, media volumes, and ledger storage.
+
+#### 11.2 Segmented Sub-Views in Services Console (11.3)
+The lower section of the Services tab adopts a 2-segment sub-view architecture:
+1. **`[ ⚙️ Daemons & Protocols ]`**: Loopback daemon management (`:9001` SigBridge, `:9002` Blossom, `:9003` Nostr, `:5222` Prosody XMPP) with live status indicators, autostart switches, port disclosures, and Sync-to-Home ingestion controls.
+2. **`[ 🗄️ Offline Media Vault ]`**: Dedicated content-addressed media browser (`BlossomBrowser.tsx`) featuring a thumbnail grid, metadata details drawer, storage usage tallies, and local blob deletion routes.
+
+#### 11.3 Enclave TLS Auto-Staging & OTA Maintenance
+- **Dev-Mode TLS Auto-Staging (11.4):** In debug/development mode, `certs.rs` automatically stages bundled cert/key assets to `~/Library/Application Support/com.byers-brands.iyou-home/certs/` with strict POSIX permissions (`0o600` for keys, `0o644` for certs) on boot.
+- **Over-The-Air (OTA) Certificate Refresher (11.5):** A background maintenance task checks `production.crt` expiration on boot and weekly. If certificate validity is `< 20 days`:
+  1. Securely queries `https://iyou.me/api/v1/enclave/cert-bundle/` over pinned HTTPS.
+  2. Atomically stages the refreshed `.crt` / `.key` pair to a temporary staging path before replacing active certificate files.
+  3. Reloads TLS acceptors across local daemon servers seamlessly without requiring an application restart.
+
+---
+
+### 9.2 Phase 12: Sovereign Auto-Updater & Cryptographic Release Vetting
+
+#### 12.1 Minisign Verified Auto-Updater (12.1)
+- Integrates `tauri-plugin-updater` backed by Minisign public key verification against `updates.iyou.me/home/latest.json`.
+- All release manifests and binary payloads are verified against the hardcoded Byers Brands Minisign release public key before any installation step is permitted.
+
+#### 12.2 User-Configurable Update Policies (12.2)
+Stored in `preferences.json`:
+- **`Air-Gapped / Locked`**: Never polls update servers. Disables all remote version checks and network updater triggers.
+- **`Manual Review (Notify Only)`** *(Default)*: Polling occurs only on explicit menu click or surfaces a subtle, non-intrusive status badge when a verified release is available.
+- **`Automatic`**: Background fetch and verification with a user prompt to restart and apply.
+
+#### 12.3 Pre-Install Cryptographic Vetting Modal (12.3)
+A high-transparency verification dialog presented before executing an update installation:
+- **Version & Release Name:** Target semantic version and release codename.
+- **Commit Hash:** Exact Git commit SHA.
+- **Binary SHA-256 Checksum:** Cryptographic hash of the downloaded payload.
+- **Minisign Signature:** Raw cryptographic signature string for independent validation.
+- **Source Diff Link:** Clickable `[ View Source Diff ↗ ]` directing to the public repository comparison between the current commit and the target release.
+
+#### 12.4 One-Click Binary Rollback Engine (12.4)
+- The prior executable binary is automatically staged to `{app_data}/bin/iyou-home.previous` during any update execution.
+- If a new version encounters errors or instability, the user can invoke "Roll Back to Previous Version" from the Vault tab Danger Zone, restoring the previous binary immediately.
+
+---
+
 ## Appendix A: File Inventory (Post-Release)
 
 | File | Status | Notes |

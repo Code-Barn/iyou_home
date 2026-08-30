@@ -17,27 +17,40 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { Profile } from "../lib/types";
+import { Profile, UpdateMetadata, UpdatePreferences } from "../lib/types";
 import QuickDispatchModal from "./QuickDispatchModal";
+import UpdateVettingModal from "./updater/UpdateVettingModal";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
 interface GlobalStatusBarProps {
   onNavigateEnclave: () => void;
+  activeProfile?: Profile | null;
+  setActiveProfile?: (profile: Profile | null) => void;
 }
 
-function truncateDid(did: string, lead = 20, tail = 6): string {
-  if (!did || did.length <= lead + tail + 3) return did || "";
-  return `${did.slice(0, lead)}...${did.slice(-tail)}`;
+function truncateDid(did: string, lead = 16): string {
+  if (!did) return "";
+  if (did.length <= lead) return did;
+  return `${did.slice(0, lead)}...`;
 }
 
-export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarProps) {
+export default function GlobalStatusBar({
+  onNavigateEnclave,
+  activeProfile: propActiveProfile,
+}: GlobalStatusBarProps) {
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({});
-  const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
+  const [localActiveProfile, setLocalActiveProfile] = useState<Profile | null>(null);
+  const activeProfile = propActiveProfile !== undefined ? propActiveProfile : localActiveProfile;
   const [copiedDid, setCopiedDid] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<number>(0);
   const [isDispatchOpen, setIsDispatchOpen] = useState(false);
+
+  // Update check states
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateMetadata | null>(null);
+  const [isUpdateModalOpen, setIsUpdateModalOpen] = useState(false);
 
   const pollStatuses = useCallback(async () => {
     try {
@@ -49,19 +62,24 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
   }, []);
 
   const loadProfile = useCallback(async () => {
+    if (propActiveProfile !== undefined) return;
     try {
       const [profiles, did] = await Promise.all([
         invoke<Profile[]>("list_profiles"),
         invoke<string | null>("get_active_did"),
       ]);
-      if (did && profiles) {
-        const match = profiles.find((p) => p.did === did);
-        setActiveProfile(match || null);
+      if (profiles && profiles.length > 0) {
+        const match =
+          (did ? profiles.find((p) => p.did === did) : null) ||
+          profiles.find((p) => p.active === true) ||
+          profiles.find((p) => p.level === 1) ||
+          profiles[0];
+        setLocalActiveProfile(match || null);
       }
     } catch {
       // silent
     }
-  }, []);
+  }, [propActiveProfile]);
 
   const loadSyncStatus = useCallback(async () => {
     try {
@@ -72,16 +90,38 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
     }
   }, []);
 
+  const checkUpdates = useCallback(async (force = false) => {
+    try {
+      const meta = await invoke<UpdateMetadata | null>("check_for_update_vetting", { force });
+      if (meta) {
+        setAvailableUpdate(meta);
+        if (force) setIsUpdateModalOpen(true);
+      }
+    } catch {
+      // silent
+    }
+  }, []);
+
   useEffect(() => {
     pollStatuses();
     loadProfile();
     loadSyncStatus();
+    checkUpdates(false);
+
     const interval = setInterval(() => {
       pollStatuses();
       loadSyncStatus();
     }, 10_000);
-    return () => clearInterval(interval);
-  }, [pollStatuses, loadProfile, loadSyncStatus]);
+
+    const unlistenPromise = listen("app://check-updates", () => {
+      checkUpdates(true);
+    });
+
+    return () => {
+      clearInterval(interval);
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [pollStatuses, loadProfile, loadSyncStatus, checkUpdates]);
 
   const handleCopyDid = async () => {
     if (!activeProfile?.did) return;
@@ -115,10 +155,16 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
   const personaLabel = activeProfile
     ? activeProfile.level === 0
       ? "Anchor (L0)"
-      : `${activeProfile.profile_name} (L${activeProfile.level})`
+      : `${activeProfile.name || activeProfile.profile_name} (${activeProfile.level === 1 ? "L1" : "L2"})`
     : "No identity";
 
-  const personaIcon = activeProfile && activeProfile.level === 0 ? "\uD83D\uDEE1\uFE0F" : "\uD83D\uDC64";
+  const personaIcon = activeProfile
+    ? activeProfile.level === 0
+      ? "🛡️"
+      : activeProfile.level === 1
+        ? "👤"
+        : "🎭"
+    : "👤";
 
   const formatSyncLabel = (ts: number): string => {
     if (ts === 0) return "Not synced";
@@ -127,6 +173,17 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
     if (diff < 3600) return `Synced ${Math.floor(diff / 60)}m ago`;
     if (diff < 86400) return `Synced ${Math.floor(diff / 3600)}h ago`;
     return `Synced ${Math.floor(diff / 86400)}d ago`;
+  };
+
+  const handleSkipVersion = async (version: string) => {
+    try {
+      const prefs = await invoke<UpdatePreferences>("get_update_preferences");
+      prefs.ignored_version = version;
+      await invoke("set_update_preferences", { prefs });
+      setAvailableUpdate(null);
+    } catch (err) {
+      console.error("Failed to skip update version:", err);
+    }
   };
 
   return (
@@ -177,8 +234,33 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
           </span>
         </div>
 
-        {/* Right cluster: Quick Dispatch trigger + Active persona pill */}
+        {/* Right cluster: Update badge + Quick Dispatch trigger + Active persona pill */}
         <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          {availableUpdate && (
+            <button
+              type="button"
+              onClick={() => setIsUpdateModalOpen(true)}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.3rem",
+                padding: "0.25rem 0.65rem",
+                background: "#ecfdf5",
+                color: "#047857",
+                border: "1px solid #a7f3d0",
+                borderRadius: "999px",
+                fontSize: "0.75rem",
+                fontWeight: 700,
+                cursor: "pointer",
+                transition: "all 0.15s",
+              }}
+              title="Click to cryptographically inspect and install update"
+            >
+              <span>🚀</span>
+              <span>Update v{availableUpdate.target_version} Available</span>
+            </button>
+          )}
+
           <button
             type="button"
             className="status-bar-dispatch-btn"
@@ -223,7 +305,7 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
                   }}
                   title="Copy DID"
                 >
-                  {copiedDid ? "\u2713" : "\uD83D\uDCCB"}
+                  {copiedDid ? "✓" : "📋"}
                 </span>
               </>
             )}
@@ -235,6 +317,16 @@ export default function GlobalStatusBar({ onNavigateEnclave }: GlobalStatusBarPr
       <QuickDispatchModal
         isOpen={isDispatchOpen}
         onClose={() => setIsDispatchOpen(false)}
+        activeProfile={activeProfile}
+      />
+
+      {/* Cryptographic Release Vetting Modal */}
+      <UpdateVettingModal
+        isOpen={isUpdateModalOpen}
+        onClose={() => setIsUpdateModalOpen(false)}
+        updateMetadata={availableUpdate}
+        onInstallComplete={() => setAvailableUpdate(null)}
+        onSkipVersion={handleSkipVersion}
       />
     </>
   );

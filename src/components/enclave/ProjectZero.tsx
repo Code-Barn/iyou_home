@@ -25,9 +25,14 @@ import GraduationWizard from "./GraduationWizard";
 
 interface ProjectZeroProps {
   onRequestChat?: (target: ChatPeerTarget) => void;
+  activeProfile?: Profile | null;
+  setActiveProfile?: (profile: Profile | null) => void;
 }
 
-export default function ProjectZero({ onRequestChat }: ProjectZeroProps) {
+export default function ProjectZero({
+  onRequestChat,
+  setActiveProfile,
+}: ProjectZeroProps) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [contacts, setContacts] = useState<PeerContact[]>([]);
   const [activeDid, setActiveDid] = useState<string | null>(null);
@@ -288,6 +293,7 @@ export default function ProjectZero({ onRequestChat }: ProjectZeroProps) {
               profiles={profiles}
               activeDid={activeDid}
               onRefresh={fetchData}
+              onSetActiveProfile={setActiveProfile}
             />
           )}
 

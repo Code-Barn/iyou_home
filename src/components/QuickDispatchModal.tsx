@@ -15,12 +15,14 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Profile } from "../lib/types";
 
 interface QuickDispatchModalProps {
   isOpen: boolean;
   onClose: () => void;
+  activeProfile?: Profile | null;
 }
 
 type DispatchTab = "note" | "media" | "poll";
@@ -60,11 +62,39 @@ function broadcastToRelays(event: any): void {
   }
 }
 
-export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchModalProps) {
+export default function QuickDispatchModal({
+  isOpen,
+  onClose,
+  activeProfile: propActiveProfile,
+}: QuickDispatchModalProps) {
+  const [localActiveProfile, setLocalActiveProfile] = useState<Profile | null>(null);
+  const activeProfile = propActiveProfile !== undefined ? propActiveProfile : localActiveProfile;
   const [tab, setTab] = useState<DispatchTab>("note");
   const [busy, setBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (propActiveProfile !== undefined || !isOpen) return;
+    (async () => {
+      try {
+        const [profiles, did] = await Promise.all([
+          invoke<Profile[]>("list_profiles"),
+          invoke<string | null>("get_active_did"),
+        ]);
+        if (profiles && profiles.length > 0) {
+          const match =
+            (did ? profiles.find((p) => p.did === did) : null) ||
+            profiles.find((p) => p.active === true) ||
+            profiles.find((p) => p.level === 1) ||
+            profiles[0];
+          setLocalActiveProfile(match || null);
+        }
+      } catch {
+        // silent
+      }
+    })();
+  }, [propActiveProfile, isOpen]);
 
   // Note State (Kind 1)
   const [noteContent, setNoteContent] = useState("");
@@ -103,6 +133,10 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
 
   const handleDispatchNote = async () => {
     if (!noteContent.trim()) return;
+    if (activeProfile && (activeProfile.level === 0 || activeProfile.derivation_index === 0)) {
+      setErrorMessage("Cannot sign events with Level 0 Anchor identity. Please switch to an active L1 or L2 persona.");
+      return;
+    }
     setBusy(true);
     setErrorMessage(null);
     setStatusMessage(null);
@@ -112,6 +146,7 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
         kind: 1,
         content: noteContent.trim(),
         tags: [],
+        profileId: activeProfile?.profile_id,
       });
 
       broadcastToRelays(signedEvent);
@@ -131,6 +166,10 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
 
   const handleDispatchMedia = async () => {
     if (!selectedFile) return;
+    if (activeProfile && (activeProfile.level === 0 || activeProfile.derivation_index === 0)) {
+      setErrorMessage("Cannot sign events with Level 0 Anchor identity. Please switch to an active L1 or L2 persona.");
+      return;
+    }
     setBusy(true);
     setErrorMessage(null);
     setStatusMessage(null);
@@ -164,6 +203,7 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
         kind: 1063,
         content: mediaAlt.trim() || selectedFile.name,
         tags,
+        profileId: activeProfile?.profile_id,
       });
 
       broadcastToRelays(signedEvent);
@@ -184,6 +224,10 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
 
   const handleDispatchPoll = async () => {
     if (!pollTitle.trim() || pollOptions.some((opt) => !opt.trim())) return;
+    if (activeProfile && (activeProfile.level === 0 || activeProfile.derivation_index === 0)) {
+      setErrorMessage("Cannot sign events with Level 0 Anchor identity. Please switch to an active L1 or L2 persona.");
+      return;
+    }
     setBusy(true);
     setErrorMessage(null);
     setStatusMessage(null);
@@ -208,6 +252,7 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
         kind: 30023,
         content: pollDescription.trim(),
         tags,
+        profileId: activeProfile?.profile_id,
       });
 
       broadcastToRelays(signedEvent);
@@ -349,6 +394,58 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
 
         {/* Modal Body */}
         <div style={{ padding: "1.25rem", maxHeight: "65vh", overflowY: "auto" }}>
+          {/* Active Signing Identity Badge */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "0.55rem 0.85rem",
+              background: "#f8fafc",
+              borderRadius: "8px",
+              marginBottom: "1rem",
+              border: "1px solid #e2e8f0",
+              fontSize: "0.82rem",
+              flexWrap: "wrap",
+              gap: "0.5rem",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "0.45rem" }}>
+              <span style={{ fontSize: "1.1rem" }}>
+                {activeProfile?.level === 1
+                  ? "👤"
+                  : activeProfile && activeProfile.level >= 2
+                    ? "🎭"
+                    : "🛡️"}
+              </span>
+              <span style={{ color: "#475569" }}>
+                Posting as:{" "}
+                <strong style={{ color: "#1e293b" }}>
+                  {activeProfile
+                    ? `[${activeProfile.name || activeProfile.profile_name} (L${activeProfile.level === 1 ? "1" : activeProfile.level === 0 ? "0" : "2"})]`
+                    : "[Primary Identity (L1)]"}
+                </strong>
+              </span>
+            </div>
+            {activeProfile?.nostr_pubkey_hex && (
+              <span
+                style={{
+                  fontFamily: "monospace",
+                  color: "#64748b",
+                  fontSize: "0.75rem",
+                  background: "#f1f5f9",
+                  padding: "0.15rem 0.4rem",
+                  borderRadius: "4px",
+                }}
+                title={activeProfile.nostr_pubkey_hex}
+              >
+                {activeProfile.nostr_pubkey_hex.length > 18
+                  ? `${activeProfile.nostr_pubkey_hex.slice(0, 10)}...${activeProfile.nostr_pubkey_hex.slice(-6)}`
+                  : activeProfile.nostr_pubkey_hex}
+              </span>
+            )}
+          </div>
+
           {statusMessage && (
             <div
               style={{
@@ -422,7 +519,12 @@ export default function QuickDispatchModal({ isOpen, onClose }: QuickDispatchMod
                   marginTop: "0.25rem",
                 }}
               >
-                <span>Signed via Level 1 Active Persona</span>
+                <span>
+                  Signed via{" "}
+                  {activeProfile
+                    ? `${activeProfile.name || activeProfile.profile_name} (L${activeProfile.level === 1 ? "1" : activeProfile.level === 0 ? "0" : "2"})`
+                    : "Level 1 Active Persona"}
+                </span>
                 <span>{noteContent.length} / 500</span>
               </div>
 

@@ -20,13 +20,17 @@ export type TrustLevel = 'level0' | 'level0_5' | 'level1' | 'Level0' | 'Level0_5
 export interface Profile {
   profile_id: string;
   profile_name: string;
+  name?: string;
   derivation_index: number;
   did: string;
   level: number; // 0 = Anchor, 1 = Public Persona, 2+ = Burner
   is_system_reserved: boolean;
+  active?: boolean;
   nostr_pubkey_hex?: string;
   credentials?: any[];
 }
+
+export type PersonaProfile = Profile;
 
 export interface PeerContact {
   peer_id: string;
@@ -100,6 +104,29 @@ export interface UserPreferences {
   last_backup_at?: number;
   /** List of configured public Nostr relays for the gossip mesh. */
   relay_mesh?: string[];
+  /** Sovereign update preferences, policies, and channel configuration. */
+  update_preferences?: UpdatePreferences;
+}
+
+export type UpdatePolicy = 'locked' | 'manual' | 'auto';
+
+export interface UpdatePreferences {
+  policy: UpdatePolicy;
+  release_channel: string;
+  custom_manifest_url?: string | null;
+  last_checked_at?: number | null;
+  ignored_version?: string | null;
+}
+
+export interface UpdateMetadata {
+  current_version: string;
+  target_version: string;
+  git_commit_hash: string;
+  binary_sha256: string;
+  minisign_signature: string;
+  release_notes: string;
+  published_at: number;
+  download_url: string;
 }
 
 export const DEFAULT_USER_PREFERENCES: UserPreferences = {
@@ -120,6 +147,13 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
     "wss://nos.lol",
     "wss://relay.damus.io",
   ],
+  update_preferences: {
+    policy: "manual",
+    release_channel: "stable",
+    custom_manifest_url: null,
+    last_checked_at: null,
+    ignored_version: null,
+  },
 };
 
 export interface KeyCustodyDiagnostic {

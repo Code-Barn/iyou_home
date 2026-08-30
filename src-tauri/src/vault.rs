@@ -57,6 +57,8 @@ pub struct Profile {
     /// System-reserved profiles (Anchor) can never be deleted or externally used.
     #[serde(default)]
     pub is_system_reserved: bool,
+    #[serde(default)]
+    pub active: bool,
 }
 
 impl Profile {
@@ -91,6 +93,14 @@ impl VaultStore {
     /// The default public-facing identity: first profile at Level 1+ /
     /// derivation index 1+. Never returns the Level 0 anchor.
     pub fn public_persona(&self) -> Option<&Profile> {
+        // Prefer any profile explicitly marked active (as long as it's not Level 0 Anchor)
+        if let Some(active_p) = self
+            .profiles
+            .iter()
+            .find(|p| p.active && p.level >= 1 && p.derivation_index >= 1)
+        {
+            return Some(active_p);
+        }
         // Prefer the canonical primary persona (profile_id == "primary", level 1).
         // This ensures tombstoned retired personas (level 2) are skipped.
         self.profiles
@@ -689,6 +699,7 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             nostr_pubkey_hex: anchor_nostr_pk,
             level: 0,
             is_system_reserved: true,
+            active: false,
         },
         Profile {
             profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
@@ -699,6 +710,7 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             nostr_pubkey_hex: persona_nostr_pk,
             level: 1,
             is_system_reserved: false,
+            active: true,
         },
     ]
 }
@@ -920,6 +932,7 @@ pub fn heal_reserved_profiles(vault: &mut VaultStore) -> Result<bool, String> {
             nostr_pubkey_hex: derive_secp256k1_pubkey_hex(&seed, 1),
             level: 1,
             is_system_reserved: false,
+            active: true,
         });
         changed = true;
     }
@@ -1047,6 +1060,7 @@ pub fn add_profile(
         nostr_pubkey_hex: nostr_pk,
         level: 2,
         is_system_reserved: false,
+        active: false,
     };
 
     vault.profiles.push(profile.clone());
@@ -1071,6 +1085,29 @@ pub fn remove_profile(vault: &mut VaultStore, profile_id: &str) -> Result<(), St
 
 pub fn list_profiles(vault: &VaultStore) -> Vec<Profile> {
     vault.profiles.clone()
+}
+
+pub fn activate_persona(vault: &mut VaultStore, profile_id: &str) -> Result<Profile, String> {
+    let target = vault
+        .profiles
+        .iter()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("Profile not found: '{}'", profile_id))?;
+
+    if target.level == 0 || target.derivation_index == 0 {
+        return Err("Cannot activate Level 0 Anchor as public persona".into());
+    }
+
+    for p in vault.profiles.iter_mut() {
+        p.active = p.profile_id == profile_id;
+    }
+
+    vault
+        .profiles
+        .iter()
+        .find(|p| p.profile_id == profile_id)
+        .cloned()
+        .ok_or_else(|| format!("Profile not found: '{}'", profile_id))
 }
 
 /// Break-Glass Emergency Rotation: burn the active Level 1 Public Persona
@@ -1103,6 +1140,7 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
             p.profile_name = format!("{} (Retired)", p.profile_name);
             p.level = 2;
             p.is_system_reserved = false;
+            p.active = false;
         }
     }
 
@@ -1119,6 +1157,7 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
         nostr_pubkey_hex: nostr_hex,
         level: 1,
         is_system_reserved: false,
+        active: true,
     };
 
     vault.profiles.push(new_persona.clone());
@@ -1871,6 +1910,7 @@ mod tests {
                 nostr_pubkey_hex: full.profiles[0].nostr_pubkey_hex.clone(),
                 level: 0,
                 is_system_reserved: false,
+                active: false,
             }],
             sovereign_identities: Vec::new(),
         };
@@ -2933,6 +2973,7 @@ mod tests {
                 nostr_pubkey_hex: "0123456789abcdef".to_string(),
                 level: 1,
                 is_system_reserved: false,
+                active: true,
             }],
             sovereign_identities: vec![],
         };

@@ -63,3 +63,15 @@ installStorage();
 if (typeof Element !== "undefined" && typeof Element.prototype.scrollIntoView !== "function") {
   Element.prototype.scrollIntoView = () => {};
 }
+
+// Provide fallback __TAURI_INTERNALS__ for tests using @tauri-apps/api/event or @tauri-apps/api/core
+if (typeof window !== "undefined") {
+  (window as any).__TAURI_INTERNALS__ = {
+    transformCallback: (_cb: any) => 1,
+    unregisterCallback: () => {},
+    invoke: () => Promise.resolve(),
+  };
+  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener: () => {},
+  };
+}

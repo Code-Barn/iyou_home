@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -41,6 +41,7 @@ mod omemo;
 mod pairing;
 mod prosody;
 mod tray;
+mod updater;
 mod vault;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -94,6 +95,9 @@ pub struct UserPreferences {
     /// List of configured public Nostr relays for the gossip mesh.
     #[serde(default = "default_relay_mesh")]
     pub relay_mesh: Vec<String>,
+    /// Sovereign update preferences, policies, and channel configuration.
+    #[serde(default)]
+    pub update_preferences: updater::UpdatePreferences,
 }
 
 pub fn default_relay_mesh() -> Vec<String> {
@@ -120,6 +124,7 @@ impl Default for UserPreferences {
             app_lock_prf_hash: None,
             last_backup_at: 0,
             relay_mesh: default_relay_mesh(),
+            update_preferences: updater::UpdatePreferences::default(),
         }
     }
 }
@@ -591,17 +596,16 @@ fn set_active_profile(
     app: AppHandle,
     state: State<'_, ServiceState>,
     profile_id: String,
-) -> Result<(), String> {
-    let vault = vault::load_vault(&app)?;
+) -> Result<vault::Profile, String> {
+    let mut vault = vault::load_vault(&app)?;
 
-    // Validate that the profile exists
-    let profile = vault
-        .get_profile_by_id(&profile_id)
-        .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+    // Atomically persist active: true in vault.json
+    let active_persona = vault::activate_persona(&mut vault, &profile_id)?;
+    vault::save_vault(&app, &vault)?;
 
     // Update the active DID in memory
     let mut active = state.active_did.lock().unwrap();
-    *active = Some(profile.did.clone());
+    *active = Some(active_persona.did.clone());
 
     // Update preferences and save. Selecting a derived persona deactivates
     // any graduated sovereign identity.
@@ -610,7 +614,19 @@ fn set_active_profile(
     prefs.active_sovereign_did = None;
     save_preferences(&app, &prefs)?;
 
-    Ok(())
+    // Emit event to all windows
+    let _ = app.emit("profile://changed", &active_persona);
+
+    Ok(active_persona)
+}
+
+#[tauri::command]
+fn activate_persona(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+    profile_id: String,
+) -> Result<vault::Profile, String> {
+    set_active_profile(app, state, profile_id)
 }
 
 #[tauri::command]
@@ -635,7 +651,6 @@ fn remove_profile(
 
     // Remove the profile
     vault::remove_profile(&mut vault, &profile_id)?;
-    vault::save_vault(&app, &vault)?;
 
     // If we removed the active profile, reset to the public persona
     if was_active {
@@ -643,11 +658,21 @@ fn remove_profile(
         prefs.active_profile_id = vault::DEFAULT_PERSONA_PROFILE_ID.to_string();
         save_preferences(&app, &prefs)?;
 
-        // Update in-memory state
-        let mut active = state.active_did.lock().unwrap();
-        if let Some(profile) = vault.public_persona() {
-            *active = Some(profile.did.clone());
+        if let Ok(active_p) = vault::activate_persona(&mut vault, vault::DEFAULT_PERSONA_PROFILE_ID) {
+            let _ = vault::save_vault(&app, &vault);
+            let mut active = state.active_did.lock().unwrap();
+            *active = Some(active_p.did.clone());
+            let _ = app.emit("profile://changed", &active_p);
+        } else {
+            let _ = vault::save_vault(&app, &vault);
+            if let Some(profile) = vault.public_persona() {
+                let mut active = state.active_did.lock().unwrap();
+                *active = Some(profile.did.clone());
+                let _ = app.emit("profile://changed", profile);
+            }
         }
+    } else {
+        vault::save_vault(&app, &vault)?;
     }
 
     Ok(())
@@ -1714,6 +1739,8 @@ fn rotate_primary_persona(
     prefs.active_sovereign_did = None;
     save_preferences(&app, &prefs)?;
 
+    let _ = app.emit("profile://changed", &new_profile);
+
     Ok(new_profile)
 }
 
@@ -2232,6 +2259,46 @@ pub struct EcosystemFootprint {
     pub media_blobs_count: usize,
     pub media_storage_bytes: u64,
     pub registered_ledgers_count: usize,
+    // Core 8 Satellites
+    pub safe_beacons_count: usize,
+    pub talk_rooms_count: usize,
+    pub clar_entries_count: usize,
+    // Extended Mesh Satellites
+    pub draw_manifests_count: usize,
+    pub ride_ledger_count: usize,
+    pub stay_manifests_count: usize,
+    pub farm_ledger_count: usize,
+    pub blog_posts_count: usize,
+}
+
+fn count_records_in_json(candidates: &[PathBuf]) -> usize {
+    for path in candidates {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val.as_array() {
+                        return arr.len();
+                    } else if let Some(obj) = val.as_object() {
+                        if let Some(arr) = obj
+                            .get("records")
+                            .or_else(|| obj.get("entries"))
+                            .or_else(|| obj.get("items"))
+                            .or_else(|| obj.get("votes"))
+                            .or_else(|| obj.get("rooms"))
+                            .or_else(|| obj.get("beacons"))
+                            .or_else(|| obj.get("manifests"))
+                            .or_else(|| obj.get("posts"))
+                            .and_then(|v| v.as_array())
+                        {
+                            return arr.len();
+                        }
+                        return obj.len();
+                    }
+                }
+            }
+        }
+    }
+    0
 }
 
 #[tauri::command]
@@ -2271,81 +2338,106 @@ fn get_ecosystem_footprint(app: AppHandle) -> Result<EcosystemFootprint, String>
         }
     }
 
-    // 3. Count governance ballots & polls
-    let mut governance_ballots_count = 0;
-    let poll_ledger_candidates = [
+    // 3. Count governance ballots & polls (poll_ledger.json)
+    let governance_ballots_count = count_records_in_json(&[
         app_data.join("poll_ledger.json"),
         app_data.join("ledgers").join("poll_ledger.json"),
-    ];
-    for path in &poll_ledger_candidates {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(arr) = val.as_array() {
-                        governance_ballots_count = arr.len();
-                        break;
-                    } else if let Some(obj) = val.as_object() {
-                        if let Some(arr) = obj.get("votes").and_then(|v| v.as_array()) {
-                            governance_ballots_count = arr.len();
-                            break;
-                        } else if let Some(arr) = obj.get("records").and_then(|v| v.as_array()) {
-                            governance_ballots_count = arr.len();
-                            break;
-                        } else {
-                            governance_ballots_count = obj.len();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    ]);
 
     // 4. Evidence vault records count (hive_ledger.json)
-    let mut evidence_records_count = 0;
-    let hive_ledger_candidates = [
+    let evidence_records_count = count_records_in_json(&[
         app_data.join("hive_ledger.json"),
         app_data.join("ledgers").join("hive_ledger.json"),
-    ];
-    for path in &hive_ledger_candidates {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(arr) = val.as_array() {
-                        evidence_records_count = arr.len();
-                        break;
-                    } else if let Some(obj) = val.as_object() {
-                        evidence_records_count = obj.len();
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    ]);
 
     // 5. Kinship registry entries count (name_ledger.json)
-    let mut kinship_entries_count = 0;
-    let name_ledger_candidates = [
+    let kinship_entries_count = count_records_in_json(&[
         app_data.join("name_ledger.json"),
         app_data.join("ledgers").join("name_ledger.json"),
-    ];
-    for path in &name_ledger_candidates {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(arr) = val.as_array() {
-                        kinship_entries_count = arr.len();
-                        break;
-                    } else if let Some(obj) = val.as_object() {
-                        kinship_entries_count = obj.len();
-                        break;
-                    }
+    ]);
+
+    // 6. Safety Circles & Beacons (safe_registry.json / safe_ledger.json)
+    let safe_beacons_count = count_records_in_json(&[
+        app_data.join("safe_registry.json"),
+        app_data.join("ledgers").join("safe_registry.json"),
+        app_data.join("safe_ledger.json"),
+        app_data.join("ledgers").join("safe_ledger.json"),
+    ]);
+
+    // 7. Talk rooms & journals (talk_journal.json / talk_ledger.json)
+    let talk_rooms_count = count_records_in_json(&[
+        app_data.join("talk_journal.json"),
+        app_data.join("ledgers").join("talk_journal.json"),
+        app_data.join("talk_ledger.json"),
+        app_data.join("ledgers").join("talk_ledger.json"),
+    ]);
+
+    // 8. Creator bookmarks & ranks (clar_registry.json or Kind 30024 in nostr_events.db)
+    let mut clar_entries_count = count_records_in_json(&[
+        app_data.join("clar_registry.json"),
+        app_data.join("ledgers").join("clar_registry.json"),
+    ]);
+    if clar_entries_count == 0 {
+        let db_path = app_data.join("nostr_events.db");
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                if let Ok(count) = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind = 30024",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                ) {
+                    clar_entries_count = count;
                 }
             }
         }
     }
 
-    // 6. Scan registered ledgers in ledgers/ and app_data
+    // Extended Mesh Satellites
+    // Draw manifests (draw_manifests.json)
+    let draw_manifests_count = count_records_in_json(&[
+        app_data.join("draw_manifests.json"),
+        app_data.join("ledgers").join("draw_manifests.json"),
+    ]);
+
+    // Ride ledger (ride_ledger.json)
+    let ride_ledger_count = count_records_in_json(&[
+        app_data.join("ride_ledger.json"),
+        app_data.join("ledgers").join("ride_ledger.json"),
+    ]);
+
+    // Stay manifests (stay_manifests.json)
+    let stay_manifests_count = count_records_in_json(&[
+        app_data.join("stay_manifests.json"),
+        app_data.join("ledgers").join("stay_manifests.json"),
+    ]);
+
+    // Farm ledger (farm_ledger.json)
+    let farm_ledger_count = count_records_in_json(&[
+        app_data.join("farm_ledger.json"),
+        app_data.join("ledgers").join("farm_ledger.json"),
+    ]);
+
+    // Blog posts (blog_posts.json or Kind 30023 in nostr_events.db)
+    let mut blog_posts_count = count_records_in_json(&[
+        app_data.join("blog_posts.json"),
+        app_data.join("ledgers").join("blog_posts.json"),
+    ]);
+    if blog_posts_count == 0 {
+        let db_path = app_data.join("nostr_events.db");
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                if let Ok(count) = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind = 30023",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                ) {
+                    blog_posts_count = count;
+                }
+            }
+        }
+    }
+
+    // Scan registered ledgers in ledgers/ and app_data
     let mut registered_ledgers = std::collections::HashSet::new();
     let ledgers_dir = app_data.join("ledgers");
     if ledgers_dir.exists() {
@@ -2365,6 +2457,13 @@ fn get_ecosystem_footprint(app: AppHandle) -> Result<EcosystemFootprint, String>
         "hive_ledger.json",
         "name_ledger.json",
         "talk_journal.json",
+        "safe_registry.json",
+        "clar_registry.json",
+        "draw_manifests.json",
+        "ride_ledger.json",
+        "stay_manifests.json",
+        "farm_ledger.json",
+        "blog_posts.json",
         "pairing.json",
         "contacts.json",
         "credentials.json",
@@ -2383,6 +2482,14 @@ fn get_ecosystem_footprint(app: AppHandle) -> Result<EcosystemFootprint, String>
         media_blobs_count,
         media_storage_bytes,
         registered_ledgers_count: registered_ledgers.len(),
+        safe_beacons_count,
+        talk_rooms_count,
+        clar_entries_count,
+        draw_manifests_count,
+        ride_ledger_count,
+        stay_manifests_count,
+        farm_ledger_count,
+        blog_posts_count,
     })
 }
 
@@ -2394,6 +2501,16 @@ fn dispatch_nostr_event(
     tags: Vec<Vec<String>>,
     profile_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let vault = vault::load_vault(&app)?;
+    let pid = profile_id.clone().unwrap_or_default();
+    let profile = vault
+        .get_profile_by_id(&pid)
+        .ok_or_else(|| format!("Profile not found: '{}'", pid))?;
+
+    if profile.is_anchor() || profile.derivation_index == 0 || profile.level == 0 {
+        return Err("Level 0 Anchor identity cannot be used for signing".into());
+    }
+
     let (signing_key, _did) = resolve_profile_keypair(&app, profile_id)?;
     let verifying_key = signing_key.verifying_key();
     let pubkey_bytes = verifying_key.to_bytes();
@@ -2520,6 +2637,67 @@ fn reset_mesh_relays(app: AppHandle) -> Result<Vec<String>, String> {
     Ok(prefs.relay_mesh)
 }
 
+#[tauri::command]
+fn get_update_preferences(app: AppHandle) -> Result<updater::UpdatePreferences, String> {
+    let prefs = load_preferences(&app);
+    Ok(prefs.update_preferences)
+}
+
+#[tauri::command]
+fn set_update_preferences(app: AppHandle, prefs: updater::UpdatePreferences) -> Result<(), String> {
+    let mut user_prefs = load_preferences(&app);
+    user_prefs.update_preferences = prefs;
+    save_preferences(&app, &user_prefs)
+}
+
+#[tauri::command]
+async fn check_for_update_vetting(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<Option<updater::UpdateMetadata>, String> {
+    let mut user_prefs = load_preferences(&app);
+    let result = updater::query_update_metadata(&user_prefs.update_preferences, force.unwrap_or(false)).await?;
+    user_prefs.update_preferences.last_checked_at = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    let _ = save_preferences(&app, &user_prefs);
+    Ok(result)
+}
+
+#[tauri::command]
+fn install_vetted_update(app: AppHandle, _target_version: String) -> Result<(), String> {
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+    updater::stage_binary_for_rollback(&app_data)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn rollback_to_previous_binary(app: AppHandle) -> Result<bool, String> {
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+    updater::execute_binary_rollback(&app_data)
+}
+
+#[tauri::command]
+fn has_rollback_binary(app: AppHandle) -> Result<bool, String> {
+    let app_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+    Ok(updater::is_rollback_available(&app_data))
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2546,6 +2724,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "check_updates" {
+                let _ = app.emit("app://check-updates", ());
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -2594,6 +2783,7 @@ pub fn run() {
             list_profiles,
             add_profile,
             set_active_profile,
+            activate_persona,
             remove_profile,
             sign_auth_challenge,
             get_public_did_document,
@@ -2658,6 +2848,12 @@ pub fn run() {
             add_mesh_relay,
             remove_mesh_relay,
             reset_mesh_relays,
+            get_update_preferences,
+            set_update_preferences,
+            check_for_update_vetting,
+            install_vetted_update,
+            rollback_to_previous_binary,
+            has_rollback_binary,
         ]);
 
     builder
@@ -2773,6 +2969,13 @@ mod tests {
             app_lock_prf_hash: None,
             last_backup_at: 1700000000,
             relay_mesh: vec!["wss://custom.relay.io".to_string()],
+            update_preferences: updater::UpdatePreferences {
+                policy: updater::UpdatePolicy::Locked,
+                release_channel: "beta".to_string(),
+                custom_manifest_url: Some("https://custom.updates.iyou.me".to_string()),
+                last_checked_at: Some(1700000000),
+                ignored_version: Some("0.2.1".to_string()),
+            },
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");
@@ -2793,6 +2996,8 @@ mod tests {
         assert_eq!(loaded.app_lock_pin_hash.as_deref(), Some("deadbeef"));
         assert_eq!(loaded.last_backup_at, 1700000000);
         assert_eq!(loaded.relay_mesh, vec!["wss://custom.relay.io"]);
+        assert_eq!(loaded.update_preferences.policy, updater::UpdatePolicy::Locked);
+        assert_eq!(loaded.update_preferences.release_channel, "beta");
 
         let _ = std::fs::remove_file(path);
     }
@@ -2820,28 +3025,27 @@ mod tests {
         let mut path = temp_dir();
         path.push("test_vault_profile_switch.json");
 
-        let vault_store = vault::create_vault_at_path(&path).expect("Should create vault");
+        let mut vault_store = vault::create_vault_at_path(&path).expect("Should create vault");
         let profile = vault::add_profile(
-            &mut vault_store.clone(),
+            &mut vault_store,
             "test_profile".to_string(),
             "Test Profile".to_string(),
         )
         .expect("Should add profile");
 
-        // Test successful profile switch
-        let mut prefs = UserPreferences::default();
-        prefs.active_profile_id = profile.profile_id.clone();
+        // Test activating the newly added persona
+        let activated = vault::activate_persona(&mut vault_store, &profile.profile_id)
+            .expect("Should activate persona");
+        assert!(activated.active);
+        assert_eq!(activated.profile_id, "test_profile");
 
-        // Verify the profile was created with expected properties
-        assert!(
-            !profile.profile_id.is_empty(),
-            "Profile ID should not be empty"
-        );
-        assert!(
-            profile.profile_id.contains("test_profile"),
-            "Profile ID should contain test_profile"
-        );
-        assert_eq!(profile.derivation_index, 2, "Should be derivation index 2");
+        // Verify anchor cannot be activated
+        let anchor_err = vault::activate_persona(&mut vault_store, vault::ANCHOR_PROFILE_ID);
+        assert!(anchor_err.is_err(), "Anchor cannot be activated");
+
+        // Verify public_persona resolves to the active profile
+        let pub_p = vault_store.public_persona().expect("Should resolve public persona");
+        assert_eq!(pub_p.profile_id, "test_profile");
 
         let _ = std::fs::remove_file(path);
     }
@@ -2887,6 +3091,14 @@ mod tests {
             media_blobs_count: 7,
             media_storage_bytes: 1048576,
             registered_ledgers_count: 6,
+            safe_beacons_count: 4,
+            talk_rooms_count: 2,
+            clar_entries_count: 8,
+            draw_manifests_count: 1,
+            ride_ledger_count: 0,
+            stay_manifests_count: 3,
+            farm_ledger_count: 9,
+            blog_posts_count: 14,
         };
 
         let json = serde_json::to_string(&footprint).expect("Should serialize");
@@ -2894,5 +3106,9 @@ mod tests {
         assert_eq!(parsed.social_notes_count, 42);
         assert_eq!(parsed.media_storage_bytes, 1048576);
         assert_eq!(parsed.registered_ledgers_count, 6);
+        assert_eq!(parsed.safe_beacons_count, 4);
+        assert_eq!(parsed.talk_rooms_count, 2);
+        assert_eq!(parsed.clar_entries_count, 8);
+        assert_eq!(parsed.blog_posts_count, 14);
     }
 }

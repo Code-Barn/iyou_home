@@ -31,6 +31,7 @@ pub fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let sep1 = PredefinedMenuItem::separator(app)?;
     let show = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
     let lock = MenuItem::with_id(app, "lock", "🔒 Lock Enclave", true, None::<&str>)?;
+    let check_updates = MenuItem::with_id(app, "check_updates", "Check for Updates…", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let bridge_status = MenuItem::with_id(
         app,
@@ -56,6 +57,7 @@ pub fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             &sep1,
             &show,
             &lock,
+            &check_updates,
             &sep2,
             &bridge_status,
             &nostr_status,
@@ -81,6 +83,14 @@ pub fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             "lock" => {
                 let _ = app.emit("app://lock", ());
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+            "check_updates" => {
+                let _ = app.emit("app://check-updates", ());
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.unminimize();
@@ -116,6 +126,9 @@ pub fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 /// Native macOS / desktop application menu bar.
 pub fn build_app_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
+    let check_updates_item = MenuItem::with_id(app, "check_updates", "Check for Updates…", true, None::<&str>)?;
+
+    #[cfg(target_os = "macos")]
     let app_menu = SubmenuBuilder::new(app, "iyou_home")
         .about(Some(AboutMetadata {
             name: Some("iyou_home".to_string()),
@@ -123,6 +136,8 @@ pub fn build_app_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std:
             copyright: Some("Copyright (C) 2026 David Byers dba Byers Brands".to_string()),
             ..Default::default()
         }))
+        .separator()
+        .item(&check_updates_item)
         .separator()
         .services()
         .separator()

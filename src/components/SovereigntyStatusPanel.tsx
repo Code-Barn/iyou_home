@@ -23,6 +23,7 @@ import type { EnclaveDiagnostics } from "../lib/types";
 interface SovereigntyStatusPanelProps {
   onServiceToggled?: () => void;
   onNavigateTab?: (tab: string) => void;
+  defaultExpanded?: boolean;
 }
 
 interface RelayProbeResult {
@@ -39,7 +40,9 @@ function truncateDid(did: string, lead = 18, tail = 6): string {
 export default function SovereigntyStatusPanel({
   onServiceToggled,
   onNavigateTab,
+  defaultExpanded = false,
 }: SovereigntyStatusPanelProps) {
+  const [isExpanded, setIsExpanded] = useState(defaultExpanded);
   const [diagnostics, setDiagnostics] = useState<EnclaveDiagnostics | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -330,6 +333,76 @@ export default function SovereigntyStatusPanel({
 
   const badge = getScoreBadge();
 
+  if (!isExpanded) {
+    return (
+      <div
+        style={{
+          marginBottom: "1.25rem",
+          background: "#ffffff",
+          border: "1px solid #e2e8f0",
+          borderRadius: "10px",
+          padding: "0.55rem 1rem",
+          boxShadow: "0 1px 3px 0 rgba(0, 0, 0, 0.05)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: "0.6rem",
+          minHeight: "40px",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          <span style={{ fontSize: "1rem" }}>
+            {fulfilledCount === 5 ? "🟢" : "🟡"}
+          </span>
+          <span style={{ fontWeight: 600, fontSize: "0.88rem", color: "#0f172a" }}>
+            Sovereignty Health: {fulfilledCount}/{totalChecks} Checks Operational
+          </span>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          <div
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "0.35rem",
+              padding: "0.2rem 0.55rem",
+              borderRadius: "999px",
+              fontSize: "0.75rem",
+              fontWeight: 700,
+              color: badge.color,
+              background: badge.bg,
+              border: `1px solid ${badge.border}`,
+            }}
+          >
+            <span>{badge.icon}</span>
+            <span>{badge.label}</span>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setIsExpanded(true)}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "0.3rem",
+              padding: "0.3rem 0.65rem",
+              fontSize: "0.78rem",
+              fontWeight: 600,
+              borderRadius: "6px",
+              border: "1px solid #cbd5e1",
+              background: "#f8fafc",
+              color: "#334155",
+              cursor: "pointer",
+            }}
+          >
+            Expand Diagnostic Matrix ▾
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       style={{
@@ -366,7 +439,7 @@ export default function SovereigntyStatusPanel({
           </div>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.65rem" }}>
           <div
             style={{
               display: "inline-flex",
@@ -400,6 +473,23 @@ export default function SovereigntyStatusPanel({
             }}
           >
             {loading || probingRelays ? "Scanning…" : "🔄 Refresh"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsExpanded(false)}
+            style={{
+              padding: "0.35rem 0.75rem",
+              fontSize: "0.8rem",
+              fontWeight: 600,
+              borderRadius: "6px",
+              border: "1px solid #cbd5e1",
+              background: "#f8fafc",
+              color: "#334155",
+              cursor: "pointer",
+            }}
+          >
+            Collapse ▴
           </button>
         </div>
       </div>
