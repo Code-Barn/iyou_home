@@ -190,6 +190,14 @@ where
                     println!("DEBUG: Ping received, sending pong via response_tx");
                     let _ = response_tx.send(Message::Text("{\"type\":\"pong\"}".into()));
                     continue;
+                } else if json["type"] == "ENCLAVE_DIAGNOSTIC_QUERY"
+                    || json["type"] == "DIAGNOSTIC_PROBE"
+                    || json["type"] == "get_diagnostics"
+                {
+                    println!("DEBUG: ENCLAVE_DIAGNOSTIC_QUERY request received");
+                    let diag = build_enclave_diagnostics(&app_handle);
+                    let _ = response_tx.send(Message::Text(diag.to_string().into()));
+                    continue;
                 } else if json["type"] == "get_profile" {
                     println!("DEBUG: get_profile request received");
                     match crate::vault::load_vault(&app_handle) {
@@ -667,4 +675,126 @@ async fn handle_omni_sign_request(
 
 pub async fn start_ws_server(app: AppHandle) {
     listen_on("127.0.0.1:9001", app).await;
+}
+
+/// Build enclave diagnostics for loopback diagnostic probing without exposing private keys.
+pub fn build_enclave_diagnostics(app: &AppHandle) -> serde_json::Value {
+    let now = chrono::Utc::now().timestamp() as u64;
+
+    // 1. Key Custody
+    let (key_custody_init, anchor_init, persona_init, active_did, profile_count, sovereign_count) =
+        match crate::vault::load_vault(app) {
+            Ok(v) => {
+                let has_anchor = v.profiles.iter().any(|p| p.is_anchor());
+                let has_persona = v.public_persona().is_some();
+                let did = v
+                    .public_persona()
+                    .map(|p| p.did.clone())
+                    .unwrap_or_default();
+                let count = v.profiles.len();
+                let sov_count = v.sovereign_identities.len();
+                (has_anchor && has_persona, has_anchor, has_persona, did, count, sov_count)
+            }
+            Err(_) => (false, false, false, String::new(), 0, 0),
+        };
+
+    // 2. Local Services & App data dir
+    let app_data = app.path().app_local_data_dir().ok();
+
+    let (nostr_running, blossom_running, chat_running) =
+        if let Some(state) = app.try_state::<crate::ServiceState>() {
+            let services = state.services.lock().unwrap();
+            (
+                services.get("Nostr") == Some(&crate::ServiceStatus::Running),
+                services.get("Blossom") == Some(&crate::ServiceStatus::Running),
+                services.get("Chat") == Some(&crate::ServiceStatus::Running),
+            )
+        } else {
+            (false, false, false)
+        };
+
+    let nostr_diag = if let Some(ref dir) = app_data {
+        crate::nostr_relay::probe_relay_status(dir)
+    } else {
+        serde_json::json!({ "status": "unavailable", "port": 9003, "events_count": 0, "db_exists": false })
+    };
+
+    let blossom_diag = if let Some(ref dir) = app_data {
+        crate::blossom::probe_blossom_status(&dir.join("blobs"))
+    } else {
+        serde_json::json!({ "status": "unavailable", "port": 9002, "blobs_count": 0, "storage_bytes": 0 })
+    };
+
+    // 3. Preferences & Relays & Backups
+    let prefs = crate::load_preferences(app);
+    let relay_mesh = prefs.relay_mesh.clone();
+    let mesh_count = relay_mesh.len();
+    let mesh_ready = mesh_count >= 3;
+
+    let last_backup_at = prefs.last_backup_at;
+    let is_fresh = last_backup_at > 0 && (now.saturating_sub(last_backup_at)) < (30 * 86400);
+    let days_since_backup = if last_backup_at > 0 {
+        Some((now.saturating_sub(last_backup_at)) / 86400)
+    } else {
+        None
+    };
+
+    let all_capabilities_met = key_custody_init
+        && nostr_running
+        && blossom_running
+        && mesh_ready
+        && is_fresh;
+
+    serde_json::json!({
+        "type": "ENCLAVE_DIAGNOSTIC_RESPONSE",
+        "status": "ok",
+        "timestamp": now,
+        "key_custody": {
+            "initialized": key_custody_init,
+            "anchor_initialized": anchor_init,
+            "public_persona_initialized": persona_init,
+            "active_did": active_did,
+            "profile_count": profile_count,
+            "sovereign_identities_count": sovereign_count,
+            "status": if key_custody_init { "active" } else { "uninitialized" }
+        },
+        "local_ingress_relay": {
+            "service_name": "Nostr",
+            "port": 9003,
+            "running": nostr_running,
+            "db_exists": nostr_diag["db_exists"].as_bool().unwrap_or(false),
+            "events_count": nostr_diag["events_count"].as_u64().unwrap_or(0),
+            "status": if nostr_running { "running" } else { "stopped" }
+        },
+        "local_media_server": {
+            "service_name": "Blossom",
+            "port": 9002,
+            "protocol": "BUD-01",
+            "running": blossom_running,
+            "blobs_count": blossom_diag["blobs_count"].as_u64().unwrap_or(0),
+            "storage_bytes": blossom_diag["storage_bytes"].as_u64().unwrap_or(0),
+            "status": if blossom_running { "running" } else { "stopped" }
+        },
+        "local_chat_daemon": {
+            "service_name": "Chat",
+            "port": 5222,
+            "running": chat_running,
+            "status": if chat_running { "running" } else { "stopped" }
+        },
+        "relay_gossip_mesh": {
+            "relays": relay_mesh,
+            "min_required": 3,
+            "configured_count": mesh_count,
+            "mesh_ready": mesh_ready,
+            "status": if mesh_ready { "healthy" } else { "insufficient_relays" }
+        },
+        "encrypted_backups": {
+            "last_backup_at": last_backup_at,
+            "days_since_backup": days_since_backup,
+            "is_fresh": is_fresh,
+            "seed_backup_confirmed": prefs.seed_backup_confirmed,
+            "status": if is_fresh { "fresh" } else if last_backup_at == 0 { "never_exported" } else { "stale" }
+        },
+        "all_capabilities_met": all_capabilities_met
+    })
 }

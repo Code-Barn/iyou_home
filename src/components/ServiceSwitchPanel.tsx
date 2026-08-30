@@ -15,10 +15,11 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import BlossomBrowser from "./BlossomBrowser";
 import SovereignFootprint from "./SovereignFootprint";
+import SovereigntyStatusPanel from "./SovereigntyStatusPanel";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -167,8 +168,23 @@ export default function ServiceSwitchPanel() {
     }
   };
 
+  const refreshServices = useCallback(async () => {
+    try {
+      const [statuses, status] = await Promise.all([
+        invoke<Record<string, ServiceStatus>>("get_service_statuses"),
+        invoke<SyncStatus>("get_sync_status").catch(() => null),
+      ]);
+      setServiceStatus((prev) => ({ ...prev, ...statuses }));
+      if (status) setSyncStatus(status);
+    } catch (err) {
+      console.error("Failed to refresh service statuses:", err);
+    }
+  }, []);
+
   return (
     <>
+      <SovereigntyStatusPanel onServiceToggled={refreshServices} />
+
       <h2>Services</h2>
 
       <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>

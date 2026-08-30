@@ -1,9 +1,8 @@
 # Release Specification V2 — `iyou_home`
 
-**Status:** DRAFT  
-**Date:** 2026-08-26  (Revised: 2026-08-29 — Phases 9 & 10 Launch Readiness codified)  
-**Supersedes:** UI Audit Report (2026-08-26), RELEASE_SPEC_V1 (if exists)  
-**Codifies:** Day 1 public release baseline for `iyou_home` Tauri desktop application
+**Status:** FINAL (V2.0 Sovereign Desktop Release)  
+**Date:** 2026-08-29  
+**Codifies:** Day 1 public sovereign release baseline for `iyou_home` Tauri desktop application across all 10 phases.
 
 ---
 
@@ -48,14 +47,15 @@ The tab bar renders in this exact order, with icons:
 
 | Position | Route ID | Label | Icon | Visibility |
 |---|---|---|---|---|
-| 1 | `enclave` | Enclave | 🛡️ | Always |
-| 2 | `assets` | Credentials | 📜 | Always |
-| 3 | `vault` | Vault & Recovery | 🔑 | Always |
-| 4 | `services` | Services | ⚙️ | Always |
-| 5 | `governance` | Governance Auditor | 🗳️ | Always |
-| 6 | `signer` | Manual Signer | 🧪 | Developer mode only |
+| 1 | `messages` | Messages | 💬 | Always |
+| 2 | `enclave` | Enclave | 🛡️ | Always |
+| 3 | `assets` | Credentials | 📜 | Always |
+| 4 | `vault` | Vault & Recovery | 🔑 | Always |
+| 5 | `services` | Services | ⚙️ | Always |
+| 6 | `governance` | Governance Auditor | 📊 | Always |
+| 7 | `signer` | Manual Signer | 🧪 | Developer mode only |
 
-The default active tab on launch is `enclave` (position 1).
+The default active tab on launch is `enclave` (position 2).
 
 ### 2.4 Developer Mode Toggle
 

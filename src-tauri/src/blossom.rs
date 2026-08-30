@@ -44,7 +44,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, options},
+    routing::get,
     Router,
 };
 use sha2::{Digest, Sha256};
@@ -99,7 +99,8 @@ pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Re
                 .delete(handle_delete)
                 .options(handle_options),
         )
-        .route("/", options(handle_options))
+        .route("/", get(handle_health).options(handle_options))
+        .route("/health", get(handle_health).options(handle_options))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(cors)
         .layer(pna_layer)
@@ -118,6 +119,18 @@ pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Re
         })
         .await
         .expect("Blossom server failed");
+}
+
+async fn handle_health(State(state): State<BlossomState>) -> impl IntoResponse {
+    let diag = probe_blossom_status(&state.blobs_dir);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header("Access-Control-Allow-Private-Network", "true")
+        .body(Body::from(diag.to_string()))
+        .unwrap()
+        .into_response()
 }
 
 async fn handle_options() -> Response {
@@ -358,9 +371,50 @@ pub async fn mirror_blob_from_remote(
     Ok(true)
 }
 
+/// Check local Blossom media storage directory metrics (blobs count, total bytes).
+pub fn probe_blossom_status(blobs_dir: &std::path::Path) -> serde_json::Value {
+    let mut count = 0usize;
+    let mut total_bytes = 0u64;
+    if let Ok(entries) = std::fs::read_dir(blobs_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    count += 1;
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "status": "ready",
+        "service": "Blossom BUD-01 Personal Data Store",
+        "port": 9002,
+        "protocol": "BUD-01",
+        "blobs_count": count,
+        "storage_bytes": total_bytes
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_probe_blossom_status() {
+        let temp_dir = std::env::temp_dir().join("test_blossom_probe");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dummy_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        std::fs::write(temp_dir.join(dummy_hash), b"hello world").unwrap();
+
+        let diag = probe_blossom_status(&temp_dir);
+        assert_eq!(diag["status"], "ready");
+        assert_eq!(diag["port"], 9002);
+        assert_eq!(diag["protocol"], "BUD-01");
+        assert_eq!(diag["blobs_count"], 1);
+        assert_eq!(diag["storage_bytes"], 11);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn test_is_valid_hash() {

@@ -1,14 +1,14 @@
-# Developer Guide — iyou_home (V2 Release)
+# Developer Guide — iyou_home (V2.0 Sovereign Release)
 
-This guide provides technical specifications, architecture patterns, cryptographic invariants, and wire protocol details for the `iyou_home` sovereign identity hub and Personal Data Store (PDS).
+This guide provides technical specifications, architecture patterns, cryptographic invariants, wire protocol details, and subsystem manuals for the `iyou_home` sovereign identity hub and Personal Data Store (PDS).
 
 ---
 
 ## 1. Getting Started
 
 ### 1.1 Prerequisites
-- **Rust & Cargo**: >= 1.78.0
-- **Node.js & npm**: >= 20.x
+- **Rust & Cargo**: `>= 1.78.0`
+- **Node.js & npm**: `>= 20.x`
 - **Tauri v2 CLI & Prerequisites**: See [Tauri v2 documentation](https://v2.tauri.app/start/prerequisites/)
 
 ### 1.2 Development Boot
@@ -22,13 +22,13 @@ npm run tauri dev
 
 ### 1.3 Verification & Test Commands
 ```bash
-# Execute full backend Rust test suite (66 tests)
+# Execute full backend Rust test suite (90 tests)
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # Run TypeScript typecheck & production bundle build
 npx tsc --noEmit && npm run build
 
-# Run Vitest test runner (30 unit tests)
+# Run Vitest test runner (74 unit tests across 10 test files)
 npx vitest run
 ```
 
@@ -47,8 +47,8 @@ $$\text{secp256k1 Seed}_i = \text{SHA-256}(\text{"secp256k1-nostr"} \parallel \t
 
 | Curve / Purpose | Derivation Prefix / Formula | Multibase / Encoding | Typical Use Case |
 |---|---|---|---|
-| **Ed25519 (W3C DID)** | `SHA-256(root_seed \|\| LE(index))` | `did:key:z6Mk...` | OIDC challenges, W3C VCs/VPs, poll votes, session revocation |
-| **secp256k1 (NIP-01)** | `SHA-256("secp256k1-nostr" \|\| root_seed \|\| LE(index))` | 64-char lowercase hex | Nostr event signatures (BIP-340 Schnorr) |
+| **Ed25519 (W3C DID)** | `SHA-256(root_seed \|\| LE(index))` | `did:key:z6Mk...` | OIDC challenges, W3C VCs/VPs, poll votes, session revocation, OMEMO identity signatures |
+| **secp256k1 (NIP-01)** | `SHA-256("secp256k1-nostr" \|\| root_seed \|\| LE(index))` | 64-char lowercase hex | Nostr event signatures (BIP-340 Schnorr `sign_raw`), Prosody SASL password |
 
 ### 2.2 Persona Hierarchy & Air-Gap Invariants
 
@@ -70,11 +70,11 @@ $$\text{secp256k1 Seed}_i = \text{SHA-256}(\text{"secp256k1-nostr"} \parallel \t
 
 1. **Level 0 Anchor Sanctum (`index: 0`, `profile_id: "anchor"`)**:
    - `is_system_reserved: true`, `level: 0`.
-   - **Air-Gap Invariant**: Excluded from external WebSocket signing requests, public persona dropdowns, and social broadcasting. Used strictly for high-assurance root introductions, selective disclosures, and air-gapped identity anchoring.
+   - **Air-Gap Invariant**: Excluded from external WebSocket signing requests, public persona dropdowns, chat JID bindings, and social broadcasting. Used strictly for high-assurance root introductions, selective disclosures, and air-gapped identity anchoring.
    - Deletion is structurally rejected by backend guards.
 2. **Level 1 Public Persona (`index: 1`, `profile_id: "primary"`)**:
    - `is_system_reserved: false`, `level: 1`.
-   - Default active persona for social broadcasting, Nostr events, W3C credentials, and browser signing challenges.
+   - Default active persona for social broadcasting, Nostr events, W3C credentials, XMPP chat sessions, and browser signing challenges.
 3. **Level 2+ Contextual Burners (`index: 2+`)**:
    - Disposable, context-isolated identities created dynamically (`add_profile`) and deleted at will (`remove_profile`).
 
@@ -89,55 +89,72 @@ If the Level 1 Public Persona is compromised or needs retirement:
 
 ---
 
-## 3. Wire Protocol Handshakes (`wss://home.iyou.me:9001`)
+## 3. Wire Protocols & Service Architecture
 
-The Signature Bridge binds exclusively to `127.0.0.1:9001` over TLS. Modern browsers connect via `wss://home.iyou.me:9001` (which resolves via DNS to `127.0.0.1`).
-
-### 3.1 Supported Frame Matrix
+All local daemons bind strictly to `127.0.0.1`.
 
 ```
-Browser / Satellite App                       iyou_home Rust Bridge (:9001)
-         │                                                │
-         │─── OPTIONS (PNA Pre-flight) ──────────────────>│
-         │<── 200 OK (Access-Control-Allow-Private-Net) ──│
-         │                                                │
-         │─── GET (Upgrade: websocket) ──────────────────>│
-         │<── 101 Switching Protocols ────────────────────│
-         │                                                │
-         │─── Frame Dispatch ────────────────────────────>│
-         │    • OMNI_SIGN_REQUEST                         │
-         │    • POLY_CREDENTIAL_REQUEST                   │
-         │    • RESOLVE_PEER_ALIASES                      │
-         │    • SYNC_TO_HOME_REQUEST                      │
-         │    • GLOBAL_SESSION_REVOKE                     │
-         │<── Response Envelope ──────────────────────────│
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Local Daemon Switchboard                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. Signature Bridge   :9001  (WSS / TLS)  wss://home.iyou.me:9001           │
+│ 2. Blossom Media PDS  :9002  (BUD-01)     http://127.0.0.1:9002             │
+│ 3. Nostr Ingress Relay:9003  (NIP-01)     ws://127.0.0.1:9003               │
+│ 4. Prosody XMPP Mesh  :5222  (RFC 7395)   wss://127.0.0.1:5222/xmpp-ws      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 1. `OMNI_SIGN_REQUEST` (`protocol: "POLY_V2"`)
-- **Purpose**: Headless poll vote signing for `iyou_poly` without UI modal interruption.
-- **Payload**: `{"poll_id": "...", "option_id": "...", "timestamp": 1234567890}`.
-- **Canonicalization**: Alphabetical key order via `BTreeMap`, serialized to compact JSON.
-- **Output**: Returns a Nostr Kind 1112 envelope signed with the persona's Ed25519 key.
+### 3.1 Signature Bridge Protocol (`wss://home.iyou.me:9001`)
 
-#### 2. `POLY_CREDENTIAL_REQUEST`
-- **Purpose**: Credential presentation handshake for external apps requesting proof of a specific credential.
-- **Flow**: Prompts user via `WsSignPopup.tsx` with `PopupGuard` anti-trample concurrency control.
-- **Output**: Returns `POLY_CREDENTIAL_PRESENTATION` containing a signed W3C Verifiable Presentation wrapping the chosen credential.
+The Signature Bridge terminates TLS natively with runtime certificate resolution (`{app_data}/certs/production.crt` and `production.key`) and provides Private Network Access (PNA) header pre-flights.
 
-#### 3. `RESOLVE_PEER_ALIASES`
-- **Purpose**: Contact Enclave privacy pre-gate lens.
-- **Constraint**: Accepts up to 256 pubkeys/DIDs. Performs exact-match lookup in `contacts.json`.
-- **Output**: Returns `{ matches: { "<key>": { "nickname": "...", "trust_level": "...", "badge": "..." } }, "unknown": [...] }`.
-- **Security**: Loads only `contacts.json`; never touches `vault.json` or root key material.
+#### Supported Wire Messages:
+1. `OMNI_SIGN_REQUEST` (`protocol: "POLY_V2"`): Headless poll vote signing for `iyou_poly`. Serializes canonicalized ballot payload and returns a signed Nostr Kind 1112 envelope.
+2. `POLY_CREDENTIAL_REQUEST`: Prompts user with `PopupGuard` anti-trample concurrency control and returns a signed W3C Verifiable Presentation.
+3. `RESOLVE_PEER_ALIASES`: Privacy pre-gate looking up up to 256 peer pubkeys in `contacts.json` without touching root keys.
+4. `SYNC_TO_HOME_REQUEST`: Ingests Nostr events into local SQLite (`:9003`) and mirrors Blossom media blobs into local storage (`:9002`).
+5. `ENCLAVE_DIAGNOSTIC_QUERY`: Diagnostic probe returning local service availability, key custody status, gossip mesh count, and backup freshness without leaking secrets.
 
-#### 4. `SYNC_TO_HOME_REQUEST`
-- **Purpose**: Sync-to-Home Local Mirroring Pipeline.
-- **Payload**: Batch of Nostr events (Kinds 1, 1063, 1111, 30023) and list of missing Blossom blob SHA-256 hashes.
-- **Engine**: Idempotently inserts Nostr events into local SQLite (`127.0.0.1:9003`) and mirrors remote blobs from `https://cdn.iyou.me/` into local storage (`127.0.0.1:9002`).
+### 3.2 Prosody XMPP & OMEMO Messaging (`:5222`)
 
-#### 5. `GLOBAL_SESSION_REVOKE`
-- **Purpose**: Invalidate all active web logins across satellite apps (`iyou_wun`, `iyou_poly`, `iyou_talk`).
-- **Engine**: Generates a timestamped nonce envelope signed with Level 1 Ed25519 key and posts to `https://iyou.me/api/auth/revoke-all/`.
+The Messages subsystem provides decentralized, end-to-end encrypted messaging using XMPP over WebSocket (RFC 7395) and OMEMO Double Ratchet encryption.
+
+- **JID Scheme**: `{nostr_pubkey_hex}@127.0.0.1`.
+- **SASL Authentication**: Plaintext SASL against embedded Prosody using Level 1 persona hex key.
+- **Address Resolution**: Supports npub (`npub1...`), did:key (`did:key:z6Mk...`), raw 64-char hex, and bare JID formats.
+- **OMEMO Device Bundles**: Stored in `omemo_store.json`. Each device mints distinct numerical device IDs, an identity key (`Ik`), a signed prekey (`Spk`) signed with Ed25519, and a pool of one-time prekeys (`Opks`).
+
+### 3.3 Mobile QR Pairing Protocol (`iyouhome://pair`)
+
+Allows mobile satellite devices to establish an authenticated, encrypted channel to ingest the root master seed.
+
+```
+Desktop App (iyou_home)                        Mobile Device (iOS / Android)
+        │                                                     │
+        │─── Generate Ephemeral X25519 Keypair ───────────────│
+        │─── Render QR Code (iyouhome://pair?...) ───────────>│
+        │                                                     │
+        │<── Mobile Scans QR & Posts Device X25519 Pubkey ───│
+        │                                                     │
+        │─── ECDH Key Agreement ──────────────────────────────│
+        │─── HKDF-SHA256(ikm, salt, info="iyou-home/pair/v1")─│
+        │─── AES-256-GCM Seal Root Master Seed ──────────────>│
+        │                                                     │
+        │<── Mobile Decrypts & Acknowledges Handshake ────────│
+        │─── Confirm Registration into pairing.json ──────────│
+```
+
+- **Deep Link Schema**: `iyouhome://pair?frame_id={uuid}&x25519={hex}&nonce={hex}&ver=1`
+- **HKDF Domain Separation**: `iyou-home/pair/v1`
+- **AAD Binding**: `frame_id || device_id || timestamp`
+
+### 3.4 Quick Dispatcher Pipeline
+
+Top-bar `[ ✍️ Dispatch ]` station allowing rapid publishing:
+- **Kind 1 (Notes)**: Plaintext / Markdown micro-posts signed via BIP-340 Schnorr.
+- **Kind 1063 (File Uploads)**: Media upload to local Blossom BUD-01 server (`:9002`) followed by publishing a Kind 1063 NIP-94 file metadata event.
+- **Kind 30023 (Civic Polls)**: Long-form poll parameter definitions containing poll title, choices, closing timestamp, and Blossom Merkle snapshot URI.
+- **Dual Broadcast**: Automatically dispatches events to the local loopback relay (`ws://127.0.0.1:9003`) and the configured public gossip mesh (`wss://relay.iyou.me`, `wss://nos.lol`, `wss://relay.damus.io`).
 
 ---
 
@@ -151,13 +168,14 @@ Identity continuity is anchored across 3 independent redundancy paths:
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 1. Local Encrypted Archive (.iyoubackup)                                    │
 │    • Password-encrypted container (HKDF-SHA256 + AES-256-GCM)               │
-│    • Bundles vault.json, contacts.json, preferences.json, manifest.json     │
+│    • Bundles vault.json, contacts.json, pairing.json, preferences.json,    │
+│      and dynamic ledgers directory ({app_data}/ledgers/)                    │
 │                                                                             │
 │ 2. Self-Hosted Blossom Node (Port 9002)                                     │
 │    • Local SHA-256 content-addressed media blob repository                  │
 │    • Automatic background mirroring of user uploads and attachments         │
 │                                                                             │
-│ 3. Decentralized Nostr Relays (Port 9003 & Upstream)                        │
+│ 3. Decentralized Nostr Relays (Port 9003 & Upstream Mesh)                   │
 │    • Signed notes, long-form articles, and social graphs                    │
 │    • Reconstructable from public relays using deterministic root seed       │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -165,36 +183,31 @@ Identity continuity is anchored across 3 independent redundancy paths:
 
 ### 4.1 `.iyoubackup` Container Specification
 
-- **KDF**: `HKDF-SHA256` over the user-provided password with a 16-byte random salt.
+- **KDF**: `HKDF-SHA256` over the user password with a 16-byte random salt.
 - **Cipher**: `AES-256-GCM` with a 12-byte random nonce.
-- **Payload**: ZIP archive containing:
+- **Payload Archive**:
   - `manifest.json`: Version metadata, creation timestamp, profile count.
   - `vault.json`: Base64-encoded `VaultStore`.
   - `contacts.json`: Peer contacts and trust levels.
+  - `pairing.json`: Paired device registry.
   - `preferences.json`: Active persona and UI settings.
+  - `ledgers/*`: All dynamic ledger documents in `{app_data}/ledgers/` (`poll_ledger.json`, civic records).
 
 ---
 
-## 5. Governance & Consensus Engine
+## 5. System Tray & Window Lifecycle
 
-`iyou_home` provides cold governance verification for decentralized polls (e.g. in `iyou_poly`).
-
-### 5.1 Local Merkle Root Computation
-
-The Merkle tree is computed over ballot signatures (`VoteRecord.client_signature`) with second-preimage resistant domain separation:
-
-- **Leaf Hash**: $\text{SHA-256}(0\text{x}00 \parallel \text{client\_signature})$
-- **Internal Node Hash**: $\text{SHA-256}(0\text{x}01 \parallel \text{left\_hash} \parallel \text{right\_hash})$
-- **Odd Layer Handling**: Duplicates the trailing node to maintain full binary tree balance.
-- **Empty Set**: Yields an empty string `""`.
-
-### 5.2 Poll Schedule & Timeline Validation
-
-`LocalPoll::validate_vote_timeline(timestamp)` verifies that votes fall strictly within $[starts\_at, ends\_at]$ unless `is_ongoing == true`.
+`iyou_home` operates as a persistent desktop daemon:
+- **Hide on Close (`WindowEvent::CloseRequested`)**: Closing the main window hides the window rather than terminating the process, allowing background daemons (SigBridge, Blossom, Nostr, Prosody) to continue serving requests uninterrupted.
+- **Monochrome Menu Bar Icon**: Configured with macOS `template: true` mode for seamless dark/light menu bar integration.
+- **Tray Menu Actions**:
+  - `Open Enclave` — Restores and focuses the main window.
+  - `Lock App` — Immediately triggers app lock screen guard.
+  - `Quit` — Gracefully halts all background daemons and exits.
 
 ---
 
-## 6. Service Port & Network Architecture
+## 6. Service Port & Network Architecture Summary
 
 | Service | Port | Protocol | Binding | Purpose |
 |---|---|---|---|---|

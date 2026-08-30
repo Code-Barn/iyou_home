@@ -82,6 +82,53 @@ const { mockInvoke, defaultMockHandler } = vi.hoisted(() => {
           level: 1,
           is_system_reserved: false,
         });
+      case "get_enclave_diagnostics":
+        return Promise.resolve({
+          type: "ENCLAVE_DIAGNOSTIC_RESPONSE",
+          status: "ok",
+          timestamp: 1756241000,
+          key_custody: {
+            initialized: true,
+            anchor_initialized: true,
+            public_persona_initialized: true,
+            active_did: "did:key:z6Mku...",
+            profile_count: 1,
+            sovereign_identities_count: 0,
+            status: "active",
+          },
+          local_ingress_relay: {
+            service_name: "Nostr",
+            port: 9003,
+            running: false,
+            db_exists: false,
+            events_count: 0,
+            status: "stopped",
+          },
+          local_media_server: {
+            service_name: "Blossom",
+            port: 9002,
+            protocol: "BUD-01",
+            running: false,
+            blobs_count: 0,
+            storage_bytes: 0,
+            status: "stopped",
+          },
+          relay_gossip_mesh: {
+            relays: ["wss://relay.iyou.me", "wss://nos.lol", "wss://relay.damus.io"],
+            min_required: 3,
+            configured_count: 3,
+            mesh_ready: true,
+            status: "healthy",
+          },
+          encrypted_backups: {
+            last_backup_at: 1756241000,
+            days_since_backup: 1,
+            is_fresh: true,
+            seed_backup_confirmed: true,
+            status: "fresh",
+          },
+          all_capabilities_met: false,
+        });
       default:
         return Promise.resolve();
     }
@@ -192,7 +239,7 @@ describe("App", () => {
     });
 
     const startButtons = screen.getAllByRole("button", {
-      name: /start/i,
+      name: /^start$/i,
     });
     expect(startButtons.length).toBe(3);
 
@@ -221,7 +268,7 @@ describe("App", () => {
     });
 
     const startButtons = screen.getAllByRole("button", {
-      name: /start/i,
+      name: /^start$/i,
     });
     await act(async () => {
       fireEvent.click(startButtons[0]);
@@ -246,7 +293,7 @@ describe("App", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getAllByRole("button", { name: /start/i }).length).toBe(3);
+      expect(screen.getAllByRole("button", { name: /^start$/i }).length).toBe(3);
     });
   });
 

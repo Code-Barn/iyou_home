@@ -414,9 +414,67 @@ pub fn count_events(db: &Arc<Mutex<rusqlite::Connection>>) -> Result<usize, Stri
     Ok(count as usize)
 }
 
+/// Check local Nostr relay metrics (database accessibility, events count, NIP support).
+pub fn probe_relay_status(app_data_dir: &std::path::Path) -> serde_json::Value {
+    let db_path = app_data_dir.join("nostr_events.db");
+    let (db_exists, count) = if db_path.exists() {
+        match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                let c: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                    .unwrap_or(0);
+                (true, c as usize)
+            }
+            Err(_) => (true, 0),
+        }
+    } else {
+        (false, 0)
+    };
+
+    serde_json::json!({
+        "status": "ready",
+        "service": "Local Nostr SQLite Relay",
+        "port": 9003,
+        "db_exists": db_exists,
+        "events_count": count,
+        "supported_nips": [1, 11]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_probe_relay_status() {
+        let temp_dir = std::env::temp_dir().join("test_nostr_probe");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let diag_initial = probe_relay_status(&temp_dir);
+        assert_eq!(diag_initial["status"], "ready");
+        assert_eq!(diag_initial["port"], 9003);
+        assert_eq!(diag_initial["events_count"], 0);
+
+        let db_path = temp_dir.join("nostr_events.db");
+        let conn = init_db(&db_path).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+
+        let events = vec![serde_json::json!({
+            "id": "e111111111111111111111111111111111111111111111111111111111111111",
+            "pubkey": "p111111111111111111111111111111111111111111111111111111111111111",
+            "created_at": 1700000000,
+            "kind": 1,
+            "tags": [],
+            "content": "Hello Sovereign World",
+            "sig": "s111111111111111111111111111111111111111111111111111111111111111"
+        })];
+        let _ = ingest_batch_events(&events, &db).unwrap();
+
+        let diag_after = probe_relay_status(&temp_dir);
+        assert_eq!(diag_after["events_count"], 1);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn test_ingest_batch_events_idempotent() {

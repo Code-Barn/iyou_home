@@ -88,6 +88,20 @@ pub struct UserPreferences {
     /// SHA-256 of the WebAuthn PRF seed hex, never the PRF seed itself.
     #[serde(default)]
     pub app_lock_prf_hash: Option<String>,
+    /// Unix timestamp of the last exported encrypted vault backup.
+    #[serde(default)]
+    pub last_backup_at: u64,
+    /// List of configured public Nostr relays for the gossip mesh.
+    #[serde(default = "default_relay_mesh")]
+    pub relay_mesh: Vec<String>,
+}
+
+pub fn default_relay_mesh() -> Vec<String> {
+    vec![
+        "wss://relay.iyou.me".to_string(),
+        "wss://nos.lol".to_string(),
+        "wss://relay.damus.io".to_string(),
+    ]
 }
 
 impl Default for UserPreferences {
@@ -104,6 +118,8 @@ impl Default for UserPreferences {
             inactivity_timeout_minutes: 15,
             app_lock_pin_hash: None,
             app_lock_prf_hash: None,
+            last_backup_at: 0,
+            relay_mesh: default_relay_mesh(),
         }
     }
 }
@@ -1860,7 +1876,14 @@ fn create_vault_backup(app: AppHandle, password: String) -> Result<Vec<u8>, Stri
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
     let vault = vault::load_or_bootstrap_vault(&app)
         .map_err(|e| format!("Failed to load vault: {}", e))?;
-    vault::export_vault_backup(&vault, &app_data, &password)
+    let backup_bytes = vault::export_vault_backup(&vault, &app_data, &password)?;
+
+    let mut prefs = load_preferences(&app);
+    let now = chrono::Utc::now().timestamp() as u64;
+    prefs.last_backup_at = now;
+    let _ = save_preferences(&app, &prefs);
+
+    Ok(backup_bytes)
 }
 
 #[tauri::command]
@@ -2443,6 +2466,60 @@ fn dispatch_nostr_event(
     Ok(event)
 }
 
+#[tauri::command]
+fn get_enclave_diagnostics(
+    app: AppHandle,
+    _state: State<'_, ServiceState>,
+) -> Result<serde_json::Value, String> {
+    Ok(bridge::build_enclave_diagnostics(&app))
+}
+
+#[tauri::command]
+fn record_backup_timestamp(app: AppHandle) -> Result<u64, String> {
+    let mut prefs = load_preferences(&app);
+    let now = chrono::Utc::now().timestamp() as u64;
+    prefs.last_backup_at = now;
+    save_preferences(&app, &prefs)?;
+    Ok(now)
+}
+
+#[tauri::command]
+fn get_relay_mesh(app: AppHandle) -> Result<Vec<String>, String> {
+    let prefs = load_preferences(&app);
+    Ok(prefs.relay_mesh)
+}
+
+#[tauri::command]
+fn add_mesh_relay(app: AppHandle, relay_url: String) -> Result<Vec<String>, String> {
+    let trimmed = relay_url.trim().to_string();
+    if !trimmed.starts_with("ws://") && !trimmed.starts_with("wss://") {
+        return Err("Relay URL must start with ws:// or wss://".to_string());
+    }
+    let mut prefs = load_preferences(&app);
+    if !prefs.relay_mesh.contains(&trimmed) {
+        prefs.relay_mesh.push(trimmed);
+        save_preferences(&app, &prefs)?;
+    }
+    Ok(prefs.relay_mesh)
+}
+
+#[tauri::command]
+fn remove_mesh_relay(app: AppHandle, relay_url: String) -> Result<Vec<String>, String> {
+    let trimmed = relay_url.trim().to_string();
+    let mut prefs = load_preferences(&app);
+    prefs.relay_mesh.retain(|r| r != &trimmed);
+    save_preferences(&app, &prefs)?;
+    Ok(prefs.relay_mesh)
+}
+
+#[tauri::command]
+fn reset_mesh_relays(app: AppHandle) -> Result<Vec<String>, String> {
+    let mut prefs = load_preferences(&app);
+    prefs.relay_mesh = default_relay_mesh();
+    save_preferences(&app, &prefs)?;
+    Ok(prefs.relay_mesh)
+}
+
 // ---------- app entry ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2575,6 +2652,12 @@ pub fn run() {
             trigger_manual_sync,
             get_ecosystem_footprint,
             dispatch_nostr_event,
+            get_enclave_diagnostics,
+            record_backup_timestamp,
+            get_relay_mesh,
+            add_mesh_relay,
+            remove_mesh_relay,
+            reset_mesh_relays,
         ]);
 
     builder
@@ -2688,6 +2771,8 @@ mod tests {
             inactivity_timeout_minutes: 5,
             app_lock_pin_hash: Some("deadbeef".to_string()),
             app_lock_prf_hash: None,
+            last_backup_at: 1700000000,
+            relay_mesh: vec!["wss://custom.relay.io".to_string()],
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");
@@ -2706,6 +2791,8 @@ mod tests {
         assert!(loaded.app_lock_enabled);
         assert_eq!(loaded.inactivity_timeout_minutes, 5);
         assert_eq!(loaded.app_lock_pin_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(loaded.last_backup_at, 1700000000);
+        assert_eq!(loaded.relay_mesh, vec!["wss://custom.relay.io"]);
 
         let _ = std::fs::remove_file(path);
     }
@@ -2723,6 +2810,9 @@ mod tests {
         assert_eq!(prefs.inactivity_timeout_minutes, 15);
         assert!(prefs.app_lock_pin_hash.is_none());
         assert!(prefs.app_lock_prf_hash.is_none());
+        assert_eq!(prefs.last_backup_at, 0);
+        assert_eq!(prefs.relay_mesh.len(), 3);
+        assert!(prefs.relay_mesh.contains(&"wss://relay.iyou.me".to_string()));
     }
 
     #[test]

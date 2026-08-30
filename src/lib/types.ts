@@ -96,6 +96,10 @@ export interface UserPreferences {
   app_lock_pin_hash?: string | null;
   /** SHA-256 of the WebAuthn PRF seed hex (never the seed itself). */
   app_lock_prf_hash?: string | null;
+  /** Unix timestamp of the last exported encrypted vault backup. */
+  last_backup_at?: number;
+  /** List of configured public Nostr relays for the gossip mesh. */
+  relay_mesh?: string[];
 }
 
 export const DEFAULT_USER_PREFERENCES: UserPreferences = {
@@ -110,4 +114,67 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   inactivity_timeout_minutes: 15,
   app_lock_pin_hash: null,
   app_lock_prf_hash: null,
+  last_backup_at: 0,
+  relay_mesh: [
+    "wss://relay.iyou.me",
+    "wss://nos.lol",
+    "wss://relay.damus.io",
+  ],
 };
+
+export interface KeyCustodyDiagnostic {
+  initialized: boolean;
+  anchor_initialized: boolean;
+  public_persona_initialized: boolean;
+  active_did: string;
+  profile_count: number;
+  sovereign_identities_count: number;
+  status: "active" | "uninitialized";
+}
+
+export interface LocalIngressRelayDiagnostic {
+  service_name: string;
+  port: number;
+  running: boolean;
+  db_exists: boolean;
+  events_count: number;
+  status: "running" | "stopped";
+}
+
+export interface LocalMediaServerDiagnostic {
+  service_name: string;
+  port: number;
+  protocol: string;
+  running: boolean;
+  blobs_count: number;
+  storage_bytes: number;
+  status: "running" | "stopped";
+}
+
+export interface RelayGossipMeshDiagnostic {
+  relays: string[];
+  min_required: number;
+  configured_count: number;
+  mesh_ready: boolean;
+  status: "healthy" | "insufficient_relays";
+}
+
+export interface EncryptedBackupsDiagnostic {
+  last_backup_at: number;
+  days_since_backup: number | null;
+  is_fresh: boolean;
+  seed_backup_confirmed: boolean;
+  status: "fresh" | "stale" | "never_exported";
+}
+
+export interface EnclaveDiagnostics {
+  type: string;
+  status: string;
+  timestamp: number;
+  key_custody: KeyCustodyDiagnostic;
+  local_ingress_relay: LocalIngressRelayDiagnostic;
+  local_media_server: LocalMediaServerDiagnostic;
+  relay_gossip_mesh: RelayGossipMeshDiagnostic;
+  encrypted_backups: EncryptedBackupsDiagnostic;
+  all_capabilities_met: boolean;
+}
