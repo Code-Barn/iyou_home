@@ -8,6 +8,9 @@
         "build": "tsc && vite build",
         "preview": "vite preview",
         "tauri": "tauri",
+        "tauri:build:x64": "tauri build --target x86_64-apple-darwin",
+        "tauri:build:arm64": "tauri build --target aarch64-apple-darwin",
+        "tauri:build:universal": "tauri build --target universal-apple-darwin",
         "test": "vitest",
         "coverage": "vitest run --coverage"
     },

@@ -508,6 +508,30 @@ A high-transparency verification dialog presented before executing an update ins
 
 ---
 
+## 10. Sovereign Packaging, Self-Hosted CI & macOS Universal Release Pipeline
+
+> Eliminate trust in third-party hosted CI infrastructure by executing release builds natively on sovereign self-hosted hardware with verifiable multi-architecture packaging.
+
+### 10.1 Self-Hosted Linux CI Packaging (`dc13` Metal Runner)
+- **Zero-Trust Runner (`.github/workflows/release.yml`):** Release packaging for Linux executes on a self-hosted runner provisioned on dedicated `dc13` hardware (`[self-hosted, linux, dc13, tauri-builder]`).
+- **Artifact Targets:** Compiles and packages native `.deb` (Debian/Ubuntu) and `.AppImage` standalone binaries with bundled desktop and icon metadata.
+- **Checksum Verification (`SHA256SUMS_LINUX.txt`):** Generates and publishes cryptographic SHA-256 digests for all generated Linux release artifacts alongside GitHub Release assets upon git tag push (`v*`).
+
+### 10.2 Local macOS Multi-Architecture & Universal DMGs
+- **Universal & Native macOS Targets (`package.json`):**
+  - `npm run tauri:build:universal` — Compiles a Universal macOS DMG binary (`universal-apple-darwin`) supporting both Apple Silicon (M1/M2/M3/M4) and Intel (x86_64) architectures in a single distributable bundle.
+  - `npm run tauri:build:arm64` — Compiles an Apple Silicon native bundle (`aarch64-apple-darwin`).
+  - `npm run tauri:build:x64` — Compiles an Intel 64-bit native bundle (`x86_64-apple-darwin`).
+- **Headless Build Compatibility:** Supports `CI=true` automated bundling without requiring active Finder AppleScript interaction.
+
+### 10.3 Minisign Cryptographic Verification Contract
+- All distributable bundles (Linux `.deb`/`.AppImage` and macOS `.dmg`) must be signed with the Byers Brands Minisign private release key:
+  - Public Key: `RWQUVz81iYkLd...ByersBrandsSovereignReleaseKey`
+  - Signed manifests are published to `https://updates.iyou.me/home/latest.json`.
+  - Node instances verify signatures locally via `tauri-plugin-updater` and the Pre-Install Cryptographic Vetting Modal before binary execution.
+
+---
+
 ## Appendix A: File Inventory (Post-Release)
 
 | File | Status | Notes |
@@ -525,5 +549,8 @@ A high-transparency verification dialog presented before executing an update ins
 | `src/components/enclave/ContactList.tsx` | No change | Already release-ready |
 | `src/components/enclave/DisclosureModal.tsx` | No change | Already release-ready |
 | `src/components/enclave/GraduationWizard.tsx` | No change | Already release-ready |
-| `src/components/IpfsArchiveViewer.tsx` | **Deprecated** | Replaced by `GovernanceAuditor.tsx` |
-| `docs/RELEASE_SPEC_V2.md` | **New** | This document |
+| `src/components/updater/UpdateVettingModal.tsx` | **New** | Pre-install cryptographic vetting modal |
+| `src/components/SovereignFootprint.tsx` | Modified | Core 8 footprint matrix & extended mesh drawer |
+| `src-tauri/src/updater.rs` | **New** | Minisign updater, preferences, and rollback engine |
+| `.github/workflows/release.yml` | **New** | Self-hosted Linux CI release packaging workflow |
+| `docs/RELEASE_SPEC_V2.md` | **New** | Comprehensive release specification |

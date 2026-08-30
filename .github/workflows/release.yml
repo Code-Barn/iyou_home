@@ -1,0 +1,45 @@
+name: Sovereign Release Packaging
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux-sovereign:
+    name: Build Linux Packages on dc13
+    runs-on: [self-hosted, linux, dc13, tauri-builder]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Frontend Dependencies
+        run: npm ci
+
+      - name: Verify Environment & Toolchain
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+
+      - name: Compile & Package Tauri Linux Artifacts
+        run: npm run tauri build
+
+      - name: Stage & Checksum Linux Bundles
+        run: |
+          mkdir -p release-artifacts
+          cp src-tauri/target/release/bundle/deb/*.deb release-artifacts/ || true
+          cp src-tauri/target/release/bundle/appimage/*.AppImage release-artifacts/ || true
+          cd release-artifacts
+          sha256sum * > SHA256SUMS_LINUX.txt
+          cat SHA256SUMS_LINUX.txt
+
+      - name: Publish Release Assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

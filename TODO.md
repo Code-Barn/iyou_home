@@ -178,6 +178,13 @@ All execution phases are complete and verified across both backend and frontend.
 
 ---
 
+### Phase 13: Sovereign Packaging & Self-Hosted Build Automation
+- [x] **13.1** Self-Hosted Linux CI Workflow: Dedicated `.github/workflows/release.yml` running on sovereign `dc13` metal runner (`[self-hosted, linux, dc13, tauri-builder]`), building `.deb` & `.AppImage` with `SHA256SUMS_LINUX.txt`.
+- [x] **13.2** macOS Universal & Architecture-Specific Helpers: Added `npm run tauri:build:universal`, `npm run tauri:build:arm64`, and `npm run tauri:build:x64` scripts to `package.json`.
+- [x] **13.3** Core 8 Footprint & Extended Mesh Drawer: 8-satellite primary matrix + 5-satellite collapsible drawer with live ledger scanning.
+
+---
+
 ## Standing Security Backlog
 
 - [x] **SEC-002** — Runtime domain certificate loading (`production.crt` / `production.key`) from `{app_data}/certs/` with ephemeral self-signed in-memory fallback.
@@ -189,5 +196,5 @@ All execution phases are complete and verified across both backend and frontend.
 ## Test & Build Verification
 
 - **Rust Backend Suite (`cargo test`)**: **94 passed, 0 failed**
-- **Frontend Test Suite (`vitest`)**: **85 passed across 11 test files**
+- **Frontend Test Suite (`vitest`)**: **87 passed across 11 test files**
 - **TypeScript Typecheck (`tsc`)**: **Clean compilation, 0 errors**
