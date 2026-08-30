@@ -7,10 +7,15 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Node / Web Build
 node_modules
 dist
 dist-ssr
 *.local
+
+# Rust Build
+src-tauri/target/
+target/
 
 # Editor directories and files
 .vscode/*
@@ -23,12 +28,21 @@ dist-ssr
 *.sln
 *.sw?
 
-# Vault / keystore / seed artifacts
+# Vault / keystore / seed artifacts & backups
 *.vault
 *.key
 *.p12
 *.jks
+*.iyoubackup
+*.corrupt_*.bak
 test_seed*.json
 
-
+# Runtime TLS certificates & keys
+src-tauri/certs/*.crt
+src-tauri/certs/*.key
+src-tauri/certs/*.pem
 src-tauri/certs/production.crt
+
+# Archived Historical Documentation
+docs/archive/
+docs/archive/*
