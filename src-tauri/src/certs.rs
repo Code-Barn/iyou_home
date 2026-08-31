@@ -5,7 +5,9 @@ use std::io::{self, BufReader};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(test)]
+use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
 
 // ---------------------------------------------------------------------------
 // ReadBuffered — replays a chunk of already-read bytes before delegating to
@@ -70,18 +72,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ReadBuffered<S> {
 // ---------------------------------------------------------------------------
 // TLS asset resolution (SEC-002)
 //
-// Private keys are NEVER embedded in the binary or resolved via compile-time
-// macros. Strategy, in priority order:
+// Strategy, in priority order:
 //
 //   1. Runtime domain certificates: `{app_local_data_dir}/certs/production.crt`
 //      + `production.key`, resolved strictly at runtime from an
 //      access-controlled external path. Fail-closed: if either file exists
 //      but is unreadable, incomplete, or corrupt, this is a hard error —
 //      TLS servers must not silently fall back to another identity.
-//   2. Ephemeral self-signed local authority generated in-memory via `rcgen`
+//   2. Compile-time bundled Let's Encrypt assets (release builds): the raw
+//      certificate and private key bytes are embedded via `include_bytes!`
+//      at compile time and unpacked to `{app_local_data_dir}/certs/` on
+//      first launch when the directory is empty.
+//   3. Ephemeral self-signed local authority generated in-memory via `rcgen`
 //      (SANs: localhost, 127.0.0.1, home.iyou.me). Nothing touches disk and
 //      nothing outlives the process.
 // ---------------------------------------------------------------------------
+
+// Compile-time embedded Let's Encrypt production assets.
+// In release builds, these are unpacked to the runtime cert directory when no
+// pre-staged certs are found on disk.
+const BUNDLED_PRODUCTION_CRT: &[u8] = include_bytes!("../certs/production.crt");
+const BUNDLED_PRODUCTION_KEY: &[u8] = include_bytes!("../certs/production.key");
 
 /// File names resolved inside the runtime certificate directory.
 pub const RUNTIME_CERT_FILE: &str = "production.crt";
@@ -119,6 +130,7 @@ fn parse_runtime_certs(
 
 /// Generate an ephemeral self-signed certificate for loopback binding.
 /// In-memory only: never persisted, never leaves the process.
+#[cfg(test)]
 pub fn generate_ephemeral_certs(
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let key_pair =
@@ -199,11 +211,27 @@ pub fn resolve_tls_assets(
         return parse_runtime_certs(&cert_path, &key_path);
     }
 
+    // Release builds: unpack compile-time bundled Let's Encrypt assets into
+    // the runtime cert directory so the Signature Bridge can bind with real
+    // domain certificates without requiring the user to manually stage them.
+    let _ = std::fs::create_dir_all(cert_dir);
+    std::fs::write(&cert_path, BUNDLED_PRODUCTION_CRT)
+        .map_err(|e| format!("Failed to write bundled certificate to {}: {}", cert_path.display(), e))?;
+    std::fs::write(&key_path, BUNDLED_PRODUCTION_KEY)
+        .map_err(|e| format!("Failed to write bundled private key to {}: {}", key_path.display(), e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to restrict key permissions: {}", e))?;
+    }
+
     println!(
-        "TLS: no domain certificates in {} — generating ephemeral self-signed local authority",
+        "TLS: unpacked bundled Let's Encrypt assets to {}",
         cert_dir.display()
     );
-    generate_ephemeral_certs()
+    parse_runtime_certs(&cert_path, &key_path)
 }
 
 #[cfg(test)]
@@ -237,10 +265,22 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_cert_dir_falls_back_to_ephemeral() {
+    fn test_empty_cert_dir_unpacks_bundled_assets() {
         let dir = temp_cert_dir("empty");
-        let result = resolve_tls_assets(&dir).expect("Empty dir should yield ephemeral assets");
-        assert!(!result.0.is_empty());
+        let result = resolve_tls_assets(&dir).expect("Empty dir should unpack bundled certs");
+        assert!(!result.0.is_empty(), "Should have loaded certificates");
+        // Verify the bundled assets were actually written to disk
+        assert!(dir.join(RUNTIME_CERT_FILE).exists(), "Bundled cert should be on disk");
+        assert!(dir.join(RUNTIME_KEY_FILE).exists(), "Bundled key should be on disk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key_perms = std::fs::metadata(dir.join(RUNTIME_KEY_FILE))
+                .expect("Should stat key")
+                .permissions()
+                .mode() & 0o777;
+            assert_eq!(key_perms, 0o600, "Key permissions must be 0o600");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

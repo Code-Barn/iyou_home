@@ -32,6 +32,15 @@
                 "host": [],
                 "open": true
             }
+        },
+        "updater": {
+            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0QTkwQzZFOEU1RUQ3RUEKUldUcTExNk9iZ3lwcENEMklpVlRVLzJFTTBRQlhxcUgvdlEva0FVUUpTVUpSSEdkckR4ZzdVRmcK",
+            "endpoints": [
+                "https://github.com/Code-Barn/iyou_home/releases/latest/download/latest.json"
+            ],
+            "windows": {
+                "installMode": "passive"
+            }
         }
     },
     "bundle": {
