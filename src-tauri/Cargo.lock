@@ -2341,6 +2341,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bs58",
+ "cc",
  "chrono",
  "crc32fast",
  "did_rust",

@@ -1083,6 +1083,21 @@ pub fn remove_profile(vault: &mut VaultStore, profile_id: &str) -> Result<(), St
     Ok(())
 }
 
+pub fn get_active_profile(vault: &VaultStore) -> Result<Profile, String> {
+    if let Some(active_p) = vault
+        .profiles
+        .iter()
+        .find(|p| p.active && !p.is_anchor())
+    {
+        return Ok(active_p.clone());
+    }
+
+    vault
+        .public_persona()
+        .cloned()
+        .ok_or_else(|| "No active profile found in vault".to_string())
+}
+
 pub fn list_profiles(vault: &VaultStore) -> Vec<Profile> {
     vault.profiles.clone()
 }
@@ -3035,5 +3050,30 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&restore_dir);
+    }
+
+    #[test]
+    fn test_get_active_profile() {
+        let mut path = temp_dir();
+        path.push("test_get_active_profile_vault.json");
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        // 1. Initial state: public persona (L1) should be returned as active
+        let active = get_active_profile(&vault).expect("Should find default active profile");
+        assert_eq!(active.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(active.level, 1);
+
+        // 2. Add an L2 burner profile and activate it
+        let dad_bod = add_profile(&mut vault, "dad_bod".to_string(), "DAD_BOD".to_string())
+            .expect("Should add dad_bod");
+        activate_persona(&mut vault, &dad_bod.profile_id).expect("Should activate dad_bod");
+
+        // 3. Now get_active_profile returns DAD_BOD
+        let active = get_active_profile(&vault).expect("Should find dad_bod as active");
+        assert_eq!(active.profile_id, "dad_bod");
+        assert_eq!(active.profile_name, "DAD_BOD");
+
+        // Cleanup
+        let _ = fs::remove_file(&path);
     }
 }

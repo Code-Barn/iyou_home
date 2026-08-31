@@ -42,6 +42,18 @@ const { mockInvoke, defaultMockHandler } = vi.hoisted(() => {
         );
       case "get_active_did":
         return Promise.resolve("did:key:z6Mku...");
+      case "get_active_profile":
+        return Promise.resolve({
+          profile_id: "primary",
+          profile_name: "Primary Identity",
+          derivation_index: 1,
+          did: "did:key:z6Mku...",
+          credentials: [],
+          nostr_pubkey_hex: "00",
+          level: 1,
+          is_system_reserved: false,
+          active: true,
+        });
       case "list_profiles":
         return Promise.resolve([
           {

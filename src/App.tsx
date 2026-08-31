@@ -116,18 +116,27 @@ function App() {
     let mounted = true;
     (async () => {
       try {
-        const profiles = await invoke<PersonaProfile[]>("list_profiles");
-        if (!mounted || !profiles || profiles.length === 0) return;
-        const active =
-          profiles.find((p) => p.active === true) ||
-          profiles.find((p) => (p.level === 1 || p.derivation_index === 1) && !p.is_system_reserved) ||
-          profiles.find((p) => p.level !== 0 && p.derivation_index !== 0) ||
-          null;
-        if (active) {
+        const active = await invoke<PersonaProfile>("get_active_profile");
+        if (mounted && active) {
           setActiveProfile(active);
+          return;
         }
       } catch {
-        // best-effort
+        // Fallback for empty or legacy vaults
+        try {
+          const profiles = await invoke<PersonaProfile[]>("list_profiles");
+          if (!mounted || !profiles || profiles.length === 0) return;
+          const active =
+            profiles.find((p) => p.active === true) ||
+            profiles.find((p) => (p.level === 1 || p.derivation_index === 1) && !p.is_system_reserved) ||
+            profiles.find((p) => p.level !== 0 && p.derivation_index !== 0) ||
+            null;
+          if (active) {
+            setActiveProfile(active);
+          }
+        } catch {
+          // best-effort
+        }
       }
     })();
     return () => {

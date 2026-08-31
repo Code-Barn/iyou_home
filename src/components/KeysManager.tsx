@@ -28,11 +28,6 @@ import {
   saveUserPreferences,
   sha256Hex,
 } from "../lib/appLock";
-import {
-  DEFAULT_PRF_SALT,
-  getOrRegisterPrfSeed,
-  webauthnPrfSupported,
-} from "../lib/webauthnPrf";
 import DevicePairing from "./DevicePairing";
 import UpdateVettingModal from "./updater/UpdateVettingModal";
 
@@ -528,20 +523,29 @@ export default function KeysManager({
   const handleEnrollBiometrics = async () => {
     setBiometricEnrolling(true);
     setLockErrorMessage(null);
+    setLockStatusMessage(null);
     try {
-      const result = await getOrRegisterPrfSeed(DEFAULT_PRF_SALT);
-      const prfHash = await sha256Hex(result.prfSeedHex);
-      const current = appPrefs || DEFAULT_USER_PREFERENCES;
-      const updated: UserPreferences = {
-        ...current,
-        app_lock_prf_hash: prfHash,
-      };
-      await saveUserPreferences(updated);
-      setAppPrefs(updated);
-      onLockSettingsChange?.(updated);
-      setLockStatusMessage("Biometrics / Passkey enrolled successfully.");
+      const success = await invoke<boolean>("verify_biometric_auth", {
+        reason: "Enroll Touch ID / Passkey for iyou_home App Lock",
+      });
+      if (success) {
+        const current = appPrefs || DEFAULT_USER_PREFERENCES;
+        const updated: UserPreferences = {
+          ...current,
+          app_lock_prf_hash: "native_biometrics_enrolled",
+        };
+        await saveUserPreferences(updated);
+        setAppPrefs(updated);
+        onLockSettingsChange?.(updated);
+        setLockStatusMessage("Biometrics enrolled successfully.");
+      }
     } catch (err: any) {
-      setLockErrorMessage(`Biometric enrollment failed: ${err?.message ?? String(err)}`);
+      const errMsg = err?.message || String(err);
+      if (errMsg.includes("LAErrorBiometryNotEnrolled")) {
+        setLockErrorMessage("Biometric enrollment failed: Touch ID is not enrolled on this Mac. Please configure Touch ID in System Settings.");
+      } else {
+        setLockErrorMessage(`Biometric enrollment failed: ${errMsg}`);
+      }
     } finally {
       setBiometricEnrolling(false);
     }
@@ -801,42 +805,40 @@ export default function KeysManager({
               </select>
             </div>
 
-            {webauthnPrfSupported() && (
-              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.25rem" }}>
-                {appPrefs.app_lock_prf_hash ? (
-                  <>
-                    <span style={{ fontSize: "0.85rem", color: "#16a34a" }}>
-                      {"\u2713"} Biometrics / Passkey enrolled
-                    </span>
-                    <button
-                      onClick={handleRemoveBiometrics}
-                      style={{
-                        fontSize: "0.8rem",
-                        padding: "0.25rem 0.5rem",
-                        background: "transparent",
-                        border: "1px solid #ef4444",
-                        color: "#dc2626",
-                      }}
-                    >
-                      Remove Biometrics
-                    </button>
-                  </>
-                ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.25rem" }}>
+              {appPrefs.app_lock_prf_hash ? (
+                <>
+                  <span style={{ fontSize: "0.85rem", color: "#16a34a" }}>
+                    {"\u2713"} Biometrics / Passkey enrolled
+                  </span>
                   <button
-                    onClick={handleEnrollBiometrics}
-                    disabled={biometricEnrolling}
+                    onClick={handleRemoveBiometrics}
                     style={{
-                      fontSize: "0.85rem",
-                      padding: "0.35rem 0.75rem",
+                      fontSize: "0.8rem",
+                      padding: "0.25rem 0.5rem",
                       background: "transparent",
-                      border: "1px solid #d1d5db",
+                      border: "1px solid #ef4444",
+                      color: "#dc2626",
                     }}
                   >
-                    {biometricEnrolling ? "Enrolling…" : "\uD83D\uDC64 Enroll Biometrics / Passkey"}
+                    Remove Biometrics
                   </button>
-                )}
-              </div>
-            )}
+                </>
+              ) : (
+                <button
+                  onClick={handleEnrollBiometrics}
+                  disabled={biometricEnrolling}
+                  style={{
+                    fontSize: "0.85rem",
+                    padding: "0.35rem 0.75rem",
+                    background: "transparent",
+                    border: "1px solid #d1d5db",
+                  }}
+                >
+                  {biometricEnrolling ? "Enrolling…" : "\uD83D\uDC64 Enroll Biometrics / Passkey"}
+                </button>
+              )}
+            </div>
           </div>
         )}
 

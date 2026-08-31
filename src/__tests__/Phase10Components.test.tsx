@@ -33,6 +33,16 @@ const mockInvoke = vi.hoisted(() =>
           Nostr: "running",
           Chat: "stopped",
         });
+      case "get_active_profile":
+        return Promise.resolve({
+          profile_id: "primary",
+          profile_name: "Primary Persona",
+          did: "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH",
+          level: 1,
+          derivation_index: 1,
+          is_system_reserved: false,
+          active: true,
+        });
       case "list_profiles":
         return Promise.resolve([
           {

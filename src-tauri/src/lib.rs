@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
+mod biometrics;
 mod blossom;
 mod bridge;
 mod certs;
@@ -565,6 +566,18 @@ fn get_active_did(
         // Corruption/IO faults must surface, never masquerade as "no DID".
         Err(e) => Err(e.to_string()),
     }
+}
+
+#[tauri::command]
+fn get_active_profile(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<vault::Profile, String> {
+    let vault = vault::load_vault(&app)?;
+    let profile = vault::get_active_profile(&vault)?;
+    let mut active = state.active_did.lock().unwrap();
+    *active = Some(profile.did.clone());
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -2854,6 +2867,8 @@ pub fn run() {
             install_vetted_update,
             rollback_to_previous_binary,
             has_rollback_binary,
+            get_active_profile,
+            biometrics::verify_biometric_auth,
         ]);
 
     builder

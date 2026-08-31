@@ -81,6 +81,8 @@ const mockContacts: PeerContact[] = [
 const mockInvoke = vi.hoisted(() =>
   vi.fn((cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
+      case "get_active_profile":
+        return Promise.resolve(mockProfiles[1]);
       case "list_profiles":
         return Promise.resolve(mockProfiles);
       case "list_contacts":

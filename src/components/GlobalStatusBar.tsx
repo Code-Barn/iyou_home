@@ -64,6 +64,15 @@ export default function GlobalStatusBar({
   const loadProfile = useCallback(async () => {
     if (propActiveProfile !== undefined) return;
     try {
+      const active = await invoke<Profile | null | undefined>("get_active_profile");
+      if (active && (active.profile_name || active.did || active.profile_id)) {
+        setLocalActiveProfile(active);
+        return;
+      }
+    } catch {
+      // fall through to list_profiles
+    }
+    try {
       const [profiles, did] = await Promise.all([
         invoke<Profile[]>("list_profiles"),
         invoke<string | null>("get_active_did"),
@@ -156,7 +165,7 @@ export default function GlobalStatusBar({
     ? activeProfile.level === 0
       ? "Anchor (L0)"
       : `${activeProfile.name || activeProfile.profile_name} (${activeProfile.level === 1 ? "L1" : "L2"})`
-    : "No identity";
+    : "Loading…";
 
   const personaIcon = activeProfile
     ? activeProfile.level === 0
@@ -164,7 +173,7 @@ export default function GlobalStatusBar({
       : activeProfile.level === 1
         ? "👤"
         : "🎭"
-    : "👤";
+    : "⏳";
 
   const formatSyncLabel = (ts: number): string => {
     if (ts === 0) return "Not synced";

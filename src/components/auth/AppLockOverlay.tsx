@@ -16,6 +16,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { sha256Hex } from "../../lib/appLock";
 import { DEFAULT_PRF_SALT, getOrRegisterPrfSeed, webauthnPrfSupported } from "../../lib/webauthnPrf";
 
@@ -47,7 +48,7 @@ export default function AppLockOverlay({
   }, []);
 
   const biometricAvailable =
-    typeof prfHash === "string" && prfHash.length > 0 && webauthnPrfSupported();
+    typeof prfHash === "string" && prfHash.length > 0;
 
   const handleUnlock = async () => {
     if (busy) return;
@@ -79,11 +80,25 @@ export default function AppLockOverlay({
         setError("Biometrics are not enrolled. Use your PIN instead.");
         return;
       }
-      const result = await getOrRegisterPrfSeed(DEFAULT_PRF_SALT);
-      const digest = await sha256Hex(result.prfSeedHex);
-      if (digest === prfHash) {
-        onUnlock();
-        return;
+      try {
+        const success = await invoke<boolean>("verify_biometric_auth", {
+          reason: "Unlock iyou_home App Lock",
+        });
+        if (success) {
+          onUnlock();
+          return;
+        }
+      } catch (invokeErr: any) {
+        // If native invocation fails, try WebAuthn PRF fallback if supported
+        if (webauthnPrfSupported()) {
+          const result = await getOrRegisterPrfSeed(DEFAULT_PRF_SALT);
+          const digest = await sha256Hex(result.prfSeedHex);
+          if (digest === prfHash) {
+            onUnlock();
+            return;
+          }
+        }
+        throw invokeErr;
       }
       setError("Biometric verification failed. Use your PIN instead.");
     } catch (err: any) {

@@ -63,6 +63,16 @@ const mockInvoke = vi.hoisted(() =>
         return Promise.resolve(true);
       case "get_service_statuses":
         return Promise.resolve({ SigBridge: "running", Nostr: "running", Blossom: "running" });
+      case "get_active_profile":
+        return Promise.resolve({
+          profile_id: "primary",
+          profile_name: "Primary Persona",
+          did: "did:key:z6MkuTest123",
+          level: 1,
+          derivation_index: 1,
+          is_system_reserved: false,
+          active: true,
+        });
       case "list_profiles":
         return Promise.resolve([
           {
