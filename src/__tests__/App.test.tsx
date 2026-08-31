@@ -54,6 +54,12 @@ const { mockInvoke, defaultMockHandler } = vi.hoisted(() => {
           is_system_reserved: false,
           active: true,
         });
+      case "get_tls_status":
+        return Promise.resolve({
+          is_production_cert: true,
+          domain: "home.iyou.me",
+          cert_path: "/mock/certs/production.crt",
+        });
       case "list_profiles":
         return Promise.resolve([
           {

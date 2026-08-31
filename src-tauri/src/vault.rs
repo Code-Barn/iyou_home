@@ -114,11 +114,14 @@ impl VaultStore {
             .or_else(|| self.profiles.iter().find(|p| p.derivation_index == 1))
     }
 
-    /// Resolve a profile by id. An empty id resolves to the public persona
-    /// (Level 1), never the air-gapped anchor.
+    /// Resolve a profile by id. An empty id resolves to the active persona
+    /// (or public persona Level 1 fallback), never the air-gapped anchor.
     pub fn get_profile_by_id(&self, id: &str) -> Option<&Profile> {
         if id.is_empty() {
-            self.public_persona()
+            self.profiles
+                .iter()
+                .find(|p| p.active && !p.is_anchor())
+                .or_else(|| self.public_persona())
         } else {
             self.profiles.iter().find(|p| p.profile_id == id)
         }

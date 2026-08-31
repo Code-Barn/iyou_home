@@ -308,7 +308,9 @@ function App() {
           )}
           {activeTab === "services" && <ServiceSwitchPanel />}
           {activeTab === "governance" && <GovernanceAuditor />}
-          {activeTab === "signer" && showDevMode && <SovereignSigner />}
+          {activeTab === "signer" && showDevMode && (
+            <SovereignSigner activeProfile={activeProfile} />
+          )}
         </div>
 
         {/* Footer with Dev Mode Toggle */}

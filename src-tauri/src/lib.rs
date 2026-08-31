@@ -2869,6 +2869,7 @@ pub fn run() {
             has_rollback_binary,
             get_active_profile,
             biometrics::verify_biometric_auth,
+            certs::get_tls_status,
         ]);
 
     builder

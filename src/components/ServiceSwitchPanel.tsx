@@ -17,6 +17,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { TlsStatus } from "../lib/types";
 import BlossomBrowser from "./BlossomBrowser";
 import SovereignFootprint from "./SovereignFootprint";
 import SovereigntyStatusPanel from "./SovereigntyStatusPanel";
@@ -84,14 +85,17 @@ export default function ServiceSwitchPanel() {
   const [showTechDetails, setShowTechDetails] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [tlsStatus, setTlsStatus] = useState<TlsStatus | null>(null);
 
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const [settings, statuses] = await Promise.all([
+        const [settings, statuses, tls] = await Promise.all([
           invoke<Record<string, boolean>>("get_auto_start_settings"),
           invoke<Record<string, ServiceStatus>>("get_service_statuses"),
+          invoke<TlsStatus>("get_tls_status").catch(() => null),
         ]);
+        if (tls) setTlsStatus(tls);
         setAutoStart((prev) => {
           const merged = { ...prev };
           for (const svc of SERVICES) {
@@ -171,12 +175,14 @@ export default function ServiceSwitchPanel() {
 
   const refreshServices = useCallback(async () => {
     try {
-      const [statuses, status] = await Promise.all([
+      const [statuses, status, tls] = await Promise.all([
         invoke<Record<string, ServiceStatus>>("get_service_statuses"),
         invoke<SyncStatus>("get_sync_status").catch(() => null),
+        invoke<TlsStatus>("get_tls_status").catch(() => null),
       ]);
       setServiceStatus((prev) => ({ ...prev, ...statuses }));
       if (status) setSyncStatus(status);
+      if (tls) setTlsStatus(tls);
     } catch (err) {
       console.error("Failed to refresh service statuses:", err);
     }
@@ -281,7 +287,42 @@ export default function ServiceSwitchPanel() {
 
                   <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
                     {svc.alwaysOn ? (
-                      <span className="always-on-badge">Always On</span>
+                      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                        {svc.name === "SigBridge" && tlsStatus && (
+                          tlsStatus.is_production_cert ? (
+                            <span
+                              title={`Authentic Let's Encrypt TLS active for ${tlsStatus.domain} (${tlsStatus.cert_path})`}
+                              style={{
+                                fontSize: "0.75rem",
+                                padding: "0.2rem 0.55rem",
+                                borderRadius: "999px",
+                                background: "#ecfdf5",
+                                color: "#047857",
+                                border: "1px solid #a7f3d0",
+                                fontWeight: 600,
+                              }}
+                            >
+                              🔒 Let's Encrypt
+                            </span>
+                          ) : (
+                            <span
+                              title="Operating on an ephemeral self-signed fallback instead of the authentic home.iyou.me Let's Encrypt certificate. Public web origins will reject WSS connections."
+                              style={{
+                                fontSize: "0.75rem",
+                                padding: "0.2rem 0.55rem",
+                                borderRadius: "999px",
+                                background: "#fef3c7",
+                                color: "#92400e",
+                                border: "1px solid #fde68a",
+                                fontWeight: 600,
+                              }}
+                            >
+                              ⚠️ Ephemeral TLS Fallback
+                            </span>
+                          )
+                        )}
+                        <span className="always-on-badge">Always On</span>
+                      </div>
                     ) : (
                       <>
                         <label className="autostart-toggle">

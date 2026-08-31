@@ -212,3 +212,9 @@ export interface EnclaveDiagnostics {
   encrypted_backups: EncryptedBackupsDiagnostic;
   all_capabilities_met: boolean;
 }
+
+export interface TlsStatus {
+  is_production_cert: boolean;
+  domain: string;
+  cert_path: string;
+}

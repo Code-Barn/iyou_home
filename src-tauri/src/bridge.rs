@@ -277,11 +277,24 @@ where
                     continue;
                 }
 
-                let profile_id = json
+                let raw_profile_id = json
                     .get("profile_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(|v| if v.is_null() { None } else { v.as_str() })
                     .unwrap_or("")
-                    .to_string();
+                    .trim();
+
+                // Dynamic persona resolution: if profile_id is empty/omitted/null, resolve
+                // to the currently active Vault profile (e.g. L2 DAD_BOD) rather than falling
+                // back to L1 or erroring.
+                let profile_id = if raw_profile_id.is_empty() {
+                    crate::vault::load_vault(&app_handle)
+                        .ok()
+                        .and_then(|v| crate::vault::get_active_profile(&v).ok())
+                        .map(|active_p| active_p.profile_id)
+                        .unwrap_or_default()
+                } else {
+                    raw_profile_id.to_string()
+                };
 
                 // Enclave air-gap, fail-closed: external frames may never
                 // target the Level 0 anchor, and an unloadable vault blocks
@@ -299,11 +312,17 @@ where
                     continue;
                 }
 
-                let is_sign = json["action"] == "sign" || json["type"] == "sign";
-                if is_sign && json["challenge"].is_string() {
-                    let challenge = json["challenge"].as_str().unwrap().to_string();
-                    println!("Triggering Signature for Challenge: {}", challenge);
-                    println!("DEBUG: Signing with Ed25519 (OIDC/VP compliant)");
+                let is_sign_raw = json["action"] == "sign_raw" || json["type"] == "sign_raw";
+                let is_sign = json["action"] == "sign" || json["type"] == "sign" || is_sign_raw;
+                if is_sign && (json["challenge"].is_string() || json["data"].is_string() || json["message"].is_string()) {
+                    let challenge = json["challenge"]
+                        .as_str()
+                        .or_else(|| json["data"].as_str())
+                        .or_else(|| json["message"].as_str())
+                        .unwrap()
+                        .to_string();
+                    println!("Triggering Signature for Challenge/Data: {}", challenge);
+                    println!("DEBUG: Signing with Ed25519 (OIDC/VP compliant) for profile '{}'", profile_id);
 
                     let app_handle = app_handle.clone();
                     tokio::spawn(async move {
@@ -327,7 +346,7 @@ where
                 } else if json["type"] == "sign_event" || json["action"] == "sign_event" {
                     if json["event"].is_object() {
                         let event = json["event"].clone();
-                        println!("Triggering Nostr Event signing");
+                        println!("Triggering Nostr Event signing for profile '{}'", profile_id);
                         println!("DEBUG: Signing Nostr event via secp256k1 Schnorr (NIP-01 standard)");
 
                         let app_handle = app_handle.clone();
@@ -360,11 +379,11 @@ where
                         } else {
                         let default_did = crate::vault::load_vault(&app_handle)
                             .ok()
-                            .and_then(|v| v.public_persona().cloned())
+                            .and_then(|v| crate::vault::get_active_profile(&v).ok())
                             .map(|p| p.did)
                             .unwrap_or_else(|| "did:vault:unknown".to_string());
                         println!(
-                            "DEBUG: No holder_did in message, defaulting to public persona DID: {}",
+                            "DEBUG: No holder_did in message, defaulting to active persona DID: {}",
                             default_did
                         );
                             default_did

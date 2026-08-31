@@ -24,43 +24,63 @@ import { isExternallySignable } from "../lib/enclaveFilters";
 // Note: In the future, we can import init, { verify_vp } from '../lib/did_rust_wasm/did_rust.js'
 // to locally verify the created VP in WASM before returning it to the user.
 
-export default function SovereignSigner() {
-  const [activeDid, setActiveDid] = useState<string | null>(null);
+export interface SovereignSignerProps {
+  activeProfile?: Profile | null;
+}
+
+export default function SovereignSigner({ activeProfile }: SovereignSignerProps = {}) {
+  const [activeDid, setActiveDid] = useState<string | null>(activeProfile?.did || null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [selectedProfileId, setSelectedProfileId] = useState<string>("");
+  const [selectedProfileId, setSelectedProfileId] = useState<string>(
+    activeProfile?.profile_id || "",
+  );
   const [challenge, setChallenge] = useState("");
   const [presentation, setPresentation] = useState<string | null>(null);
   const [isSigning, setIsSigning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Dynamically auto-sync with reactive activeProfile prop
   useEffect(() => {
-    fetchActiveDid();
+    if (activeProfile && isExternallySignable(activeProfile)) {
+      setSelectedProfileId(activeProfile.profile_id);
+      setActiveDid(activeProfile.did);
+    }
+  }, [activeProfile]);
+
+  useEffect(() => {
     fetchProfiles();
   }, []);
-
-  const fetchActiveDid = async () => {
-    try {
-      const did = await invoke<string | null>("get_active_did");
-      setActiveDid(did);
-    } catch (err: any) {
-      console.error("Failed to fetch active DID:", err);
-    }
-  };
 
   const fetchProfiles = async () => {
     try {
       const list = await invoke<Profile[]>("list_profiles");
       const signable = (list || []).filter(isExternallySignable);
       setProfiles(signable);
-      // Set default selected profile to active one if available among signable
-      if (signable.length > 0) {
-        const activeProfile =
-          signable.find((p) => p.did === activeDid) || signable[0];
+
+      // Keep activeProfile if valid, otherwise fallback
+      if (activeProfile && signable.some((p) => p.profile_id === activeProfile.profile_id)) {
         setSelectedProfileId(activeProfile.profile_id);
+        setActiveDid(activeProfile.did);
+      } else if (signable.length > 0) {
+        const found =
+          signable.find((p) => p.profile_id === selectedProfileId) ||
+          signable.find((p) => p.active === true) ||
+          signable.find((p) => p.level === 1) ||
+          signable[0];
+        setSelectedProfileId(found.profile_id);
+        setActiveDid(found.did);
       }
     } catch (err: any) {
       console.error("Failed to fetch profiles:", err);
       setError(`Failed to load profiles: ${err.toString()}`);
+    }
+  };
+
+  const handleProfileSelect = (profileId: string) => {
+    setSelectedProfileId(profileId);
+    const target = profiles.find((p) => p.profile_id === profileId);
+    if (target) {
+      setActiveDid(target.did);
     }
   };
 
@@ -144,7 +164,7 @@ export default function SovereignSigner() {
             <label>Signing Profile</label>
             <select
               value={selectedProfileId}
-              onChange={(e) => setSelectedProfileId(e.target.value)}
+              onChange={(e) => handleProfileSelect(e.target.value)}
               style={{
                 width: "100%",
                 padding: "0.5rem",

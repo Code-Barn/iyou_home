@@ -1,6 +1,7 @@
 // Shared TLS certificate loading and stream buffering utilities
 // used by both the Signature Bridge (bridge.rs) and the XMPP server (prosody.rs).
 
+use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -97,6 +98,42 @@ const BUNDLED_PRODUCTION_KEY: &[u8] = include_bytes!("../certs/production.key");
 /// File names resolved inside the runtime certificate directory.
 pub const RUNTIME_CERT_FILE: &str = "production.crt";
 pub const RUNTIME_KEY_FILE: &str = "production.key";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TlsStatus {
+    pub is_production_cert: bool,
+    pub domain: String,
+    pub cert_path: String,
+}
+
+pub fn check_tls_status_in_dir(cert_dir: &std::path::Path) -> TlsStatus {
+    let cert_path = cert_dir.join(RUNTIME_CERT_FILE);
+    let key_path = cert_dir.join(RUNTIME_KEY_FILE);
+
+    let is_production_cert = cert_path.exists()
+        && key_path.exists()
+        && parse_runtime_certs(&cert_path, &key_path).is_ok();
+
+    TlsStatus {
+        is_production_cert,
+        domain: "home.iyou.me".to_string(),
+        cert_path: if cert_path.exists() {
+            cert_path.to_string_lossy().to_string()
+        } else {
+            "ephemeral (in-memory)".to_string()
+        },
+    }
+}
+
+#[tauri::command]
+pub fn get_tls_status(app: tauri::AppHandle) -> Result<TlsStatus, String> {
+    use tauri::Manager;
+    let cert_dir = match app.path().app_local_data_dir() {
+        Ok(dir) => dir.join("certs"),
+        Err(e) => return Err(format!("Cannot resolve certs directory: {}", e)),
+    };
+    Ok(check_tls_status_in_dir(&cert_dir))
+}
 
 fn parse_runtime_certs(
     cert_path: &std::path::Path,
@@ -332,6 +369,30 @@ mod tests {
             resolve_tls_assets(&dir).expect("Runtime certs should load");
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].as_ref(), cert.der().as_ref(), "Round-trip must be byte-identical");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tls_status_resolution() {
+        let dir = temp_cert_dir("status_test");
+
+        // 1. Empty dir: not production cert
+        let status = check_tls_status_in_dir(&dir);
+        assert!(!status.is_production_cert);
+        assert_eq!(status.domain, "home.iyou.me");
+
+        // 2. Provision valid certs
+        let key_pair = rcgen::KeyPair::generate().expect("Generate key pair");
+        let params = rcgen::CertificateParams::new(vec!["home.iyou.me".to_string()]).expect("Params");
+        let cert = params.self_signed(&key_pair).expect("Self-sign");
+        std::fs::write(dir.join(RUNTIME_CERT_FILE), cert.pem()).expect("Write cert");
+        std::fs::write(dir.join(RUNTIME_KEY_FILE), key_pair.serialize_pem()).expect("Write key");
+
+        // 3. Status is now production cert
+        let status = check_tls_status_in_dir(&dir);
+        assert!(status.is_production_cert);
+        assert!(status.cert_path.ends_with(RUNTIME_CERT_FILE));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

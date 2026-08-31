@@ -19,7 +19,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { Profile, UpdateMetadata, UpdatePreferences } from "../lib/types";
+import { Profile, TlsStatus, UpdateMetadata, UpdatePreferences } from "../lib/types";
 import QuickDispatchModal from "./QuickDispatchModal";
 import UpdateVettingModal from "./updater/UpdateVettingModal";
 
@@ -51,6 +51,7 @@ export default function GlobalStatusBar({
   // Update check states
   const [availableUpdate, setAvailableUpdate] = useState<UpdateMetadata | null>(null);
   const [isUpdateModalOpen, setIsUpdateModalOpen] = useState(false);
+  const [tlsStatus, setTlsStatus] = useState<TlsStatus | null>(null);
 
   const pollStatuses = useCallback(async () => {
     try {
@@ -58,6 +59,15 @@ export default function GlobalStatusBar({
       setStatuses(s);
     } catch {
       // silent — status bar is best-effort
+    }
+  }, []);
+
+  const loadTlsStatus = useCallback(async () => {
+    try {
+      const status = await invoke<TlsStatus>("get_tls_status");
+      setTlsStatus(status);
+    } catch {
+      // silent
     }
   }, []);
 
@@ -115,11 +125,13 @@ export default function GlobalStatusBar({
     pollStatuses();
     loadProfile();
     loadSyncStatus();
+    loadTlsStatus();
     checkUpdates(false);
 
     const interval = setInterval(() => {
       pollStatuses();
       loadSyncStatus();
+      loadTlsStatus();
     }, 10_000);
 
     const unlistenPromise = listen("app://check-updates", () => {
@@ -130,7 +142,7 @@ export default function GlobalStatusBar({
       clearInterval(interval);
       unlistenPromise.then((unlisten) => unlisten());
     };
-  }, [pollStatuses, loadProfile, loadSyncStatus, checkUpdates]);
+  }, [pollStatuses, loadProfile, loadSyncStatus, loadTlsStatus, checkUpdates]);
 
   const handleCopyDid = async () => {
     if (!activeProfile?.did) return;
@@ -149,7 +161,12 @@ export default function GlobalStatusBar({
 
   const dotColor = (name: string): string => {
     const s = statuses?.[name];
-    if (name === "SigBridge") return "var(--color-success)";
+    if (name === "SigBridge") {
+      if (tlsStatus && !tlsStatus.is_production_cert) {
+        return "var(--color-warning, #f59e0b)";
+      }
+      return "var(--color-success)";
+    }
     if (s === "running") return "var(--color-success)";
     if (s === "starting") return "var(--color-warning)";
     return "#9ca3af";
@@ -157,7 +174,12 @@ export default function GlobalStatusBar({
 
   const dotLabel = (name: string): string => {
     const s = statuses?.[name];
-    if (name === "SigBridge") return `${name} — always active`;
+    if (name === "SigBridge") {
+      if (tlsStatus && !tlsStatus.is_production_cert) {
+        return "SigBridge — Warning: Ephemeral self-signed TLS fallback active (Public HTTPS browser origins may reject wss://home.iyou.me:9001)";
+      }
+      return "SigBridge — Authentic Let's Encrypt TLS active (home.iyou.me)";
+    }
     return `${name} — ${s || "unknown"}`;
   };
 
