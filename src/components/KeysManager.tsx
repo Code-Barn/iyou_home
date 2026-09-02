@@ -322,7 +322,7 @@ export default function KeysManager({
       // Trigger file save dialog
       const filePath = await save({
         defaultPath: "iyou_home_backup.iyoubackup",
-        filters: [{ name: "iYou Backup", extensions: ["iyoubackup"] }],
+        filters: [{ name: "iyou Backup", extensions: ["iyoubackup"] }],
       });
 
       if (filePath) {
@@ -347,7 +347,7 @@ export default function KeysManager({
     try {
       const selected = await open({
         multiple: false,
-        filters: [{ name: "iYou Backup", extensions: ["iyoubackup"] }],
+        filters: [{ name: "iyou Backup", extensions: ["iyoubackup"] }],
       });
 
       if (!selected) return;

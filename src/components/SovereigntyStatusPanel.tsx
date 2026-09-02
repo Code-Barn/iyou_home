@@ -254,7 +254,7 @@ export default function SovereigntyStatusPanel({
 
       const selectedPath = await save({
         defaultPath: "iyou_home_backup.iyoubackup",
-        filters: [{ name: "iYou Backup", extensions: ["iyoubackup"] }],
+        filters: [{ name: "iyou Backup", extensions: ["iyoubackup"] }],
       });
 
       if (selectedPath) {
