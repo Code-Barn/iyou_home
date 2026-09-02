@@ -1,7 +1,7 @@
 # TODO — iyou_home (Tauri/Rust Local Enclave)
 
 **Codified from:** `docs/RELEASE_SPEC_V2.md`  
-**Last updated:** 2026-08-29 (V2.0 Sovereign Release Complete)
+**Last updated:** 2026-09-02 (Phase 14: Bridge Persona Discovery & Switching)
 
 ---
 
@@ -185,6 +185,16 @@ All execution phases are complete and verified across both backend and frontend.
 
 ---
 
+### Phase 14: Bridge Persona Discovery & Switching
+> Expose `list_profiles` / persona switching to bridge clients (`bridge_client.js`).
+
+- [x] **14.1** Wire `list_profiles` / `LIST_PERSONAS` inbound frames in `bridge.rs`: enumerate all stored personas, strictly filtering Level 0 / Index 0 / system-reserved rows (Air-Gap Invariant).
+- [x] **14.2** Emit `PublicPersonaSummary` (public metadata only — never credential or key material) for each L1 and L2+ persona and reply with a `personas_list` frame (the type `bridge_client.js` recognizes) carrying both `personas` and `profiles` keys for backward/forward compatibility.
+- [x] **14.3** Wire `set_active_profile` / `SET_ACTIVE_PROFILE` / `SET_ACTIVE_PERSONA` / `switch_persona` inbound frames: resolve target by `profile_id` (fallback `did`), reject Level 0 / system-reserved activation, persist the active persona, and broadcast an immediate `profile_sync` frame to the connected client.
+- [x] **14.4** Add unit tests covering persona enumeration filtering and clean (non-panicking) failure on invalid / Level 0 activation.
+
+---
+
 ## Standing Security Backlog
 
 - [x] **SEC-002** — Runtime domain certificate loading (`production.crt` / `production.key`) from `{app_data}/certs/` with ephemeral self-signed in-memory fallback.
@@ -195,6 +205,6 @@ All execution phases are complete and verified across both backend and frontend.
 
 ## Test & Build Verification
 
-- **Rust Backend Suite (`cargo test`)**: **94 passed, 0 failed**
+- **Rust Backend Suite (`cargo test`)**: **102 passed, 0 failed**
 - **Frontend Test Suite (`vitest`)**: **87 passed across 11 test files**
 - **TypeScript Typecheck (`tsc`)**: **Clean compilation, 0 errors**

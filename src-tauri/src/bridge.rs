@@ -18,7 +18,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -35,6 +35,69 @@ use crate::WsState;
 
 /// Upper bound on keys per RESOLVE_PEER_ALIASES frame (harvesting guard).
 const MAX_RESOLVE_KEYS: usize = 256;
+
+/// Public view of a stored persona profile exposed over the bridge. Deliberately
+/// excludes `credentials` (which may contain raw W3C payloads) and any private
+/// key material — only identity metadata crosses the wire.
+#[derive(serde::Serialize)]
+pub struct PublicPersonaSummary {
+    pub profile_id: String,
+    pub profile_name: String,
+    /// Alias for `profile_name`, provided for `bridge_client.js` compatibility.
+    pub name: String,
+    pub did: String,
+    pub derivation_index: u32,
+    pub nostr_pubkey_hex: String,
+    pub level: u8,
+    pub active: bool,
+}
+
+impl From<&crate::vault::Profile> for PublicPersonaSummary {
+    fn from(p: &crate::vault::Profile) -> Self {
+        PublicPersonaSummary {
+            profile_id: p.profile_id.clone(),
+            profile_name: p.profile_name.clone(),
+            name: p.profile_name.clone(),
+            did: p.did.clone(),
+            derivation_index: p.derivation_index,
+            nostr_pubkey_hex: p.nostr_pubkey_hex.clone(),
+            level: p.level,
+            active: p.active,
+        }
+    }
+}
+
+/// Level 0 Air-Gap Invariant: profiles at derivation_index 0, level 0, or
+/// flagged system-reserved are never exposed over the external bridge.
+fn is_bridge_protected(profile: &crate::vault::Profile) -> bool {
+    profile.derivation_index == 0 || profile.level == 0 || profile.is_system_reserved
+}
+
+/// Enumerate public summaries for every bridge-exposable persona (L1 and L2+).
+fn public_persona_summaries(vault: &crate::vault::VaultStore) -> Vec<PublicPersonaSummary> {
+    vault
+        .profiles
+        .iter()
+        .filter(|p| !is_bridge_protected(p))
+        .map(PublicPersonaSummary::from)
+        .collect()
+}
+
+/// Resolve the profile targeted by a `set_active_profile`-style frame, supporting
+/// both `profile_id` and `did` matching.
+fn resolve_target_profile<'a>(
+    vault: &'a crate::vault::VaultStore,
+    profile_id: &str,
+    did: &str,
+) -> Option<&'a crate::vault::Profile> {
+    if !profile_id.is_empty() {
+        vault.profiles.iter().find(|p| p.profile_id == profile_id)
+    } else if !did.is_empty() {
+        vault.profiles.iter().find(|p| p.did == did)
+    } else {
+        None
+    }
+}
 
 fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
     let state = app.state::<WsState>();
@@ -274,6 +337,147 @@ where
                             ));
                         }
                     }
+                    continue;
+                } else if json["type"] == "list_profiles" || json["type"] == "LIST_PERSONAS" {
+                    println!("DEBUG: list_profiles / LIST_PERSONAS request received");
+                    match crate::vault::load_vault(&app_handle) {
+                        Ok(vault) => {
+                            let summaries = public_persona_summaries(&vault);
+                            // `personas_list` is the type name the iyou_wun
+                            // bridge_client.js recognizes; both `personas` and
+                            // `profiles` keys are provided for compatibility.
+                            let payload = serde_json::json!({
+                                "type": "personas_list",
+                                "personas": summaries,
+                                "profiles": summaries,
+                            });
+                            let _ = response_tx.send(Message::Text(payload.to_string().into()));
+                        }
+                        Err(e) => {
+                            eprintln!("DEBUG: list_profiles failed to load vault: {}", e);
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("Failed to load vault: {}", e)
+                                }).to_string().into(),
+                            ));
+                        }
+                    }
+                    continue;
+                } else if json["type"] == "set_active_profile"
+                    || json["type"] == "SET_ACTIVE_PROFILE"
+                    || json["type"] == "SET_ACTIVE_PERSONA"
+                    || json["type"] == "switch_persona"
+                {
+                    println!("DEBUG: set_active_profile / SET_ACTIVE_PROFILE / switch_persona received");
+                    let profile_id = json
+                        .get("profile_id")
+                        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let did = json
+                        .get("did")
+                        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+
+                    if profile_id.is_empty() && did.is_empty() {
+                        let _ = response_tx.send(Message::Text(
+                            "{\"type\":\"error\",\"message\":\"missing_profile_id_or_did\"}".into(),
+                        ));
+                        continue;
+                    }
+
+                    // Fail-open to clean errors (never panic) if the vault cannot load.
+                    let mut vault = match crate::vault::load_vault(&app_handle) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("DEBUG: set_active_profile failed to load vault: {}", e);
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("Failed to load vault: {}", e)
+                                }).to_string().into(),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    // Level 0 Air-Gap Invariant: never activate the anchor or any
+                    // system-reserved identity over the bridge.
+                    if let Some(target) = resolve_target_profile(&vault, &profile_id, &did) {
+                        if is_bridge_protected(target) {
+                            let _ = response_tx.send(Message::Text(
+                                "{\"type\":\"error\",\"message\":\"Access denied: Level 0 identity is air-gapped from external activation\"}".into(),
+                            ));
+                            continue;
+                        }
+                    } else {
+                        let _ = response_tx.send(Message::Text(
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!(
+                                    "Profile not found: profile_id='{}' did='{}'",
+                                    profile_id, did
+                                )
+                            }).to_string().into(),
+                        ));
+                        continue;
+                    }
+
+                    let active_profile = match crate::vault::activate_persona(&mut vault, &profile_id) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("DEBUG: set_active_profile activation failed: {}", e);
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": e
+                                }).to_string().into(),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = crate::vault::save_vault(&app_handle, &vault) {
+                        eprintln!("DEBUG: set_active_profile failed to persist vault: {}", e);
+                        let _ = response_tx.send(Message::Text(
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("Failed to persist vault: {}", e)
+                            }).to_string().into(),
+                        ));
+                        continue;
+                    }
+
+                    // Update in-memory active DID and preferences.
+                    if let Some(service_state) = app_handle.try_state::<crate::ServiceState>() {
+                        let mut active = service_state.active_did.lock().unwrap();
+                        *active = Some(active_profile.did.clone());
+                    }
+                    let mut prefs = crate::load_preferences(&app_handle);
+                    prefs.active_profile_id = active_profile.profile_id.clone();
+                    prefs.active_sovereign_did = None;
+                    let _ = crate::save_preferences(&app_handle, &prefs);
+                    let _ = app_handle.emit("profile://changed", &active_profile);
+
+                    let _ = response_tx.send(Message::Text(
+                        serde_json::json!({
+                            "type": "profile_sync",
+                            "profile": {
+                                "profile_id": active_profile.profile_id,
+                                "profile_name": active_profile.profile_name,
+                                "derivation_index": active_profile.derivation_index,
+                                "did": active_profile.did,
+                                "nostr_pubkey_hex": active_profile.nostr_pubkey_hex,
+                                "level": active_profile.level,
+                                "is_system_reserved": active_profile.is_system_reserved,
+                                "active": true
+                            }
+                        }).to_string().into(),
+                    ));
                     continue;
                 }
 
@@ -816,4 +1020,157 @@ pub fn build_enclave_diagnostics(app: &AppHandle) -> serde_json::Value {
         },
         "all_capabilities_met": all_capabilities_met
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::{activate_persona, Profile, VaultStore};
+
+    fn sample_profile(
+        profile_id: &str,
+        derivation_index: u32,
+        level: u8,
+        is_system_reserved: bool,
+        active: bool,
+    ) -> Profile {
+        Profile {
+            profile_id: profile_id.to_string(),
+            profile_name: format!("{} Persona", profile_id),
+            derivation_index,
+            did: format!("did:key:z6Mk{}", profile_id),
+            credentials: vec![],
+            nostr_pubkey_hex: "abcd".repeat(16),
+            level,
+            is_system_reserved,
+            active,
+        }
+    }
+
+    fn test_vault() -> VaultStore {
+        // Anchor (L0 / index 0 / system-reserved), Primary (L1 / index 1),
+        // and a couple of L2 burners.
+        VaultStore {
+            root_seed_base58: "seed".to_string(),
+            profiles: vec![
+                sample_profile("anchor", 0, 0, true, false),
+                sample_profile("primary", 1, 1, false, true),
+                sample_profile("dad_bod", 2, 2, false, false),
+                sample_profile("work_sock", 3, 2, false, false),
+            ],
+            sovereign_identities: vec![],
+        }
+    }
+
+    #[test]
+    fn test_list_profiles_excludes_level0_anchor() {
+        let vault = test_vault();
+        let summaries = public_persona_summaries(&vault);
+
+        // Only L1 + L2 personas are exposed; the Level 0 anchor is filtered out.
+        assert_eq!(summaries.len(), 3);
+        let ids: Vec<&str> = summaries.iter().map(|s| s.profile_id.as_str()).collect();
+        assert!(!ids.contains(&"anchor"));
+        assert!(ids.contains(&"primary"));
+        assert!(ids.contains(&"dad_bod"));
+        assert!(ids.contains(&"work_sock"));
+
+        // The summary omits private credential material but includes the
+        // public identity metadata and the `name` alias.
+        let primary = summaries.iter().find(|s| s.profile_id == "primary").unwrap();
+        assert_eq!(primary.name, primary.profile_name);
+        assert_eq!(primary.derivation_index, 1);
+        assert_eq!(primary.level, 1);
+        assert!(primary.active);
+        assert!(primary.did.starts_with("did:key:"));
+    }
+
+    #[test]
+    fn test_is_bridge_protected_predictates() {
+        // Each independent Level 0 invariant must trip the guard.
+        assert!(is_bridge_protected(&sample_profile("a", 0, 1, false, false)));
+        assert!(is_bridge_protected(&sample_profile("b", 1, 0, false, false)));
+        assert!(is_bridge_protected(&sample_profile("c", 1, 1, true, false)));
+        // L1 / L2 personas are never protected.
+        assert!(!is_bridge_protected(&sample_profile("d", 1, 1, false, false)));
+        assert!(!is_bridge_protected(&sample_profile("e", 2, 2, false, false)));
+    }
+
+    #[test]
+    fn test_activate_level0_fails_cleanly_without_panic() {
+        let mut vault = test_vault();
+
+        // Attempting to activate the Level 0 anchor fails cleanly with an
+        // error rather than panicking or mutating state.
+        let err = activate_persona(&mut vault, "anchor");
+        assert!(err.is_err());
+        let msg = err.unwrap_err();
+        assert!(
+            msg.to_lowercase().contains("anchor"),
+            "Expected anchor rejection, got: {}",
+            msg
+        );
+
+        // The anchor may never become active.
+        assert!(!vault.profiles[0].active);
+        // The previous active persona remains active.
+        assert!(vault.profiles[1].active);
+    }
+
+    #[test]
+    fn test_activate_invalid_profile_fails_cleanly() {
+        let mut vault = test_vault();
+        let err = activate_persona(&mut vault, "does_not_exist");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("not found"));
+
+        // State must be unchanged after a failed activation.
+        assert_eq!(vault.profiles[0].active, false);
+        assert!(vault.profiles[1].active);
+    }
+
+    #[test]
+    fn test_activate_l2_burner_succeeds_and_broadcast_shape() {
+        let mut vault = test_vault();
+        let active = activate_persona(&mut vault, "dad_bod")
+            .expect("L2 burner activation must succeed");
+
+        assert_eq!(active.profile_id, "dad_bod");
+        assert!(active.active);
+        assert_eq!(active.level, 2);
+
+        // Emit the profile_sync JSON the bridge broadcasts after activation.
+        let sync = serde_json::json!({
+            "type": "profile_sync",
+            "profile": {
+                "profile_id": active.profile_id,
+                "profile_name": active.profile_name,
+                "derivation_index": active.derivation_index,
+                "did": active.did,
+                "nostr_pubkey_hex": active.nostr_pubkey_hex,
+                "level": active.level,
+                "is_system_reserved": active.is_system_reserved,
+                "active": true
+            }
+        });
+        assert_eq!(sync["type"], "profile_sync");
+        assert_eq!(sync["profile"]["profile_id"], "dad_bod");
+        assert_eq!(sync["profile"]["derivation_index"], 2);
+        assert_eq!(sync["profile"]["level"], 2);
+        assert_eq!(sync["profile"]["active"], true);
+    }
+
+    #[test]
+    fn test_resolve_target_profile_by_id_and_did() {
+        let vault = test_vault();
+
+        let by_id = resolve_target_profile(&vault, "work_sock", "").unwrap();
+        assert_eq!(by_id.profile_id, "work_sock");
+
+        let by_did = resolve_target_profile(&vault, "", "did:key:z6Mkwork_sock").unwrap();
+        assert_eq!(by_did.profile_id, "work_sock");
+
+        assert!(resolve_target_profile(&vault, "", "").is_none());
+        assert!(resolve_target_profile(&vault, "nope", "").is_none());
+    }
 }
