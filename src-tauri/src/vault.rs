@@ -59,6 +59,46 @@ pub struct Profile {
     pub is_system_reserved: bool,
     #[serde(default)]
     pub active: bool,
+    /// Optional leaf private key (base58) for graduated sovereign personas imported directly without re-hashing
+    #[serde(default)]
+    pub imported_seed_b58: Option<String>,
+    /// Optional companion nostr secret key (hex) for graduated sovereign personas
+    #[serde(default)]
+    pub imported_nostr_sk_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependentProfile {
+    pub dependent_id: String,
+    pub name: String,
+    pub birth_year: u16,
+    pub custody_stage: u8, // 1 = Guided Delegation, 2 = Autonomous, 3 = Sovereign Pending
+    pub dependent_index: u32,
+    pub did: String,
+    pub nostr_pubkey_hex: String,
+    pub guardian_did: String,
+    pub allowed_relays: Vec<String>,
+    pub attestation_vc: Option<VaultCredential>,
+    #[serde(default)]
+    pub revoked: bool,
+    pub created_at: u64,
+    pub graduated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependentProvisioningBundle {
+    pub bundle_version: String, // "1.0"
+    pub dependent_id: String,
+    pub petname: String,
+    pub did: String,
+    pub ed25519_private_key_b58: String,
+    pub nostr_private_key_hex: String,
+    pub nostr_pubkey_hex: String,
+    pub guardian_did: String,
+    pub custody_stage: u8,
+    pub allowed_relays: Vec<String>,
+    pub attestation_vc: serde_json::Value,
+    pub exported_at: u64,
 }
 
 impl Profile {
@@ -87,6 +127,8 @@ pub struct VaultStore {
     /// the local root seed and are invisible to root-seed keypair paths.
     #[serde(default)]
     pub sovereign_identities: Vec<SovereignIdentity>,
+    #[serde(default)]
+    pub dependents: Vec<DependentProfile>,
 }
 
 impl VaultStore {
@@ -678,6 +720,7 @@ pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
         root_seed_base58,
         profiles: initial_profiles(&seed),
         sovereign_identities: Vec::new(),
+        dependents: Vec::new(),
     };
 
     save_vault_inner(path, &vault)?;
@@ -703,6 +746,8 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             level: 0,
             is_system_reserved: true,
             active: false,
+            imported_seed_b58: None,
+            imported_nostr_sk_hex: None,
         },
         Profile {
             profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
@@ -714,6 +759,8 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             level: 1,
             is_system_reserved: false,
             active: true,
+            imported_seed_b58: None,
+            imported_nostr_sk_hex: None,
         },
     ]
 }
@@ -936,6 +983,8 @@ pub fn heal_reserved_profiles(vault: &mut VaultStore) -> Result<bool, String> {
             level: 1,
             is_system_reserved: false,
             active: true,
+            imported_seed_b58: None,
+            imported_nostr_sk_hex: None,
         });
         changed = true;
     }
@@ -1018,6 +1067,25 @@ pub fn get_profile_keypair(vault: &VaultStore, profile_id: &str) -> Result<Deriv
         .get_profile_by_id(profile_id)
         .ok_or_else(|| format!("Profile not found: '{}'", profile_id))?;
 
+    if let Some(ref imported) = profile.imported_seed_b58 {
+        let seed = bs58::decode(imported)
+            .into_vec()
+            .map_err(|_| "Invalid imported seed encoding".to_string())?;
+        if seed.len() != 32 {
+            return Err("Imported seed must be 32 bytes".to_string());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&seed);
+        let signing_key = SigningKey::from_bytes(&arr);
+        let verifying_key = signing_key.verifying_key();
+        let did = format!("did:key:{}", ed25519_multibase(verifying_key.as_bytes()));
+        return Ok(DerivedKeypair {
+            signing_key,
+            verifying_key,
+            did,
+        });
+    }
+
     let seed = bs58::decode(&vault.root_seed_base58)
         .into_vec()
         .map_err(|_| "Invalid root seed encoding".to_string())?;
@@ -1064,6 +1132,8 @@ pub fn add_profile(
         level: 2,
         is_system_reserved: false,
         active: false,
+        imported_seed_b58: None,
+        imported_nostr_sk_hex: None,
     };
 
     vault.profiles.push(profile.clone());
@@ -1176,12 +1246,379 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
         level: 1,
         is_system_reserved: false,
         active: true,
+        imported_seed_b58: None,
+        imported_nostr_sk_hex: None,
     };
 
     vault.profiles.push(new_persona.clone());
     vault.profiles.sort_by_key(|p| p.derivation_index);
 
     Ok(new_persona)
+}
+
+pub fn derive_dependent_identity(
+    root_seed: &[u8],
+    dependent_index: u32,
+) -> Result<did_rust::DependentDerivedKeypair, String> {
+    if root_seed.len() != 32 {
+        return Err("Root seed must be 32 bytes".to_string());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(root_seed);
+    did_rust::derive_dependent_subkeys(&arr, dependent_index)
+        .map_err(|e| format!("Dependent key derivation failed: {}", e))
+}
+
+#[allow(dead_code)]
+pub fn import_graduated_dependent(
+    bundle: &DependentProvisioningBundle,
+) -> Result<VaultStore, String> {
+    if bundle.ed25519_private_key_b58.is_empty() {
+        return Err("Missing leaf Ed25519 private key in bundle".to_string());
+    }
+    let leaf_bytes = bs58::decode(&bundle.ed25519_private_key_b58)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58 leaf private key: {}", e))?;
+    if leaf_bytes.len() != 32 {
+        return Err("Leaf Ed25519 private key must be 32 bytes".to_string());
+    }
+    let mut leaf_arr = [0u8; 32];
+    leaf_arr.copy_from_slice(&leaf_bytes);
+    let leaf_signing_key = SigningKey::from_bytes(&leaf_arr);
+    let computed_did = format!(
+        "did:key:{}",
+        ed25519_multibase(leaf_signing_key.verifying_key().as_bytes())
+    );
+    if computed_did != bundle.did {
+        return Err(format!(
+            "Leaf key does not match bundle DID: computed {}, bundle {}",
+            computed_did, bundle.did
+        ));
+    }
+
+    // 1. Generate a fresh independent 32-byte root seed for the newly sovereign child
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    let root_seed_base58 = bs58::encode(seed).into_string();
+
+    // 2. Anchor at index 0 under the new independent root seed
+    let anchor_kp = derive_deterministic_keypair(&seed, 0);
+    let anchor_nostr_pk = derive_secp256k1_pubkey_hex(&seed, 0);
+    let anchor_profile = Profile {
+        profile_id: ANCHOR_PROFILE_ID.to_string(),
+        profile_name: "Anchor Identity".to_string(),
+        derivation_index: 0,
+        did: anchor_kp.did,
+        credentials: vec![],
+        nostr_pubkey_hex: anchor_nostr_pk,
+        level: 0,
+        is_system_reserved: true,
+        active: false,
+        imported_seed_b58: None,
+        imported_nostr_sk_hex: None,
+    };
+
+    // 3. Ingest leaf keypair directly into L1 Primary slot, preserving DID/pubkey continuity
+    let primary_profile = Profile {
+        profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
+        profile_name: if bundle.petname.is_empty() {
+            "Primary Identity".to_string()
+        } else {
+            bundle.petname.clone()
+        },
+        derivation_index: 1,
+        did: bundle.did.clone(),
+        credentials: vec![],
+        nostr_pubkey_hex: bundle.nostr_pubkey_hex.clone(),
+        level: 1,
+        is_system_reserved: false,
+        active: true,
+        imported_seed_b58: Some(bundle.ed25519_private_key_b58.clone()),
+        imported_nostr_sk_hex: Some(bundle.nostr_private_key_hex.clone()),
+    };
+
+    let sovereign_record = SovereignIdentity {
+        did: bundle.did.clone(),
+        profile_name: if bundle.petname.is_empty() {
+            "Sovereign Identity".to_string()
+        } else {
+            bundle.petname.clone()
+        },
+        nostr_pubkey_hex: bundle.nostr_pubkey_hex.clone(),
+        sealed_seed_b64: base64::engine::general_purpose::STANDARD.encode(&leaf_arr),
+        custodial_origin: false,
+        graduated_at: bundle.exported_at,
+    };
+
+    Ok(VaultStore {
+        root_seed_base58,
+        profiles: vec![anchor_profile, primary_profile],
+        sovereign_identities: vec![sovereign_record],
+        dependents: Vec::new(),
+    })
+}
+
+pub fn add_dependent_profile(
+    vault: &mut VaultStore,
+    name: String,
+    birth_year: u16,
+    custody_stage: u8,
+) -> Result<DependentProfile, String> {
+    if name.trim().is_empty() {
+        return Err("Dependent name cannot be empty".into());
+    }
+    if custody_stage != 1 && custody_stage != 2 {
+        return Err("Custody stage must be 1 (Guided Delegation) or 2 (Autonomous)".into());
+    }
+
+    let seed = decode_root_seed(vault)?;
+
+    // Decoupled Monotonic Allocation: max(dependents.dependent_index) + 1, starting at 0
+    let next_index = vault
+        .dependents
+        .iter()
+        .map(|d| d.dependent_index)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+
+    let derived = derive_dependent_identity(&seed, next_index)?;
+
+    let guardian = vault
+        .public_persona()
+        .ok_or_else(|| "Parent public persona not found".to_string())?;
+    let guardian_did = guardian.did.clone();
+
+    let bracket = match custody_stage {
+        1 => "U14",
+        2 => "U14-U18",
+        _ => "U18",
+    };
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    let vc_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+
+    let vc_unproven = serde_json::json!({
+        "@context": [
+            "https://www.w3.org/2018/credentials/v1",
+            "https://iyou.me/credentials/age-bracket/v1"
+        ],
+        "id": vc_id,
+        "type": ["VerifiableCredential", "AgeBracketCredential"],
+        "issuer": guardian_did,
+        "issuanceDate": now_rfc3339,
+        "credentialSubject": {
+            "id": derived.did,
+            "ageBracket": bracket,
+            "parentAttestation": format!("Parent attests subject is in {} age bracket.", bracket)
+        }
+    });
+
+    let parent_keypair = get_profile_keypair(vault, &guardian.profile_id)?;
+    let parent_key_b58 = bs58::encode(parent_keypair.signing_key.to_bytes()).into_string();
+
+    let signed_vc_str = did_rust::issue_vc(
+        &vc_unproven.to_string(),
+        &guardian_did,
+        &parent_key_b58,
+    )
+    .map_err(|e| format!("Failed to issue AgeBracketCredential VC: {}", e))?;
+
+    let vault_vc = VaultCredential {
+        vc_id,
+        issuer_did: guardian_did.clone(),
+        subject_did: derived.did.clone(),
+        credential_type: "AgeBracketCredential".to_string(),
+        fidelity_score: None,
+        expiration_date: None,
+        raw_payload: signed_vc_str,
+    };
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Time went backwards".to_string())?
+        .as_secs();
+
+    let clean_name: String = name
+        .to_lowercase()
+        .replace(char::is_whitespace, "_")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    let did_tail: String = derived.did.chars().rev().take(8).collect();
+    let dependent_id = format!("dep_{}_{}", clean_name, did_tail);
+
+    let dep_profile = DependentProfile {
+        dependent_id,
+        name,
+        birth_year,
+        custody_stage,
+        dependent_index: next_index,
+        did: derived.did.clone(),
+        nostr_pubkey_hex: derived.nostr_pubkey_hex.clone(),
+        guardian_did,
+        allowed_relays: vec![
+            "wss://relay.iyou.me".to_string(),
+            "wss://safe.iyou.me".to_string(),
+        ],
+        attestation_vc: Some(vault_vc),
+        revoked: false,
+        created_at: now_ts,
+        graduated_at: None,
+    };
+
+    vault.dependents.push(dep_profile.clone());
+    Ok(dep_profile)
+}
+
+pub fn export_dependent_leaf_bundle(
+    vault: &VaultStore,
+    dependent_id: &str,
+) -> Result<DependentProvisioningBundle, String> {
+    let dep = vault
+        .dependents
+        .iter()
+        .find(|d| d.dependent_id == dependent_id)
+        .ok_or_else(|| format!("Dependent '{}' not found", dependent_id))?;
+
+    if dep.revoked {
+        return Err("Cannot export provisioning bundle: dependent is revoked".to_string());
+    }
+
+    let seed = decode_root_seed(vault)?;
+    let derived = derive_dependent_identity(&seed, dep.dependent_index)?;
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Time went backwards".to_string())?
+        .as_secs();
+
+    let attestation_val = match &dep.attestation_vc {
+        Some(vc) => serde_json::from_str(&vc.raw_payload)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": vc.raw_payload })),
+        None => serde_json::Value::Null,
+    };
+
+    let bundle = DependentProvisioningBundle {
+        bundle_version: "1.0".to_string(),
+        dependent_id: dep.dependent_id.clone(),
+        petname: dep.name.clone(),
+        did: dep.did.clone(),
+        ed25519_private_key_b58: bs58::encode(derived.ed25519_signing_key_bytes).into_string(),
+        nostr_private_key_hex: hex::encode(derived.secp256k1_signing_key_bytes),
+        nostr_pubkey_hex: dep.nostr_pubkey_hex.clone(),
+        guardian_did: dep.guardian_did.clone(),
+        custody_stage: dep.custody_stage,
+        allowed_relays: dep.allowed_relays.clone(),
+        attestation_vc: attestation_val,
+        exported_at: now_ts,
+    };
+
+    // Asserts bundle JSON never contains root_seed_base58 or parent signing keys
+    let bundle_json = serde_json::to_string(&bundle)
+        .map_err(|e| format!("Failed to serialize bundle: {}", e))?;
+    if bundle_json.contains(&vault.root_seed_base58) {
+        return Err("Security invariant violation: bundle contains root seed".to_string());
+    }
+    for p in &vault.profiles {
+        if let Ok(kp) = get_profile_keypair(vault, &p.profile_id) {
+            let sk_b58 = bs58::encode(kp.signing_key.to_bytes()).into_string();
+            if bundle_json.contains(&sk_b58) {
+                return Err(
+                    "Security invariant violation: bundle contains parent private key".to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(bundle)
+}
+
+pub fn graduate_dependent(
+    vault: &mut VaultStore,
+    dependent_id: &str,
+) -> Result<DependentProvisioningBundle, String> {
+    let dep_idx = vault
+        .dependents
+        .iter()
+        .position(|d| d.dependent_id == dependent_id)
+        .ok_or_else(|| format!("Dependent '{}' not found", dependent_id))?;
+
+    if vault.dependents[dep_idx].revoked {
+        return Err("Cannot graduate revoked dependent".to_string());
+    }
+
+    use chrono::Datelike;
+    let current_year = chrono::Utc::now().year() as u16;
+    if current_year < vault.dependents[dep_idx].birth_year + 18 {
+        return Err(format!(
+            "Dependent has not attained sovereign age (current year {}, birth year {})",
+            current_year, vault.dependents[dep_idx].birth_year
+        ));
+    }
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Time went backwards".to_string())?
+        .as_secs();
+
+    vault.dependents[dep_idx].custody_stage = 3;
+    vault.dependents[dep_idx].graduated_at = Some(now_ts);
+
+    let dep = vault.dependents[dep_idx].clone();
+    let seed = decode_root_seed(vault)?;
+    let derived = derive_dependent_identity(&seed, dep.dependent_index)?;
+
+    let guardian = vault
+        .public_persona()
+        .ok_or_else(|| "Parent public persona not found".to_string())?;
+    let guardian_did = guardian.did.clone();
+    let parent_keypair = get_profile_keypair(vault, &guardian.profile_id)?;
+    let parent_key_b58 = bs58::encode(parent_keypair.signing_key.to_bytes()).into_string();
+
+    let graduation_vc = serde_json::json!({
+        "@context": [
+            "https://www.w3.org/2018/credentials/v1",
+            "https://iyou.me/credentials/age-bracket/v1"
+        ],
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": ["VerifiableCredential", "AgeBracketCredential", "SovereignGraduationCredential"],
+        "issuer": guardian_did,
+        "issuanceDate": chrono::Utc::now().to_rfc3339(),
+        "credentialSubject": {
+            "id": dep.did,
+            "ageBracket": "ADULT",
+            "sovereignStatus": "GRADUATED",
+            "controller": dep.did,
+            "parentAttestation": "Parent attests subject has attained sovereign status and full key stewardship."
+        }
+    });
+
+    let signed_grad_vc = did_rust::issue_vc(
+        &graduation_vc.to_string(),
+        &guardian_did,
+        &parent_key_b58,
+    )
+    .unwrap_or_else(|_| graduation_vc.to_string());
+
+    let attestation_val: serde_json::Value =
+        serde_json::from_str(&signed_grad_vc).unwrap_or(graduation_vc);
+
+    let bundle = DependentProvisioningBundle {
+        bundle_version: "1.0".to_string(),
+        dependent_id: dep.dependent_id,
+        petname: dep.name,
+        did: dep.did,
+        ed25519_private_key_b58: bs58::encode(derived.ed25519_signing_key_bytes).into_string(),
+        nostr_private_key_hex: hex::encode(derived.secp256k1_signing_key_bytes),
+        nostr_pubkey_hex: dep.nostr_pubkey_hex,
+        guardian_did: dep.guardian_did,
+        custody_stage: 3,
+        allowed_relays: dep.allowed_relays,
+        attestation_vc: attestation_val,
+        exported_at: now_ts,
+    };
+
+    Ok(bundle)
 }
 
 /// Validate and ingest a W3C Verifiable Credential into a specified profile.
@@ -1856,6 +2293,7 @@ mod tests {
             root_seed_base58: full.root_seed_base58.clone(),
             profiles: vec![full.profiles[0].clone()],
             sovereign_identities: Vec::new(),
+            dependents: Vec::new(),
         };
         save_vault_inner(path, &legacy).expect("Should persist legacy vault");
         let seed = bs58::decode(&legacy.root_seed_base58)
@@ -1929,8 +2367,11 @@ mod tests {
                 level: 0,
                 is_system_reserved: false,
                 active: false,
+                imported_seed_b58: None,
+                imported_nostr_sk_hex: None,
             }],
             sovereign_identities: Vec::new(),
+            dependents: Vec::new(),
         };
         save_vault_inner(&path, &squatting).expect("Should persist squatting vault");
         let anchor_did = squatting.profiles[0].did.clone();
@@ -2756,6 +3197,7 @@ mod tests {
             root_seed_base58: bs58::encode(&seed).into_string(),
             profiles: vec![],
             sovereign_identities: vec![],
+            dependents: vec![],
         };
 
         let hex = reveal_root_seed_hex(&vault).expect("Should reveal seed");
@@ -2778,6 +3220,7 @@ mod tests {
             root_seed_base58: bs58::encode(&seed).into_string(),
             profiles: vec![],
             sovereign_identities: vec![],
+            dependents: vec![],
         };
         vault.profiles = initial_profiles(&seed);
 
@@ -2872,6 +3315,7 @@ mod tests {
             root_seed_base58: bs58::encode(&seed).into_string(),
             profiles: initial_profiles(&seed),
             sovereign_identities: vec![],
+            dependents: vec![],
         };
         fs::write(tmp.join("vault.json"), serde_json::to_string_pretty(&vault).unwrap()).unwrap();
 
@@ -2992,8 +3436,11 @@ mod tests {
                 level: 1,
                 is_system_reserved: false,
                 active: true,
+                imported_seed_b58: None,
+                imported_nostr_sk_hex: None,
             }],
             sovereign_identities: vec![],
+            dependents: vec![],
         };
 
         let backup_bytes = export_vault_backup(&vault, &tmp, "safe-password")
@@ -3026,6 +3473,7 @@ mod tests {
             root_seed_base58: bs58::encode(vec![0x55u8; 32]).into_string(),
             profiles: vec![],
             sovereign_identities: vec![],
+            dependents: vec![],
         };
 
         let backup_bytes = export_vault_backup(&vault, &tmp, "correct-password")
@@ -3078,5 +3526,233 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_derive_dependent_identity_deterministic() {
+        let seed = [0x42u8; 32];
+        let d1 = derive_dependent_identity(&seed, 0).expect("derivation 1 succeeds");
+        let d2 = derive_dependent_identity(&seed, 0).expect("derivation 2 succeeds");
+
+        assert_eq!(d1.did, d2.did);
+        assert_eq!(d1.nostr_pubkey_hex, d2.nostr_pubkey_hex);
+        assert_eq!(d1.ed25519_signing_key_bytes, d2.ed25519_signing_key_bytes);
+        assert_eq!(d1.secp256k1_signing_key_bytes, d2.secp256k1_signing_key_bytes);
+    }
+
+    #[test]
+    fn test_derive_dependent_identity_domain_separation() {
+        let seed = [0x55u8; 32];
+        let anchor = derive_deterministic_keypair(&seed, 0);
+        let primary = derive_deterministic_keypair(&seed, 1);
+
+        let dep0 = derive_dependent_identity(&seed, 0).expect("dep 0 succeeds");
+        let dep1 = derive_dependent_identity(&seed, 1).expect("dep 1 succeeds");
+
+        // Dependent subkey at index 0 must differ from parent Anchor (index 0)
+        assert_ne!(dep0.did, anchor.did);
+        assert_ne!(dep0.nostr_pubkey_hex, derive_secp256k1_pubkey_hex(&seed, 0));
+
+        // Dependent subkey at index 1 must differ from parent Primary (index 1)
+        assert_ne!(dep1.did, primary.did);
+        assert_ne!(dep1.nostr_pubkey_hex, derive_secp256k1_pubkey_hex(&seed, 1));
+
+        // Dependent 0 and Dependent 1 must differ
+        assert_ne!(dep0.did, dep1.did);
+        assert_ne!(dep0.nostr_pubkey_hex, dep1.nostr_pubkey_hex);
+    }
+
+    #[test]
+    fn test_dependent_and_burner_index_decoupling() {
+        let mut path = temp_dir();
+        path.push("test_decoupling_vault.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let b1 = add_profile(&mut vault, "burner_1".to_string(), "Burner 1".to_string())
+            .expect("Add burner 1");
+        assert_eq!(b1.derivation_index, 2);
+
+        let d1 = add_dependent_profile(&mut vault, "Child 1".to_string(), 2015, 1)
+            .expect("Add child 1");
+        assert_eq!(d1.dependent_index, 0);
+
+        let b2 = add_profile(&mut vault, "burner_2".to_string(), "Burner 2".to_string())
+            .expect("Add burner 2");
+        assert_eq!(b2.derivation_index, 3);
+
+        let d2 = add_dependent_profile(&mut vault, "Child 2".to_string(), 2013, 1)
+            .expect("Add child 2");
+        assert_eq!(d2.dependent_index, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_public_persona_ignores_dependents() {
+        let mut path = temp_dir();
+        path.push("test_public_persona_ignores_dependents.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        add_dependent_profile(&mut vault, "Alice".to_string(), 2014, 1)
+            .expect("Should add dependent Alice");
+        add_dependent_profile(&mut vault, "Charlie".to_string(), 2011, 2)
+            .expect("Should add dependent Charlie");
+
+        let persona = vault.public_persona().expect("Public persona must exist");
+        assert_eq!(persona.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(persona.level, 1);
+        assert_ne!(persona.profile_name, "Alice");
+
+        let resolved_empty = vault.get_profile_by_id("").expect("Empty id must resolve");
+        assert_eq!(resolved_empty.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_bridge_summaries_exclude_dependents() {
+        let mut path = temp_dir();
+        path.push("test_bridge_summaries_exclude_dependents.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        add_profile(&mut vault, "burner_x".to_string(), "Burner X".to_string())
+            .expect("Should add burner");
+        add_dependent_profile(&mut vault, "Bob".to_string(), 2012, 1)
+            .expect("Should add dependent");
+
+        let summaries = crate::bridge::public_persona_summaries(&vault);
+        assert!(!summaries.is_empty());
+        for s in &summaries {
+            assert_ne!(s.profile_name, "Bob");
+            assert_ne!(s.name, "Bob");
+            assert!(!s.profile_id.starts_with("dep_"));
+            for dep in &vault.dependents {
+                assert_ne!(s.did, dep.did);
+                assert_ne!(s.nostr_pubkey_hex, dep.nostr_pubkey_hex);
+            }
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_export_leaf_bundle_excludes_master_secrets() {
+        let mut path = temp_dir();
+        path.push("test_export_secrets_vault.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        let dep = add_dependent_profile(&mut vault, "Alice".to_string(), 2014, 1)
+            .expect("Add child Alice");
+
+        let bundle = export_dependent_leaf_bundle(&vault, &dep.dependent_id)
+            .expect("Bundle export must succeed");
+
+        let bundle_json = serde_json::to_string(&bundle).expect("Serialize bundle");
+
+        // Master root seed must NEVER be present
+        assert!(!bundle_json.contains(&vault.root_seed_base58));
+        let seed_bytes = decode_root_seed(&vault).unwrap();
+        assert!(!bundle_json.contains(&hex::encode(&seed_bytes)));
+
+        // Parent profile secret keys must NEVER be present
+        for p in &vault.profiles {
+            let kp = get_profile_keypair(&vault, &p.profile_id).unwrap();
+            let sk_b58 = bs58::encode(kp.signing_key.to_bytes()).into_string();
+            assert!(!bundle_json.contains(&sk_b58));
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_export_leaf_bundle_fails_when_revoked() {
+        let mut path = temp_dir();
+        path.push("test_export_revoked_vault.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        let dep = add_dependent_profile(&mut vault, "Bob".to_string(), 2014, 1)
+            .expect("Add child Bob");
+
+        // Mark revoked
+        vault.dependents.iter_mut().find(|d| d.dependent_id == dep.dependent_id).unwrap().revoked = true;
+
+        let result = export_dependent_leaf_bundle(&vault, &dep.dependent_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("revoked"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_graduation_ceremony_age_boundary() {
+        let mut path = temp_dir();
+        path.push("test_graduation_age_vault.json");
+        let _ = fs::remove_file(&path);
+
+        use chrono::Datelike;
+        let current_year = chrono::Utc::now().year() as u16;
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        // Underage dependent (17 years old)
+        let underage = add_dependent_profile(&mut vault, "Young".to_string(), current_year - 17, 2)
+            .expect("Add underage dependent");
+        let err = graduate_dependent(&mut vault, &underage.dependent_id);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("sovereign age"));
+
+        // Eligible dependent (18 years old)
+        let adult = add_dependent_profile(&mut vault, "Adult".to_string(), current_year - 18, 2)
+            .expect("Add adult dependent");
+        let bundle = graduate_dependent(&mut vault, &adult.dependent_id)
+            .expect("Graduation should succeed");
+
+        assert_eq!(bundle.custody_stage, 3);
+        let dep_after = vault.dependents.iter().find(|d| d.dependent_id == adult.dependent_id).unwrap();
+        assert_eq!(dep_after.custody_stage, 3);
+        assert!(dep_after.graduated_at.is_some());
+
+        // Test import_graduated_dependent preserving DID and key continuity
+        let new_vault = import_graduated_dependent(&bundle).expect("Import graduated dependent succeeds");
+        assert_ne!(new_vault.root_seed_base58, vault.root_seed_base58);
+        let new_primary = new_vault.public_persona().expect("New primary persona must exist");
+        assert_eq!(new_primary.did, bundle.did);
+        assert_eq!(new_primary.nostr_pubkey_hex, bundle.nostr_pubkey_hex);
+
+        let resolved_kp = get_profile_keypair(&new_vault, "primary").expect("Keypair must resolve");
+        assert_eq!(resolved_kp.did, bundle.did);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_legacy_vault_deserialization_with_empty_dependents() {
+        let raw_legacy = r#"{
+            "root_seed_base58": "mockSeed12345",
+            "profiles": [
+                {
+                    "profile_id": "primary",
+                    "profile_name": "Primary",
+                    "derivation_index": 1,
+                    "did": "did:key:zMock",
+                    "credentials": [],
+                    "nostr_pubkey_hex": "00112233",
+                    "level": 1,
+                    "is_system_reserved": false,
+                    "active": true
+                }
+            ],
+            "sovereign_identities": []
+        }"#;
+
+        let vault: VaultStore = serde_json::from_str(raw_legacy).expect("Deserialization succeeds");
+        assert!(vault.dependents.is_empty());
+        assert_eq!(vault.profiles.len(), 1);
     }
 }

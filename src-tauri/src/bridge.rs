@@ -74,7 +74,7 @@ fn is_bridge_protected(profile: &crate::vault::Profile) -> bool {
 }
 
 /// Enumerate public summaries for every bridge-exposable persona (L1 and L2+).
-fn public_persona_summaries(vault: &crate::vault::VaultStore) -> Vec<PublicPersonaSummary> {
+pub fn public_persona_summaries(vault: &crate::vault::VaultStore) -> Vec<PublicPersonaSummary> {
     vault
         .profiles
         .iter()
@@ -133,6 +133,12 @@ fn bridge_access_denial_reason(app: &AppHandle, profile_id: &str) -> Option<Stri
     // Empty/omitted profile_id resolves to the public persona downstream.
     if profile_id.is_empty() {
         return None;
+    }
+
+    if vault.dependents.iter().any(|d| d.dependent_id == profile_id) {
+        return Some(
+            "Access denied: Dependent identity is air-gapped from external signing".to_string(),
+        );
     }
 
     match vault.get_profile_by_id(profile_id) {
@@ -1025,7 +1031,7 @@ pub fn build_enclave_diagnostics(app: &AppHandle) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{activate_persona, Profile, VaultStore};
+    use crate::vault::{activate_persona, DependentProfile, Profile, VaultStore};
 
     fn sample_profile(
         profile_id: &str,
@@ -1044,6 +1050,8 @@ mod tests {
             level,
             is_system_reserved,
             active,
+            imported_seed_b58: None,
+            imported_nostr_sk_hex: None,
         }
     }
 
@@ -1059,6 +1067,7 @@ mod tests {
                 sample_profile("work_sock", 3, 2, false, false),
             ],
             sovereign_identities: vec![],
+            dependents: vec![],
         }
     }
 
@@ -1172,5 +1181,28 @@ mod tests {
 
         assert!(resolve_target_profile(&vault, "", "").is_none());
         assert!(resolve_target_profile(&vault, "nope", "").is_none());
+    }
+
+    #[test]
+    fn test_resolve_target_profile_ignores_dependents() {
+        let mut vault = test_vault();
+        vault.dependents.push(DependentProfile {
+            dependent_id: "dep_alice_12345678".to_string(),
+            name: "Alice".to_string(),
+            birth_year: 2012,
+            custody_stage: 1,
+            dependent_index: 0,
+            did: "did:key:z6MkAliceDependent".to_string(),
+            nostr_pubkey_hex: "abcd".repeat(16),
+            guardian_did: "did:key:z6Mkprimary".to_string(),
+            allowed_relays: vec![],
+            attestation_vc: None,
+            revoked: false,
+            created_at: 1000,
+            graduated_at: None,
+        });
+
+        assert!(resolve_target_profile(&vault, "dep_alice_12345678", "").is_none());
+        assert!(resolve_target_profile(&vault, "", "did:key:z6MkAliceDependent").is_none());
     }
 }

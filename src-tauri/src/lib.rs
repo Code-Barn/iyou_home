@@ -498,6 +498,7 @@ fn import_did(
                 root_seed_base58: bs58::encode(arr).into_string(),
                 profiles: vault::initial_profiles(&arr),
                 sovereign_identities: Vec::new(),
+                dependents: Vec::new(),
             }
         }
         Err(e) => return Err(e.to_string()),
@@ -827,8 +828,17 @@ async fn submit_ws_event_response(
         .profiles
         .iter()
         .filter_map(|profile| {
-            let sk_bytes =
-                vault::derive_secp256k1_secret_key(&seed, profile.derivation_index);
+            let sk_bytes = if let Some(ref sk_hex) = profile.imported_nostr_sk_hex {
+                let bytes = hex::decode(sk_hex).ok()?;
+                if bytes.len() != 32 {
+                    return None;
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            } else {
+                vault::derive_secp256k1_secret_key(&seed, profile.derivation_index)
+            };
             let key = SecpSigningKey::from_bytes(&sk_bytes).ok()?;
             let pubkey_hex = hex::encode(key.verifying_key().to_bytes());
             if pubkey_hex == event_pubkey {
@@ -1725,6 +1735,47 @@ fn activate_sovereign_identity(
     let mut prefs = load_preferences(&app);
     prefs.active_sovereign_did = Some(did);
     save_preferences(&app, &prefs)
+}
+
+// ---------- Parent-Stewarded Dependent Personas (OMNI-DEP-GRAD-SPEC-V1) ----------
+
+/// Provisions a new parent-stewarded dependent persona, deriving subkeys from
+/// the parent root seed and issuing an AgeBracketCredential verifiable credential.
+#[tauri::command]
+fn create_dependent_profile(
+    app: AppHandle,
+    name: String,
+    birth_year: u16,
+    custody_stage: u8,
+) -> Result<vault::DependentProfile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let profile = vault::add_dependent_profile(&mut vault, name, birth_year, custody_stage)?;
+    vault::save_vault(&app, &vault)?;
+    Ok(profile)
+}
+
+/// Exports a self-contained leaf-only provisioning bundle for a dependent persona.
+/// Fails closed if revoked, and verifies parent root seed and private keys are never exposed.
+#[tauri::command]
+fn export_dependent_leaf_bundle(
+    app: AppHandle,
+    dependent_id: String,
+) -> Result<vault::DependentProvisioningBundle, String> {
+    let vault = vault::load_vault(&app)?;
+    vault::export_dependent_leaf_bundle(&vault, &dependent_id)
+}
+
+/// Graduates a dependent who has attained age 18 to sovereign status.
+/// Sets custody_stage = 3 (Sovereign Pending) and returns the sealed graduation bundle.
+#[tauri::command]
+fn graduate_dependent_to_sovereign(
+    app: AppHandle,
+    dependent_id: String,
+) -> Result<vault::DependentProvisioningBundle, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let bundle = vault::graduate_dependent(&mut vault, &dependent_id)?;
+    vault::save_vault(&app, &vault)?;
+    Ok(bundle)
 }
 
 // ---------- Break-Glass Emergency Rotation ----------
@@ -2830,6 +2881,9 @@ pub fn run() {
             generate_transit_keypair,
             process_graduation_ingest,
             activate_sovereign_identity,
+            create_dependent_profile,
+            export_dependent_leaf_bundle,
+            graduate_dependent_to_sovereign,
             rotate_primary_persona,
             reveal_master_seed,
             get_vault_status,
