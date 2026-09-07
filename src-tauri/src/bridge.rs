@@ -70,7 +70,7 @@ impl From<&crate::vault::Profile> for PublicPersonaSummary {
 /// Level 0 Air-Gap Invariant: profiles at derivation_index 0, level 0, or
 /// flagged system-reserved are never exposed over the external bridge.
 fn is_bridge_protected(profile: &crate::vault::Profile) -> bool {
-    profile.derivation_index == 0 || profile.level == 0 || profile.is_system_reserved
+    profile.derivation_index == 0 || profile.level == 0 || profile.is_system_reserved || profile.level >= 3
 }
 
 /// Enumerate public summaries for every bridge-exposable persona (L1 and L2+).
@@ -141,8 +141,20 @@ fn bridge_access_denial_reason(app: &AppHandle, profile_id: &str) -> Option<Stri
         );
     }
 
+    if vault.roles.iter().any(|r| r.role_id == profile_id) {
+        return Some(
+            "Access denied: Level 3 Role identity is air-gapped from external signing".to_string(),
+        );
+    }
+
+    if vault.businesses.iter().any(|b| b.business_id == profile_id) {
+        return Some(
+            "Access denied: Level 4 Business identity requires merchant bridge authorization".to_string(),
+        );
+    }
+
     match vault.get_profile_by_id(profile_id) {
-        Some(p) if p.is_anchor() || p.is_system_reserved => Some(
+        Some(p) if p.is_anchor() || p.is_system_reserved || p.level >= 3 => Some(
             "Access denied: Level 0 identity is air-gapped from external signing".to_string(),
         ),
         _ => None,
@@ -1068,6 +1080,8 @@ mod tests {
             ],
             sovereign_identities: vec![],
             dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
         }
     }
 
@@ -1103,6 +1117,9 @@ mod tests {
         // L1 / L2 personas are never protected.
         assert!(!is_bridge_protected(&sample_profile("d", 1, 1, false, false)));
         assert!(!is_bridge_protected(&sample_profile("e", 2, 2, false, false)));
+        // Level 3 & Level 4 are always protected from bridge exposure.
+        assert!(is_bridge_protected(&sample_profile("f", 3, 3, false, false)));
+        assert!(is_bridge_protected(&sample_profile("g", 4, 4, false, false)));
     }
 
     #[test]

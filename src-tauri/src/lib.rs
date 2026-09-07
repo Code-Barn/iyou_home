@@ -499,6 +499,8 @@ fn import_did(
                 profiles: vault::initial_profiles(&arr),
                 sovereign_identities: Vec::new(),
                 dependents: Vec::new(),
+                roles: Vec::new(),
+                businesses: Vec::new(),
             }
         }
         Err(e) => return Err(e.to_string()),
@@ -1778,6 +1780,64 @@ fn graduate_dependent_to_sovereign(
     Ok(bundle)
 }
 
+// ---------- Level 3 Accredited Roles & Level 4 Commerce Entities ----------
+
+#[tauri::command]
+fn list_roles(app: AppHandle) -> Result<Vec<vault::RoleProfile>, String> {
+    let vault = vault::load_vault(&app)?;
+    Ok(vault::list_roles(&vault))
+}
+
+#[tauri::command]
+fn create_role_profile(
+    app: AppHandle,
+    role_title: String,
+    namespace: String,
+    organization_did: String,
+    delegation_scope: Vec<String>,
+) -> Result<vault::RoleProfile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let role = vault::create_role_profile(
+        &mut vault,
+        role_title,
+        namespace,
+        organization_did,
+        delegation_scope,
+    )?;
+    vault::save_vault(&app, &vault)?;
+    Ok(role)
+}
+
+#[tauri::command]
+fn list_businesses(app: AppHandle) -> Result<Vec<vault::BusinessProfile>, String> {
+    let vault = vault::load_vault(&app)?;
+    Ok(vault::list_businesses(&vault))
+}
+
+#[tauri::command]
+fn create_business_profile(
+    app: AppHandle,
+    business_id: String,
+    legal_name: String,
+    jurisdiction: String,
+    operating_currency: String,
+    registration_number: Option<String>,
+    merchant_endpoints: Vec<String>,
+) -> Result<vault::BusinessProfile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let biz = vault::create_business_profile(
+        &mut vault,
+        business_id,
+        legal_name,
+        jurisdiction,
+        operating_currency,
+        registration_number,
+        merchant_endpoints,
+    )?;
+    vault::save_vault(&app, &vault)?;
+    Ok(biz)
+}
+
 // ---------- Break-Glass Emergency Rotation ----------
 
 /// Burns the active Level 1 Public Persona and provisions a fresh one at the
@@ -2884,6 +2944,10 @@ pub fn run() {
             create_dependent_profile,
             export_dependent_leaf_bundle,
             graduate_dependent_to_sovereign,
+            list_roles,
+            create_role_profile,
+            list_businesses,
+            create_business_profile,
             rotate_primary_persona,
             reveal_master_seed,
             get_vault_status,

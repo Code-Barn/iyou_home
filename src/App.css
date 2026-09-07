@@ -20,6 +20,10 @@
     --color-primary-bg: rgba(37, 99, 235, 0.03);
     --color-burner: #059669;
     --color-burner-bg: rgba(5, 150, 105, 0.03);
+    --color-role: #d97706;
+    --color-role-bg: rgba(217, 119, 6, 0.03);
+    --color-business: #0891b2;
+    --color-business-bg: rgba(8, 145, 178, 0.03);
 
     /* Status colors */
     --color-success: #10b981;
@@ -666,6 +670,16 @@ textarea {
     border-color: var(--color-burner, #059669);
 }
 
+.trust-tier-card.level-3.active {
+    box-shadow: 0 0 0 1px var(--color-role, #d97706);
+    border-color: var(--color-role, #d97706);
+}
+
+.trust-tier-card.level-4.active {
+    box-shadow: 0 0 0 1px var(--color-business, #0891b2);
+    border-color: var(--color-business, #0891b2);
+}
+
 .trust-tier-label {
     font-size: 0.65rem;
     text-transform: uppercase;
@@ -685,6 +699,14 @@ textarea {
 
 .trust-tier-card.level-2.active .trust-tier-label {
     color: var(--color-burner, #059669);
+}
+
+.trust-tier-card.level-3.active .trust-tier-label {
+    color: var(--color-role, #d97706);
+}
+
+.trust-tier-card.level-4.active .trust-tier-label {
+    color: var(--color-business, #0891b2);
 }
 
 .trust-tier-count {

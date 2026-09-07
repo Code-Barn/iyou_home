@@ -15,16 +15,18 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { Profile } from "../../lib/types";
+import { Profile, RoleProfile, BusinessProfile } from "../../lib/types";
 
 interface PersonaMatrixProps {
   profiles: Profile[];
   activeDid: string | null;
   onRefresh: () => void | Promise<void>;
   onSetActiveProfile?: (profile: Profile | null) => void;
+  roles?: RoleProfile[];
+  businesses?: BusinessProfile[];
 }
 
 function truncateString(str: string, lead = 18, tail = 8): string {
@@ -38,6 +40,8 @@ export default function PersonaMatrix({
   activeDid,
   onRefresh,
   onSetActiveProfile,
+  roles: initialRoles,
+  businesses: initialBusinesses,
 }: PersonaMatrixProps) {
   const [newPersonaName, setNewPersonaName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -52,6 +56,65 @@ export default function PersonaMatrix({
   const [breakGlassModalOpen, setBreakGlassModalOpen] = useState<boolean>(false);
   const [rotationConfirmText, setRotationConfirmText] = useState<string>("");
   const [rotationInProgress, setRotationInProgress] = useState<boolean>(false);
+
+  // Accordion state: Level 0 collapsed by default for zero shoulder-surfing exposure
+  const [expandedTiers, setExpandedTiers] = useState<Record<string, boolean>>({
+    level0: false,
+    level1: true,
+    level2: true,
+    level3: true,
+    level4: true,
+  });
+
+  const toggleTier = (tier: string) => {
+    setExpandedTiers((prev) => ({
+      ...prev,
+      [tier]: !prev[tier],
+    }));
+  };
+
+  // Level 3 (Roles) & Level 4 (Businesses) state
+  const [roles, setRoles] = useState<RoleProfile[]>(initialRoles || []);
+  const [businesses, setBusinesses] = useState<BusinessProfile[]>(initialBusinesses || []);
+
+  const [isCreatingRole, setIsCreatingRole] = useState(false);
+  const [showCreateRoleForm, setShowCreateRoleForm] = useState(false);
+  const [newRoleTitle, setNewRoleTitle] = useState("");
+  const [newRoleNamespace, setNewRoleNamespace] = useState("");
+  const [newRoleOrgDid, setNewRoleOrgDid] = useState("");
+  const [newRoleDelegationScope, setNewRoleDelegationScope] = useState("");
+  const [newRoleAccreditationVcId, setNewRoleAccreditationVcId] = useState("");
+
+  const [isCreatingBusiness, setIsCreatingBusiness] = useState(false);
+  const [showCreateBusinessForm, setShowCreateBusinessForm] = useState(false);
+  const [newBusinessLegalName, setNewBusinessLegalName] = useState("");
+  const [newBusinessJurisdiction, setNewBusinessJurisdiction] = useState("");
+  const [newBusinessRegistrationNumber, setNewBusinessRegistrationNumber] = useState("");
+  const [newBusinessCurrency, setNewBusinessCurrency] = useState("USD");
+  const [newBusinessMerchantEndpoints, setNewBusinessMerchantEndpoints] = useState("");
+
+  const loadRolesAndBusinesses = async () => {
+    try {
+      const r = await invoke<RoleProfile[]>("list_roles");
+      setRoles(r || []);
+    } catch (e) {
+      console.warn("Failed to fetch roles:", e);
+    }
+    try {
+      const b = await invoke<BusinessProfile[]>("list_businesses");
+      setBusinesses(b || []);
+    } catch (e) {
+      console.warn("Failed to fetch businesses:", e);
+    }
+  };
+
+  useEffect(() => {
+    if (initialRoles) setRoles(initialRoles);
+    if (initialBusinesses) setBusinesses(initialBusinesses);
+    if (!initialRoles || !initialBusinesses) {
+      loadRolesAndBusinesses();
+    }
+  }, [initialRoles, initialBusinesses]);
 
   const formatMaskedDid = (did: string): string => {
     if (!did) return "";
@@ -131,6 +194,107 @@ export default function PersonaMatrix({
     }
   };
 
+  const handleCreateRole = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const slug = newRoleNamespace.trim().toLowerCase();
+    if (!slug.match(/^[a-z0-9_-]{1,32}$/)) {
+      setActionError(
+        "Namespace must be 1 to 32 lowercase alphanumeric characters, dashes, or underscores (e.g. dev-dao, acme_corp)."
+      );
+      return;
+    }
+    if (!newRoleTitle.trim()) {
+      setActionError("Role title is required.");
+      return;
+    }
+    if (!newRoleOrgDid.trim()) {
+      setActionError("Organization DID is required.");
+      return;
+    }
+
+    setIsCreatingRole(true);
+    setActionError(null);
+    setActionSuccess(null);
+    try {
+      const delegationScope = newRoleDelegationScope
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      await invoke("create_role_profile", {
+        roleTitle: newRoleTitle.trim(),
+        namespace: slug,
+        organizationDid: newRoleOrgDid.trim(),
+        delegationScope: delegationScope.length > 0 ? delegationScope : null,
+        accreditationVcId: newRoleAccreditationVcId.trim() || null,
+      });
+
+      setNewRoleTitle("");
+      setNewRoleNamespace("");
+      setNewRoleOrgDid("");
+      setNewRoleDelegationScope("");
+      setNewRoleAccreditationVcId("");
+      setShowCreateRoleForm(false);
+      setActionSuccess(`Accredited Role '${newRoleTitle.trim()}' created in namespace '${slug}'`);
+      await loadRolesAndBusinesses();
+      await onRefresh();
+      setTimeout(() => setActionSuccess(null), 3000);
+    } catch (err: any) {
+      setActionError(`Failed to create role profile: ${err.toString()}`);
+    } finally {
+      setIsCreatingRole(false);
+    }
+  };
+
+  const handleCreateBusiness = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newBusinessLegalName.trim()) {
+      setActionError("Business legal name is required.");
+      return;
+    }
+    if (!newBusinessJurisdiction.trim()) {
+      setActionError("Legal jurisdiction is required (e.g. US-DE, UK, SG, CH).");
+      return;
+    }
+
+    setIsCreatingBusiness(true);
+    setActionError(null);
+    setActionSuccess(null);
+    try {
+      const bizId =
+        newBusinessLegalName.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_") ||
+        `biz_${Date.now()}`;
+      const endpoints = newBusinessMerchantEndpoints
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      await invoke("create_business_profile", {
+        businessId: bizId,
+        legalName: newBusinessLegalName.trim(),
+        jurisdiction: newBusinessJurisdiction.trim(),
+        operatingCurrency: newBusinessCurrency.trim() || "USD",
+        registrationNumber: newBusinessRegistrationNumber.trim() || null,
+        merchantEndpoints: endpoints,
+      });
+
+      setNewBusinessLegalName("");
+      setNewBusinessJurisdiction("");
+      setNewBusinessRegistrationNumber("");
+      setNewBusinessCurrency("USD");
+      setNewBusinessMerchantEndpoints("");
+      setShowCreateBusinessForm(false);
+      setActionSuccess(`Business profile '${newBusinessLegalName.trim()}' created successfully`);
+      await loadRolesAndBusinesses();
+      await onRefresh();
+      setTimeout(() => setActionSuccess(null), 3000);
+    } catch (err: any) {
+      setActionError(`Failed to create business profile: ${err.toString()}`);
+    } finally {
+      setIsCreatingBusiness(false);
+    }
+  };
+
   // Group profiles into the 3 hierarchical tiers
   const anchorProfiles = profiles.filter(
     (p) => p.level === 0 || p.derivation_index === 0 || p.is_system_reserved,
@@ -206,6 +370,89 @@ export default function PersonaMatrix({
         </div>
       )}
 
+      {/* Trust Tier Quick-Toggle Bar */}
+      <div className="trust-tier-bar" style={{ marginBottom: "1.25rem" }}>
+        <div
+          className={`trust-tier-card ${expandedTiers.level0 ? "active" : ""}`}
+          onClick={() => toggleTier("level0")}
+          title="Toggle Level 0 — Anchor Sanctum"
+          role="button"
+          tabIndex={0}
+        >
+          <div className="trust-tier-label">L0 • Anchor</div>
+          <div className="trust-tier-count">
+            {anchorProfiles.length}
+            <span style={{ fontSize: "0.75rem", marginLeft: "0.35rem", opacity: 0.7 }}>
+              {expandedTiers.level0 ? "▼" : "▶"}
+            </span>
+          </div>
+        </div>
+
+        <div
+          className={`trust-tier-card level-1 ${expandedTiers.level1 ? "active" : ""}`}
+          onClick={() => toggleTier("level1")}
+          title="Toggle Level 1 — Primary Identity"
+          role="button"
+          tabIndex={0}
+        >
+          <div className="trust-tier-label">L1 • Primary</div>
+          <div className="trust-tier-count">
+            {primaryProfiles.length}
+            <span style={{ fontSize: "0.75rem", marginLeft: "0.35rem", opacity: 0.7 }}>
+              {expandedTiers.level1 ? "▼" : "▶"}
+            </span>
+          </div>
+        </div>
+
+        <div
+          className={`trust-tier-card level-2 ${expandedTiers.level2 ? "active" : ""}`}
+          onClick={() => toggleTier("level2")}
+          title="Toggle Level 2 — Contextual / Burner Personas"
+          role="button"
+          tabIndex={0}
+        >
+          <div className="trust-tier-label">L2 • Burners</div>
+          <div className="trust-tier-count">
+            {burnerProfiles.length}
+            <span style={{ fontSize: "0.75rem", marginLeft: "0.35rem", opacity: 0.7 }}>
+              {expandedTiers.level2 ? "▼" : "▶"}
+            </span>
+          </div>
+        </div>
+
+        <div
+          className={`trust-tier-card level-3 ${expandedTiers.level3 ? "active" : ""}`}
+          onClick={() => toggleTier("level3")}
+          title="Toggle Level 3 — Accredited Roles & Collectives"
+          role="button"
+          tabIndex={0}
+        >
+          <div className="trust-tier-label">L3 • Roles</div>
+          <div className="trust-tier-count">
+            {roles.length}
+            <span style={{ fontSize: "0.75rem", marginLeft: "0.35rem", opacity: 0.7 }}>
+              {expandedTiers.level3 ? "▼" : "▶"}
+            </span>
+          </div>
+        </div>
+
+        <div
+          className={`trust-tier-card level-4 ${expandedTiers.level4 ? "active" : ""}`}
+          onClick={() => toggleTier("level4")}
+          title="Toggle Level 4 — Business & Commerce Profiles"
+          role="button"
+          tabIndex={0}
+        >
+          <div className="trust-tier-label">L4 • Commerce</div>
+          <div className="trust-tier-count">
+            {businesses.length}
+            <span style={{ fontSize: "0.75rem", marginLeft: "0.35rem", opacity: 0.7 }}>
+              {expandedTiers.level4 ? "▼" : "▶"}
+            </span>
+          </div>
+        </div>
+      </div>
+
       {/* Level 0: Anchor Sanctum */}
       <div
         className="section"
@@ -215,40 +462,68 @@ export default function PersonaMatrix({
         }}
       >
         <div
+          onClick={() => toggleTier("level0")}
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
             flexWrap: "wrap",
             gap: "0.5rem",
+            cursor: "pointer",
+            userSelect: "none",
           }}
+          role="button"
+          tabIndex={0}
+          aria-expanded={expandedTiers.level0}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <span style={{ fontSize: "1rem", color: "#7c3aed", fontWeight: "bold" }}>
+              {expandedTiers.level0 ? "▼" : "▶"}
+            </span>
             <span style={{ fontSize: "1.3rem" }}>🛡️🔒</span>
             <h3 style={{ margin: 0, color: "#7c3aed" }}>
               Level 0 — Anchor Sanctum (Air-Gapped Root)
             </h3>
           </div>
-          <span
-            style={{
-              background: "#ede9fe",
-              color: "#6d28d9",
-              padding: "0.2rem 0.6rem",
-              borderRadius: "12px",
-              fontSize: "0.75rem",
-              fontWeight: 700,
-              textTransform: "uppercase",
-              letterSpacing: "0.5px",
-              border: "1px solid #ddd6fe",
-            }}
-          >
-            System Reserved • Zero Exposure
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            {!expandedTiers.level0 && (
+              <span
+                style={{
+                  background: "#f3e8ff",
+                  color: "#7e22ce",
+                  padding: "0.2rem 0.6rem",
+                  borderRadius: "12px",
+                  fontSize: "0.75rem",
+                  fontWeight: 600,
+                  border: "1px solid #e9d5ff",
+                }}
+              >
+                Shielded Root — Tap to Expand
+              </span>
+            )}
+            <span
+              style={{
+                background: "#ede9fe",
+                color: "#6d28d9",
+                padding: "0.2rem 0.6rem",
+                borderRadius: "12px",
+                fontSize: "0.75rem",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+                border: "1px solid #ddd6fe",
+              }}
+            >
+              System Reserved • Zero Exposure
+            </span>
+          </div>
         </div>
 
-        <div
-          style={{
-            background: "#fef3c7",
+        {expandedTiers.level0 && (
+          <div style={{ marginTop: "0.75rem" }}>
+            <div
+              style={{
+                background: "#fef3c7",
             color: "#92400e",
             padding: "0.6rem 0.85rem",
             borderRadius: "6px",
@@ -407,6 +682,8 @@ export default function PersonaMatrix({
             )}
           </div>
         ))}
+          </div>
+        )}
       </div>
 
       {/* Level 1: Public Persona */}
@@ -418,15 +695,24 @@ export default function PersonaMatrix({
         }}
       >
         <div
+          onClick={() => toggleTier("level1")}
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
             flexWrap: "wrap",
             gap: "0.5rem",
+            cursor: "pointer",
+            userSelect: "none",
           }}
+          role="button"
+          tabIndex={0}
+          aria-expanded={expandedTiers.level1}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <span style={{ fontSize: "1rem", color: "#2563eb", fontWeight: "bold" }}>
+              {expandedTiers.level1 ? "▼" : "▶"}
+            </span>
             <span style={{ fontSize: "1.3rem" }}>👤</span>
             <h3 style={{ margin: 0, color: "#2563eb" }}>
               Level 1 — Primary Identity (Public Persona)
@@ -447,7 +733,9 @@ export default function PersonaMatrix({
           </span>
         </div>
 
-        <p style={{ fontSize: "0.85rem", color: "#4b5563", margin: "0.5rem 0 1rem" }}>
+        {expandedTiers.level1 && (
+          <div style={{ marginTop: "0.75rem" }}>
+            <p style={{ fontSize: "0.85rem", color: "#4b5563", margin: "0.5rem 0 1rem" }}>
           Default sovereign persona used for standard Nostr social broadcasting,
           Verifiable Credentials, and public signing requests.
         </p>
@@ -616,9 +904,11 @@ export default function PersonaMatrix({
                   </div>
                 </div>
               )}
-            </div>
-          );
-        })}
+              </div>
+            );
+          })}
+          </div>
+        )}
       </div>
 
       {/* Level 2+: Contextual / Burner Personas */}
@@ -630,15 +920,24 @@ export default function PersonaMatrix({
         }}
       >
         <div
+          onClick={() => toggleTier("level2")}
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
             flexWrap: "wrap",
             gap: "0.5rem",
+            cursor: "pointer",
+            userSelect: "none",
           }}
+          role="button"
+          tabIndex={0}
+          aria-expanded={expandedTiers.level2}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <span style={{ fontSize: "1rem", color: "#059669", fontWeight: "bold" }}>
+              {expandedTiers.level2 ? "▼" : "▶"}
+            </span>
             <span style={{ fontSize: "1.3rem" }}>🎭🔥</span>
             <h3 style={{ margin: 0, color: "#059669" }}>
               Level 2+ — Contextual / Burner Identities ({burnerProfiles.length})
@@ -659,7 +958,9 @@ export default function PersonaMatrix({
           </span>
         </div>
 
-        <p style={{ fontSize: "0.85rem", color: "#4b5563", margin: "0.5rem 0 1rem" }}>
+        {expandedTiers.level2 && (
+          <div style={{ marginTop: "0.75rem" }}>
+            <p style={{ fontSize: "0.85rem", color: "#4b5563", margin: "0.5rem 0 1rem" }}>
           Contextual burner personas isolate distinct communities, sensitive
           topics, and P2P sockets without leaking your primary identity.
         </p>
@@ -897,6 +1198,835 @@ export default function PersonaMatrix({
                 </div>
               );
             })}
+          </div>
+        )}
+          </div>
+        )}
+      </div>
+
+      {/* Level 3: Accredited Roles & Collectives */}
+      <div
+        className="section"
+        style={{
+          borderLeft: "4px solid #d97706",
+          background: "rgba(217, 119, 6, 0.03)",
+        }}
+      >
+        <div
+          onClick={() => toggleTier("level3")}
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "0.5rem",
+            cursor: "pointer",
+            userSelect: "none",
+          }}
+          role="button"
+          tabIndex={0}
+          aria-expanded={expandedTiers.level3}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <span style={{ fontSize: "1rem", color: "#d97706", fontWeight: "bold" }}>
+              {expandedTiers.level3 ? "▼" : "▶"}
+            </span>
+            <span style={{ fontSize: "1.3rem" }}>🏛️📜</span>
+            <h3 style={{ margin: 0, color: "#d97706" }}>
+              Level 3 — Accredited Roles & Collectives ({roles.length})
+            </h3>
+          </div>
+          <span
+            style={{
+              background: "#fef3c7",
+              color: "#92400e",
+              padding: "0.2rem 0.6rem",
+              borderRadius: "12px",
+              fontSize: "0.75rem",
+              fontWeight: 700,
+              border: "1px solid #fde68a",
+            }}
+          >
+            Accredited Role Isolation
+          </span>
+        </div>
+
+        {expandedTiers.level3 && (
+          <div style={{ marginTop: "0.75rem" }}>
+            <p style={{ fontSize: "0.85rem", color: "#4b5563", margin: "0.5rem 0 0.75rem" }}>
+              Accredited organizational roles, collective delegations, and DAO authority paths.
+              Derived deterministically under isolated namespace derivation subtrees.
+            </p>
+
+            <div
+              style={{
+                background: "#fffbeb",
+                color: "#92400e",
+                padding: "0.6rem 0.85rem",
+                borderRadius: "6px",
+                margin: "0.75rem 0",
+                fontSize: "0.85rem",
+                border: "1px solid #fde68a",
+                lineHeight: "1.4",
+              }}
+            >
+              🔒 <strong>Fail-Closed Security Notice:</strong> Level 3 identities are isolated from public social feeds and dApp bridges. WebSocket bridge signing requests for Level 3 profiles are rejected by default.
+            </div>
+
+            {/* Toggle create role form */}
+            <div style={{ margin: "1rem 0" }}>
+              {!showCreateRoleForm ? (
+                <button
+                  onClick={() => setShowCreateRoleForm(true)}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    fontSize: "0.85rem",
+                    fontWeight: 600,
+                    borderRadius: "6px",
+                    background: "#fef3c7",
+                    color: "#b45309",
+                    border: "1px solid #fcd34d",
+                    cursor: "pointer",
+                  }}
+                >
+                  + Create Accredited Role Profile
+                </button>
+              ) : (
+                <form
+                  onSubmit={handleCreateRole}
+                  style={{
+                    background: "white",
+                    padding: "1rem",
+                    borderRadius: "8px",
+                    border: "1px solid #fde68a",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "0.75rem",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <h4 style={{ margin: 0, color: "#92400e", fontSize: "0.95rem" }}>
+                      New Accredited Role Profile
+                    </h4>
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateRoleForm(false)}
+                      style={{
+                        background: "none",
+                        border: "none",
+                        color: "#9ca3af",
+                        cursor: "pointer",
+                        fontSize: "1rem",
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Role Title *
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Treasury Signer, Lead Auditor, Guild Steward"
+                      value={newRoleTitle}
+                      onChange={(e) => setNewRoleTitle(e.target.value)}
+                      required
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Namespace (Slug: a-z, 0-9, -, _) *
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. dev-dao, acme_corp, open-syndicate"
+                      value={newRoleNamespace}
+                      onChange={(e) => setNewRoleNamespace(e.target.value.toLowerCase())}
+                      pattern="^[a-z0-9_-]{1,32}$"
+                      title="1 to 32 lowercase alphanumeric characters, dashes, or underscores"
+                      required
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                        fontFamily: "monospace",
+                      }}
+                    />
+                    <span style={{ fontSize: "0.75rem", color: "#6b7280" }}>
+                      Subtree derivation path: iyou/role/{newRoleNamespace || "<namespace>"}/[index]
+                    </span>
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Organization DID *
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="did:key:... or did:ion:..."
+                      value={newRoleOrgDid}
+                      onChange={(e) => setNewRoleOrgDid(e.target.value)}
+                      required
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                        fontFamily: "monospace",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Delegation Scope (Optional, comma-separated)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. sign_proposals, approve_transfers, audit_logs"
+                      value={newRoleDelegationScope}
+                      onChange={(e) => setNewRoleDelegationScope(e.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Accreditation VC ID (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. urn:uuid:... or VC credential ID"
+                      value={newRoleAccreditationVcId}
+                      onChange={(e) => setNewRoleAccreditationVcId(e.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                        fontFamily: "monospace",
+                      }}
+                    />
+                  </div>
+
+                  <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                    <button
+                      type="submit"
+                      disabled={isCreatingRole}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        borderRadius: "6px",
+                        background: "#d97706",
+                        color: "white",
+                        border: "none",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {isCreatingRole ? "Deriving Role Key..." : "Create Role Profile"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateRoleForm(false)}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        borderRadius: "6px",
+                        background: "#e5e7eb",
+                        color: "#374151",
+                        border: "none",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+
+            {/* List Roles */}
+            {roles.length === 0 ? (
+              <div
+                style={{
+                  padding: "1.5rem",
+                  textAlign: "center",
+                  background: "white",
+                  borderRadius: "8px",
+                  border: "1px dashed #d1d5db",
+                  color: "#6b7280",
+                  fontSize: "0.85rem",
+                }}
+              >
+                No Level 3 Accredited Roles provisioned yet. Use the button above to add a role identity bound to an organization.
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                {roles.map((r) => {
+                  const isActive = r.did === activeDid;
+                  return (
+                    <div
+                      key={r.role_id}
+                      style={{
+                        padding: "0.85rem",
+                        borderRadius: "8px",
+                        background: isActive ? "#fffbeb" : "white",
+                        border: isActive ? "1px solid #d97706" : "1px solid #e5e7eb",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: "0.5rem",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                          <span style={{ fontWeight: 600, color: "#111827", fontSize: "0.95rem" }}>
+                            {r.role_title}
+                          </span>
+                          <span
+                            style={{
+                              background: "#fef3c7",
+                              color: "#b45309",
+                              padding: "0.15rem 0.5rem",
+                              borderRadius: "6px",
+                              fontSize: "0.75rem",
+                              fontWeight: 700,
+                              border: "1px solid #fde68a",
+                              fontFamily: "monospace",
+                            }}
+                          >
+                            ns:{r.namespace} #{r.role_index}
+                          </span>
+                          <span
+                            style={{
+                              background: "#f3f4f6",
+                              color: "#4b5563",
+                              padding: "0.15rem 0.4rem",
+                              borderRadius: "4px",
+                              fontSize: "0.7rem",
+                              fontWeight: 600,
+                            }}
+                          >
+                            L3
+                          </span>
+                          {isActive && (
+                            <span
+                              style={{
+                                background: "#dcfce7",
+                                color: "#15803d",
+                                padding: "0.15rem 0.4rem",
+                                borderRadius: "4px",
+                                fontSize: "0.7rem",
+                                fontWeight: 700,
+                              }}
+                            >
+                              ● ACTIVE
+                            </span>
+                          )}
+                        </div>
+
+                        <div style={{ display: "flex", gap: "0.4rem" }}>
+                          <button
+                            onClick={() => copyToClipboard(r.did, `role-did-${r.role_id}`)}
+                            style={{
+                              padding: "0.25rem 0.6rem",
+                              fontSize: "0.75rem",
+                              borderRadius: "4px",
+                              border: "1px solid #d1d5db",
+                              background: "white",
+                              cursor: "pointer",
+                            }}
+                          >
+                            {copiedKey === `role-did-${r.role_id}` ? "✓ Copied DID" : "📋 Copy DID"}
+                          </button>
+                          <button
+                            onClick={() => copyToClipboard(r.nostr_pubkey_hex, `role-hex-${r.role_id}`)}
+                            style={{
+                              padding: "0.25rem 0.6rem",
+                              fontSize: "0.75rem",
+                              borderRadius: "4px",
+                              border: "1px solid #d1d5db",
+                              background: "white",
+                              cursor: "pointer",
+                            }}
+                          >
+                            {copiedKey === `role-hex-${r.role_id}` ? "✓ Copied Hex" : "📋 Copy Key"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "#4b5563", display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                        <div>
+                          <strong>DID:</strong>{" "}
+                          <span style={{ fontFamily: "monospace" }}>{truncateString(r.did, 24, 10)}</span>
+                        </div>
+                        <div>
+                          <strong>Org DID:</strong>{" "}
+                          <span style={{ fontFamily: "monospace" }}>{truncateString(r.organization_did, 24, 10)}</span>
+                        </div>
+                        <div>
+                          <strong>Nostr Key:</strong>{" "}
+                          <span style={{ fontFamily: "monospace" }}>{truncateString(r.nostr_pubkey_hex, 16, 8)}</span>
+                        </div>
+                        {r.delegation_scope && r.delegation_scope.length > 0 && (
+                          <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap", marginTop: "0.2rem" }}>
+                            <strong>Scopes:</strong>
+                            {r.delegation_scope.map((s, idx) => (
+                              <span
+                                key={idx}
+                                style={{
+                                  background: "#fef9c3",
+                                  color: "#854d0e",
+                                  padding: "0.1rem 0.4rem",
+                                  borderRadius: "4px",
+                                  fontSize: "0.7rem",
+                                }}
+                              >
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {r.accreditation_vc_id && (
+                          <div>
+                            <strong>VC Credential:</strong>{" "}
+                            <span style={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{r.accreditation_vc_id}</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Level 4: Business & Commerce Profiles */}
+      <div
+        className="section"
+        style={{
+          borderLeft: "4px solid #0891b2",
+          background: "rgba(8, 145, 178, 0.03)",
+        }}
+      >
+        <div
+          onClick={() => toggleTier("level4")}
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "0.5rem",
+            cursor: "pointer",
+            userSelect: "none",
+          }}
+          role="button"
+          tabIndex={0}
+          aria-expanded={expandedTiers.level4}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <span style={{ fontSize: "1rem", color: "#0891b2", fontWeight: "bold" }}>
+              {expandedTiers.level4 ? "▼" : "▶"}
+            </span>
+            <span style={{ fontSize: "1.3rem" }}>🏢💼</span>
+            <h3 style={{ margin: 0, color: "#0891b2" }}>
+              Level 4 — Business & Commerce Profiles ({businesses.length})
+            </h3>
+          </div>
+          <span
+            style={{
+              background: "#cffafe",
+              color: "#0e7490",
+              padding: "0.2rem 0.6rem",
+              borderRadius: "12px",
+              fontSize: "0.75rem",
+              fontWeight: 700,
+              border: "1px solid #a5f3fc",
+            }}
+          >
+            Commercial Isolation
+          </span>
+        </div>
+
+        {expandedTiers.level4 && (
+          <div style={{ marginTop: "0.75rem" }}>
+            <p style={{ fontSize: "0.85rem", color: "#4b5563", margin: "0.5rem 0 0.75rem" }}>
+              Commercial entities, merchant profiles, and corporate identities with legally registered jurisdictions.
+            </p>
+
+            <div
+              style={{
+                background: "#ecfeff",
+                color: "#155e75",
+                padding: "0.6rem 0.85rem",
+                borderRadius: "6px",
+                margin: "0.75rem 0",
+                fontSize: "0.85rem",
+                border: "1px solid #a5f3fc",
+                lineHeight: "1.4",
+              }}
+            >
+              🔒 <strong>Commercial Boundary:</strong> Level 4 identities operate under commercial isolation. Bridge access denied to prevent cross-contamination with personal and social keys.
+            </div>
+
+            {/* Toggle create business form */}
+            <div style={{ margin: "1rem 0" }}>
+              {!showCreateBusinessForm ? (
+                <button
+                  onClick={() => setShowCreateBusinessForm(true)}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    fontSize: "0.85rem",
+                    fontWeight: 600,
+                    borderRadius: "6px",
+                    background: "#cffafe",
+                    color: "#0e7490",
+                    border: "1px solid #67e8f9",
+                    cursor: "pointer",
+                  }}
+                >
+                  + Create Business Profile
+                </button>
+              ) : (
+                <form
+                  onSubmit={handleCreateBusiness}
+                  style={{
+                    background: "white",
+                    padding: "1rem",
+                    borderRadius: "8px",
+                    border: "1px solid #a5f3fc",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "0.75rem",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <h4 style={{ margin: 0, color: "#0e7490", fontSize: "0.95rem" }}>
+                      New Business & Commerce Profile
+                    </h4>
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateBusinessForm(false)}
+                      style={{
+                        background: "none",
+                        border: "none",
+                        color: "#9ca3af",
+                        cursor: "pointer",
+                        fontSize: "1rem",
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Business Legal Name *
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Acme Corp LLC, Satoshi Enterprises Ltd"
+                      value={newBusinessLegalName}
+                      onChange={(e) => setNewBusinessLegalName(e.target.value)}
+                      required
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Legal Jurisdiction *
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. US-DE, UK, SG, CH, EE"
+                      value={newBusinessJurisdiction}
+                      onChange={(e) => setNewBusinessJurisdiction(e.target.value)}
+                      required
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Registration / Tax Number (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. EIN, VAT, LEI, Company Number"
+                      value={newBusinessRegistrationNumber}
+                      onChange={(e) => setNewBusinessRegistrationNumber(e.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Operating Currency (Default: USD)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. USD, EUR, GBP, SAT"
+                      value={newBusinessCurrency}
+                      onChange={(e) => setNewBusinessCurrency(e.target.value.toUpperCase())}
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 600, color: "#374151", marginBottom: "0.25rem" }}>
+                      Merchant Endpoints (Optional, comma-separated URLs)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. https://store.example.com/api, https://pay.example.com"
+                      value={newBusinessMerchantEndpoints}
+                      onChange={(e) => setNewBusinessMerchantEndpoints(e.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "0.5rem",
+                        borderRadius: "6px",
+                        border: "1px solid #d1d5db",
+                        fontSize: "0.85rem",
+                      }}
+                    />
+                  </div>
+
+                  <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                    <button
+                      type="submit"
+                      disabled={isCreatingBusiness}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        borderRadius: "6px",
+                        background: "#0891b2",
+                        color: "white",
+                        border: "none",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {isCreatingBusiness ? "Deriving Business Key..." : "Create Business Profile"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateBusinessForm(false)}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        borderRadius: "6px",
+                        background: "#e5e7eb",
+                        color: "#374151",
+                        border: "none",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+
+            {/* List Businesses */}
+            {businesses.length === 0 ? (
+              <div
+                style={{
+                  padding: "1.5rem",
+                  textAlign: "center",
+                  background: "white",
+                  borderRadius: "8px",
+                  border: "1px dashed #d1d5db",
+                  color: "#6b7280",
+                  fontSize: "0.85rem",
+                }}
+              >
+                No Level 4 Business profiles provisioned yet. Use the button above to register an enterprise identity.
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                {businesses.map((b) => {
+                  return (
+                    <div
+                      key={b.business_id}
+                      style={{
+                        padding: "0.85rem",
+                        borderRadius: "8px",
+                        background: "white",
+                        border: "1px solid #e5e7eb",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: "0.5rem",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                          <span style={{ fontWeight: 600, color: "#111827", fontSize: "0.95rem" }}>
+                            {b.legal_name}
+                          </span>
+                          <span
+                            style={{
+                              background: "#cffafe",
+                              color: "#0e7490",
+                              padding: "0.15rem 0.5rem",
+                              borderRadius: "6px",
+                              fontSize: "0.75rem",
+                              fontWeight: 700,
+                              border: "1px solid #a5f3fc",
+                            }}
+                          >
+                            Jurisdiction: {b.jurisdiction}
+                          </span>
+                          <span
+                            style={{
+                              background: "#f3f4f6",
+                              color: "#4b5563",
+                              padding: "0.15rem 0.4rem",
+                              borderRadius: "4px",
+                              fontSize: "0.7rem",
+                              fontWeight: 600,
+                            }}
+                          >
+                            L4 #{b.business_index}
+                          </span>
+                          <span
+                            style={{
+                              background: "#f0fdf4",
+                              color: "#166534",
+                              padding: "0.15rem 0.4rem",
+                              borderRadius: "4px",
+                              fontSize: "0.7rem",
+                              fontWeight: 600,
+                              border: "1px solid #bbf7d0",
+                            }}
+                          >
+                            {b.operating_currency}
+                          </span>
+                        </div>
+
+                        <div style={{ display: "flex", gap: "0.4rem" }}>
+                          <button
+                            onClick={() => copyToClipboard(b.did, `biz-did-${b.business_id}`)}
+                            style={{
+                              padding: "0.25rem 0.6rem",
+                              fontSize: "0.75rem",
+                              borderRadius: "4px",
+                              border: "1px solid #d1d5db",
+                              background: "white",
+                              cursor: "pointer",
+                            }}
+                          >
+                            {copiedKey === `biz-did-${b.business_id}` ? "✓ Copied DID" : "📋 Copy DID"}
+                          </button>
+                          <button
+                            onClick={() => copyToClipboard(b.nostr_pubkey_hex, `biz-hex-${b.business_id}`)}
+                            style={{
+                              padding: "0.25rem 0.6rem",
+                              fontSize: "0.75rem",
+                              borderRadius: "4px",
+                              border: "1px solid #d1d5db",
+                              background: "white",
+                              cursor: "pointer",
+                            }}
+                          >
+                            {copiedKey === `biz-hex-${b.business_id}` ? "✓ Copied Hex" : "📋 Copy Key"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "#4b5563", display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                        <div>
+                          <strong>DID:</strong>{" "}
+                          <span style={{ fontFamily: "monospace" }}>{truncateString(b.did, 24, 10)}</span>
+                        </div>
+                        <div>
+                          <strong>Nostr Key:</strong>{" "}
+                          <span style={{ fontFamily: "monospace" }}>{truncateString(b.nostr_pubkey_hex, 16, 8)}</span>
+                        </div>
+                        {b.registration_number && (
+                          <div>
+                            <strong>Registration / Tax ID:</strong> {b.registration_number}
+                          </div>
+                        )}
+                        {b.merchant_endpoints && b.merchant_endpoints.length > 0 && (
+                          <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap", marginTop: "0.2rem" }}>
+                            <strong>Endpoints:</strong>
+                            {b.merchant_endpoints.map((ep, idx) => (
+                              <span
+                                key={idx}
+                                style={{
+                                  background: "#ecfeff",
+                                  color: "#0e7490",
+                                  padding: "0.1rem 0.4rem",
+                                  borderRadius: "4px",
+                                  fontSize: "0.7rem",
+                                  fontFamily: "monospace",
+                                }}
+                              >
+                                {ep}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </div>

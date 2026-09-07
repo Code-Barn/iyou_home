@@ -101,6 +101,52 @@ pub struct DependentProvisioningBundle {
     pub exported_at: u64,
 }
 
+fn default_role_level() -> u8 {
+    3
+}
+
+fn default_business_level() -> u8 {
+    4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleProfile {
+    pub role_id: String,
+    pub role_title: String,
+    pub namespace: String,
+    pub role_index: u32,
+    pub did: String,
+    pub nostr_pubkey_hex: String,
+    pub organization_did: String,
+    #[serde(default)]
+    pub accreditation_vc_id: Option<String>,
+    #[serde(default)]
+    pub delegation_scope: Vec<String>,
+    #[serde(default = "default_role_level")]
+    pub level: u8,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessProfile {
+    pub business_id: String,
+    pub legal_name: String,
+    pub business_index: u32,
+    pub did: String,
+    pub nostr_pubkey_hex: String,
+    pub jurisdiction: String,
+    #[serde(default)]
+    pub registration_number: Option<String>,
+    pub operating_currency: String,
+    #[serde(default)]
+    pub merchant_endpoints: Vec<String>,
+    #[serde(default = "default_business_level")]
+    pub level: u8,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
 impl Profile {
     pub fn is_anchor(&self) -> bool {
         self.level == 0 || self.derivation_index == 0
@@ -129,6 +175,10 @@ pub struct VaultStore {
     pub sovereign_identities: Vec<SovereignIdentity>,
     #[serde(default)]
     pub dependents: Vec<DependentProfile>,
+    #[serde(default)]
+    pub roles: Vec<RoleProfile>,
+    #[serde(default)]
+    pub businesses: Vec<BusinessProfile>,
 }
 
 impl VaultStore {
@@ -721,6 +771,8 @@ pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
         profiles: initial_profiles(&seed),
         sovereign_identities: Vec::new(),
         dependents: Vec::new(),
+        roles: Vec::new(),
+        businesses: Vec::new(),
     };
 
     save_vault_inner(path, &vault)?;
@@ -1355,6 +1407,8 @@ pub fn import_graduated_dependent(
         profiles: vec![anchor_profile, primary_profile],
         sovereign_identities: vec![sovereign_record],
         dependents: Vec::new(),
+        roles: Vec::new(),
+        businesses: Vec::new(),
     })
 }
 
@@ -1619,6 +1673,229 @@ pub fn graduate_dependent(
     };
 
     Ok(bundle)
+}
+
+// ---------- Level 3 Accredited Roles & Level 4 Commerce Profiles ----------
+
+pub fn validate_namespace_slug(namespace: &str) -> Result<(), String> {
+    if namespace.is_empty() || namespace.len() > 32 {
+        return Err("Namespace slug must be between 1 and 32 characters".to_string());
+    }
+    for b in namespace.bytes() {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'_' && b != b'-' {
+            return Err(format!(
+                "Invalid character in namespace slug: '{}'. Only lowercase ASCII [a-z0-9_-] allowed.",
+                b as char
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn derive_role_identity(
+    root_seed: &[u8],
+    namespace: &str,
+    role_index: u32,
+) -> Result<DerivedKeypair, String> {
+    validate_namespace_slug(namespace)?;
+    if root_seed.len() != 32 {
+        return Err("Root seed must be 32 bytes".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(root_seed);
+    hasher.update(b"iyou/role/");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"/");
+    hasher.update(&role_index.to_le_bytes());
+    let hash = hasher.finalize();
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash);
+    let signing_key = SigningKey::from_bytes(&arr);
+    let verifying_key = signing_key.verifying_key();
+    let did = format!("did:key:{}", ed25519_multibase(verifying_key.as_bytes()));
+
+    Ok(DerivedKeypair {
+        signing_key,
+        verifying_key,
+        did,
+    })
+}
+
+pub fn derive_role_nostr_pubkey(
+    root_seed: &[u8],
+    namespace: &str,
+    role_index: u32,
+) -> Result<String, String> {
+    validate_namespace_slug(namespace)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"secp256k1-nostr/role/");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"/");
+    hasher.update(root_seed);
+    hasher.update(&role_index.to_le_bytes());
+    let hash = hasher.finalize();
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash);
+    let key = SecpSigningKey::from_bytes(&arr)
+        .map_err(|e| format!("Invalid secp256k1 scalar for role: {}", e))?;
+    Ok(hex::encode(key.verifying_key().to_bytes()))
+}
+
+pub fn create_role_profile(
+    vault: &mut VaultStore,
+    role_title: String,
+    namespace: String,
+    organization_did: String,
+    delegation_scope: Vec<String>,
+) -> Result<RoleProfile, String> {
+    validate_namespace_slug(&namespace)?;
+    let seed = decode_root_seed(vault)?;
+
+    // Monotonic counter decoupled per namespace
+    let next_index = vault
+        .roles
+        .iter()
+        .filter(|r| r.namespace == namespace)
+        .map(|r| r.role_index)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+
+    let kp = derive_role_identity(&seed, &namespace, next_index)?;
+    let nostr_pubkey_hex = derive_role_nostr_pubkey(&seed, &namespace, next_index)?;
+
+    let role_id = format!("role_{}_{}", namespace, next_index);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let role = RoleProfile {
+        role_id,
+        role_title,
+        namespace,
+        role_index: next_index,
+        did: kp.did,
+        nostr_pubkey_hex,
+        organization_did,
+        accreditation_vc_id: None,
+        delegation_scope,
+        level: 3,
+        created_at: now,
+    };
+
+    vault.roles.push(role.clone());
+    Ok(role)
+}
+
+pub fn list_roles(vault: &VaultStore) -> Vec<RoleProfile> {
+    vault.roles.clone()
+}
+
+pub fn derive_business_identity(
+    root_seed: &[u8],
+    business_id: &str,
+    business_index: u32,
+) -> Result<DerivedKeypair, String> {
+    validate_namespace_slug(business_id)?;
+    if root_seed.len() != 32 {
+        return Err("Root seed must be 32 bytes".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(root_seed);
+    hasher.update(b"iyou/business/");
+    hasher.update(business_id.as_bytes());
+    hasher.update(b"/");
+    hasher.update(&business_index.to_le_bytes());
+    let hash = hasher.finalize();
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash);
+    let signing_key = SigningKey::from_bytes(&arr);
+    let verifying_key = signing_key.verifying_key();
+    let did = format!("did:key:{}", ed25519_multibase(verifying_key.as_bytes()));
+
+    Ok(DerivedKeypair {
+        signing_key,
+        verifying_key,
+        did,
+    })
+}
+
+pub fn derive_business_nostr_pubkey(
+    root_seed: &[u8],
+    business_id: &str,
+    business_index: u32,
+) -> Result<String, String> {
+    validate_namespace_slug(business_id)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"secp256k1-nostr/business/");
+    hasher.update(business_id.as_bytes());
+    hasher.update(b"/");
+    hasher.update(root_seed);
+    hasher.update(&business_index.to_le_bytes());
+    let hash = hasher.finalize();
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash);
+    let key = SecpSigningKey::from_bytes(&arr)
+        .map_err(|e| format!("Invalid secp256k1 scalar for business: {}", e))?;
+    Ok(hex::encode(key.verifying_key().to_bytes()))
+}
+
+pub fn create_business_profile(
+    vault: &mut VaultStore,
+    business_id: String,
+    legal_name: String,
+    jurisdiction: String,
+    operating_currency: String,
+    registration_number: Option<String>,
+    merchant_endpoints: Vec<String>,
+) -> Result<BusinessProfile, String> {
+    validate_namespace_slug(&business_id)?;
+    if vault.businesses.iter().any(|b| b.business_id == business_id) {
+        return Err(format!("Business ID '{}' already exists", business_id));
+    }
+
+    let seed = decode_root_seed(vault)?;
+    let next_index = vault
+        .businesses
+        .iter()
+        .map(|b| b.business_index)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+
+    let kp = derive_business_identity(&seed, &business_id, next_index)?;
+    let nostr_pubkey_hex = derive_business_nostr_pubkey(&seed, &business_id, next_index)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let biz = BusinessProfile {
+        business_id,
+        legal_name,
+        business_index: next_index,
+        did: kp.did,
+        nostr_pubkey_hex,
+        jurisdiction,
+        registration_number,
+        operating_currency,
+        merchant_endpoints,
+        level: 4,
+        created_at: now,
+    };
+
+    vault.businesses.push(biz.clone());
+    Ok(biz)
+}
+
+pub fn list_businesses(vault: &VaultStore) -> Vec<BusinessProfile> {
+    vault.businesses.clone()
 }
 
 /// Validate and ingest a W3C Verifiable Credential into a specified profile.
@@ -2294,6 +2571,8 @@ mod tests {
             profiles: vec![full.profiles[0].clone()],
             sovereign_identities: Vec::new(),
             dependents: Vec::new(),
+            roles: Vec::new(),
+            businesses: Vec::new(),
         };
         save_vault_inner(path, &legacy).expect("Should persist legacy vault");
         let seed = bs58::decode(&legacy.root_seed_base58)
@@ -2372,6 +2651,8 @@ mod tests {
             }],
             sovereign_identities: Vec::new(),
             dependents: Vec::new(),
+            roles: Vec::new(),
+            businesses: Vec::new(),
         };
         save_vault_inner(&path, &squatting).expect("Should persist squatting vault");
         let anchor_did = squatting.profiles[0].did.clone();
@@ -3198,6 +3479,8 @@ mod tests {
             profiles: vec![],
             sovereign_identities: vec![],
             dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
         };
 
         let hex = reveal_root_seed_hex(&vault).expect("Should reveal seed");
@@ -3221,6 +3504,8 @@ mod tests {
             profiles: vec![],
             sovereign_identities: vec![],
             dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
         };
         vault.profiles = initial_profiles(&seed);
 
@@ -3316,6 +3601,8 @@ mod tests {
             profiles: initial_profiles(&seed),
             sovereign_identities: vec![],
             dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
         };
         fs::write(tmp.join("vault.json"), serde_json::to_string_pretty(&vault).unwrap()).unwrap();
 
@@ -3441,6 +3728,8 @@ mod tests {
             }],
             sovereign_identities: vec![],
             dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
         };
 
         let backup_bytes = export_vault_backup(&vault, &tmp, "safe-password")
@@ -3474,6 +3763,8 @@ mod tests {
             profiles: vec![],
             sovereign_identities: vec![],
             dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
         };
 
         let backup_bytes = export_vault_backup(&vault, &tmp, "correct-password")
@@ -3753,6 +4044,128 @@ mod tests {
 
         let vault: VaultStore = serde_json::from_str(raw_legacy).expect("Deserialization succeeds");
         assert!(vault.dependents.is_empty());
+        assert!(vault.roles.is_empty());
+        assert!(vault.businesses.is_empty());
         assert_eq!(vault.profiles.len(), 1);
+    }
+
+    #[test]
+    fn test_role_derivation_and_namespace_isolation() {
+        let seed = [0x7cu8; 32];
+        let kp0 = derive_role_identity(&seed, "board_dao", 0).expect("Should derive role kp0");
+        let kp1 = derive_role_identity(&seed, "board_dao", 1).expect("Should derive role kp1");
+        let kp_other_ns = derive_role_identity(&seed, "tech_council", 0).expect("Should derive diff ns");
+
+        assert_ne!(kp0.did, kp1.did, "Different indices must yield different DIDs");
+        assert_ne!(kp0.did, kp_other_ns.did, "Different namespaces must yield different DIDs");
+
+        // Orthogonality: must not collide with standard L0/L1/L2 deterministic derivation at same index
+        let standard_kp = derive_deterministic_keypair(&seed, 0);
+        assert_ne!(kp0.did, standard_kp.did, "Role derivation must be orthogonal to standard personas");
+
+        // Nostr derivation
+        let nostr_pk0 = derive_role_nostr_pubkey(&seed, "board_dao", 0).expect("Should derive nostr pk");
+        let nostr_pk1 = derive_role_nostr_pubkey(&seed, "board_dao", 1).expect("Should derive nostr pk 1");
+        assert_ne!(nostr_pk0, nostr_pk1);
+        assert_eq!(nostr_pk0.len(), 64);
+
+        // Namespace slug validation
+        assert!(validate_namespace_slug("valid-namespace_123").is_ok());
+        assert!(validate_namespace_slug("").is_err(), "Empty namespace disallowed");
+        assert!(validate_namespace_slug("Capitalized").is_err(), "Uppercase disallowed");
+        assert!(validate_namespace_slug("path/traversal").is_err(), "Slashes disallowed");
+        assert!(validate_namespace_slug("has.dot").is_err(), "Dots disallowed");
+        assert!(validate_namespace_slug("a_very_long_namespace_slug_that_exceeds_thirty_two_chars").is_err());
+    }
+
+    #[test]
+    fn test_create_role_profile_decoupled_index_allocation() {
+        let path = temp_dir().join("test_vault_roles.json");
+        let _ = fs::remove_file(&path);
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        // Burners in profiles start at 2
+        let burner = add_profile(&mut vault, "burner1".to_string(), "Burner 1".to_string()).unwrap();
+        assert_eq!(burner.derivation_index, 2);
+
+        // Create first role in namespace "audit_committee" -> index 0
+        let r1 = create_role_profile(
+            &mut vault,
+            "Chief Auditor".to_string(),
+            "audit_committee".to_string(),
+            "did:key:z6MkOrg".to_string(),
+            vec!["sign_audit".to_string()],
+        )
+        .expect("Should create role 1");
+        assert_eq!(r1.role_index, 0);
+        assert_eq!(r1.level, 3);
+        assert_eq!(r1.role_id, "role_audit_committee_0");
+
+        // Create second role in same namespace -> index 1
+        let r2 = create_role_profile(
+            &mut vault,
+            "Deputy Auditor".to_string(),
+            "audit_committee".to_string(),
+            "did:key:z6MkOrg".to_string(),
+            vec!["review_audit".to_string()],
+        )
+        .expect("Should create role 2");
+        assert_eq!(r2.role_index, 1);
+        assert_eq!(r2.role_id, "role_audit_committee_1");
+
+        // Create role in different namespace -> index 0 (decoupled per namespace)
+        let r_other = create_role_profile(
+            &mut vault,
+            "Treasurer".to_string(),
+            "finance".to_string(),
+            "did:key:z6MkOrg".to_string(),
+            vec!["approve_budget".to_string()],
+        )
+        .expect("Should create role other ns");
+        assert_eq!(r_other.role_index, 0);
+
+        // Burner index progression remains unaffected: adding another burner must yield 3
+        let burner2 = add_profile(&mut vault, "burner2".to_string(), "Burner 2".to_string()).unwrap();
+        assert_eq!(burner2.derivation_index, 3);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_create_business_profile() {
+        let path = temp_dir().join("test_vault_businesses.json");
+        let _ = fs::remove_file(&path);
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+
+        let biz = create_business_profile(
+            &mut vault,
+            "acme_corp".to_string(),
+            "Acme Corp LLC".to_string(),
+            "US-DE".to_string(),
+            "USD".to_string(),
+            Some("REG-12345".to_string()),
+            vec!["https://pay.acme.com".to_string()],
+        )
+        .expect("Should create business");
+
+        assert_eq!(biz.business_index, 0);
+        assert_eq!(biz.level, 4);
+        assert_eq!(biz.business_id, "acme_corp");
+        assert!(biz.did.starts_with("did:key:z"));
+        assert_eq!(biz.nostr_pubkey_hex.len(), 64);
+
+        // Duplicate business ID fails
+        let dup = create_business_profile(
+            &mut vault,
+            "acme_corp".to_string(),
+            "Acme Copy".to_string(),
+            "US-DE".to_string(),
+            "USD".to_string(),
+            None,
+            vec![],
+        );
+        assert!(dup.is_err());
+
+        let _ = fs::remove_file(path);
     }
 }

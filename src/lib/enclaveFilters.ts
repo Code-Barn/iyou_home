@@ -15,9 +15,14 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { Profile } from './types';
+import { Profile, EnclaveProfile, RoleProfile, BusinessProfile } from './types';
 
 export const isAnchor = (p: Profile): boolean =>
   p.level === 0 || p.derivation_index === 0 || Boolean(p.is_system_reserved);
 
-export const isExternallySignable = (p: Profile): boolean => !isAnchor(p);
+export const isExternallySignable = (p: Profile): boolean =>
+  !isAnchor(p) && (p.level === 1 || p.level === 2);
+
+export const isRoleProfile = (p: EnclaveProfile): p is RoleProfile => p.level === 3;
+
+export const isBusinessProfile = (p: EnclaveProfile): p is BusinessProfile => p.level === 4;

@@ -23,12 +23,42 @@ export interface Profile {
   name?: string;
   derivation_index: number;
   did: string;
-  level: number; // 0 = Anchor, 1 = Public Persona, 2+ = Burner
+  level: 0 | 1 | 2; // 0 = Anchor, 1 = Public Persona, 2 = Burner
   is_system_reserved: boolean;
   active?: boolean;
   nostr_pubkey_hex?: string;
   credentials?: any[];
 }
+
+export interface RoleProfile {
+  role_id: string;
+  role_title: string;
+  namespace: string;
+  role_index: number;
+  did: string;
+  nostr_pubkey_hex: string;
+  organization_did: string;
+  accreditation_vc_id?: string;
+  delegation_scope: string[];
+  level: 3;
+  created_at: number;
+}
+
+export interface BusinessProfile {
+  business_id: string;
+  legal_name: string;
+  business_index: number;
+  did: string;
+  nostr_pubkey_hex: string;
+  jurisdiction: string;
+  registration_number?: string;
+  operating_currency: string;
+  merchant_endpoints: string[];
+  level: 4;
+  created_at: number;
+}
+
+export type EnclaveProfile = Profile | RoleProfile | BusinessProfile;
 
 export type PersonaProfile = Profile;
 

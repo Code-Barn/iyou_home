@@ -16,8 +16,8 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { isAnchor, isExternallySignable } from "../lib/enclaveFilters";
-import { Profile } from "../lib/types";
+import { isAnchor, isExternallySignable, isRoleProfile, isBusinessProfile } from "../lib/enclaveFilters";
+import { Profile, RoleProfile, BusinessProfile } from "../lib/types";
 
 describe("enclaveFilters", () => {
   const anchorProfile: Profile = {
@@ -65,5 +65,43 @@ describe("enclaveFilters", () => {
     expect(isExternallySignable(anchorProfile)).toBe(false);
     expect(isExternallySignable(primaryProfile)).toBe(true);
     expect(isExternallySignable(burnerProfile)).toBe(true);
+    // Any hypothetical profile that is not level 1 or 2 must not be externally signable
+    expect(isExternallySignable({ ...burnerProfile, level: 0 })).toBe(false);
+  });
+
+  it("validates role and business profile type guards", () => {
+    const role: RoleProfile = {
+      role_id: "role_lead",
+      role_title: "Tech Lead",
+      namespace: "core.eng",
+      role_index: 0,
+      did: "did:key:z6MkRole33333333333333333333333333",
+      nostr_pubkey_hex: "3333333333333333333333333333333333333333333333333333333333333333",
+      organization_did: "did:key:z6MkOrg44444444444444444444444444",
+      delegation_scope: ["sign_reviews"],
+      level: 3,
+      created_at: Date.now(),
+    };
+
+    const business: BusinessProfile = {
+      business_id: "biz_corp",
+      legal_name: "Byers Brands LLC",
+      business_index: 0,
+      did: "did:key:z6MkBiz55555555555555555555555555",
+      nostr_pubkey_hex: "5555555555555555555555555555555555555555555555555555555555555555",
+      jurisdiction: "US-DE",
+      operating_currency: "USD",
+      merchant_endpoints: ["https://merchant.iyou.me"],
+      level: 4,
+      created_at: Date.now(),
+    };
+
+    expect(isRoleProfile(role)).toBe(true);
+    expect(isRoleProfile(business as any)).toBe(false);
+    expect(isRoleProfile(primaryProfile as any)).toBe(false);
+
+    expect(isBusinessProfile(business)).toBe(true);
+    expect(isBusinessProfile(role as any)).toBe(false);
+    expect(isBusinessProfile(primaryProfile as any)).toBe(false);
   });
 });

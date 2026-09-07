@@ -133,6 +133,10 @@ const mockInvoke = vi.hoisted(() =>
           created_at: 1000,
           updated_at: 1000,
         });
+      case "list_roles":
+        return Promise.resolve([]);
+      case "list_businesses":
+        return Promise.resolve([]);
       default:
         return Promise.resolve();
     }
@@ -174,13 +178,12 @@ describe("ProjectZero Suite", () => {
     });
 
     await waitFor(() => {
-      // Level 0: Anchor Sanctum
+      // Level 0: Anchor Sanctum is collapsed by default for zero visual shoulder-surfing exposure
       expect(
         screen.getByText("Level 0 — Anchor Sanctum (Air-Gapped Root)"),
       ).toBeInTheDocument();
       expect(screen.getByText("System Reserved • Zero Exposure")).toBeInTheDocument();
-      expect(screen.getByText(/Air-Gap Guarantee/i)).toBeInTheDocument();
-      expect(screen.getByText("🔒 Locked Anchor")).toBeInTheDocument();
+      expect(screen.getByText("Shielded Root — Tap to Expand")).toBeInTheDocument();
 
       // Level 1: Public Persona
       expect(
@@ -195,6 +198,24 @@ describe("ProjectZero Suite", () => {
       ).toBeInTheDocument();
       expect(screen.getByText("Burner Alpha")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /\+ Create Persona/i })).toBeInTheDocument();
+
+      // Level 3 & Level 4 sections
+      expect(
+        screen.getByText(/Level 3 — Accredited Roles & Collectives/i),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/Level 4 — Business & Commerce Profiles/i),
+      ).toBeInTheDocument();
+    });
+
+    // Expand Level 0 by clicking header
+    await act(async () => {
+      fireEvent.click(screen.getByText("Level 0 — Anchor Sanctum (Air-Gapped Root)"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Air-Gap Guarantee/i)).toBeInTheDocument();
+      expect(screen.getByText("🔒 Locked Anchor")).toBeInTheDocument();
     });
   });
 
