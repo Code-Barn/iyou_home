@@ -516,6 +516,21 @@ A high-transparency verification dialog presented before executing an update ins
 - **Zero-Trust Runner (`.github/workflows/release.yml`):** Release packaging for Linux executes on a self-hosted runner provisioned on dedicated `dc13` hardware (`[self-hosted, linux, dc13, tauri-builder]`).
 - **Artifact Targets:** Compiles and packages native `.deb` (Debian/Ubuntu) and `.AppImage` standalone binaries with bundled desktop and icon metadata.
 - **Checksum Verification (`SHA256SUMS_LINUX.txt`):** Generates and publishes cryptographic SHA-256 digests for all generated Linux release artifacts alongside GitHub Release assets upon git tag push (`v*`).
+- **Submodule CI Resolution:** `libs/did_rust` fetches from the public mirror `https://github.com/Code-Barn/did_rust.git` via `actions/checkout@v4` with `submodules: recursive`.
+
+#### 10.1.1 Phase 13 Verification Record — v0.2.0 (2026-09-12)
+
+Validated `SHA256SUMS_LINUX.txt` (clean native build on `dc13`, `sha256sum -c` pass):
+
+```
+b5498678a3ece713953749dbd902f60b1cb5c87fb31aae12f10219eef19ddcd7  iyou-home_0.2.0_amd64.AppImage
+e985ae08400a3f6c8ae671f23e005d4f7b05a66e20f551595df3b6b31f468d5a  iyou-home_0.2.0_amd64.deb
+39194d45166df97188dfbdedc7ca7f2e599b3fe50f903b5628d09aaf40ada7a7  iyou-home-0.2.0-1.x86_64.rpm
+```
+
+- **Source tree:** `dc13:~/build-smoke/release-artifacts/` (mirrored to `release-artifacts/SHA256SUMS_LINUX.txt`).
+- **Toolchain:** rustc/cargo 1.98.0, node v20.19.2, patchelf 0.18.0.
+- **Result:** `npm ci` clean, `npm run tauri build` exit 0; canonical matrix `iyou-home_0.2.0_amd64.deb` + `iyou-home_0.2.0_amd64.AppImage` confirmed.
 
 ### 10.2 Local macOS Multi-Architecture & Universal DMGs
 - **Universal & Native macOS Targets (`package.json`):**

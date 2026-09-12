@@ -1,7 +1,7 @@
 # TODO — iyou_home (Tauri/Rust Local Enclave)
 
 **Codified from:** `docs/RELEASE_SPEC_V2.md`  
-**Last updated:** 2026-09-02 (Phase 14: Bridge Persona Discovery & Switching)
+**Last updated:** 2026-09-12 (Phase 13: Sovereign Packaging — v0.2.0 verified on `dc13`)
 
 ---
 
@@ -179,9 +179,12 @@ All execution phases are complete and verified across both backend and frontend.
 ---
 
 ### Phase 13: Sovereign Packaging & Self-Hosted Build Automation
+> Verified end-to-end on `dc13` (2026-09-12): clean `npm run tauri build` produces the canonical `iyou-home_0.2.0_amd64.{deb,AppImage}` matrix; checksums recorded in `docs/RELEASE_SPEC_V2.md` §10.1.1.
+
 - [x] **13.1** Self-Hosted Linux CI Workflow: Dedicated `.github/workflows/release.yml` running on sovereign `dc13` metal runner (`[self-hosted, linux, dc13, tauri-builder]`), building `.deb` & `.AppImage` with `SHA256SUMS_LINUX.txt`.
 - [x] **13.2** macOS Universal & Architecture-Specific Helpers: Added `npm run tauri:build:universal`, `npm run tauri:build:arm64`, and `npm run tauri:build:x64` scripts to `package.json`.
 - [x] **13.3** Core 8 Footprint & Extended Mesh Drawer: 8-satellite primary matrix + 5-satellite collapsible drawer with live ledger scanning.
+- [x] **13.4** `did_rust` Submodule CI Resolution: `.gitmodules` URL migrated to canonical HTTPS mirror (`https://github.com/Code-Barn/did_rust.git`) and checkout step updated to `actions/checkout@v4` with `submodules: recursive`, unblocking the runner's path-dependency build.
 
 ---
 
