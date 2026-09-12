@@ -11,8 +11,10 @@ jobs:
     name: Build Linux Packages on dc13
     runs-on: [self-hosted, linux, dc13, tauri-builder]
     steps:
-      - name: Checkout Repository
+      - name: Checkout Source Code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Frontend Dependencies
         run: npm ci

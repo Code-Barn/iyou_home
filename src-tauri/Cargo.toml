@@ -1,6 +1,6 @@
 [package]
 name = "iyou-home"
-version = "0.2.0-SOVEREIGN-RELEASE"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
