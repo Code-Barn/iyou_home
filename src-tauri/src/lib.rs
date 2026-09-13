@@ -753,6 +753,10 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 
 #[tauri::command]
 fn show_main_window(app: AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -2915,7 +2919,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_menu_event(|app, event| {
-            if event.id().as_ref() == "check_updates" {
+            if event.id().as_ref() == "hide" {
+                // "Hide iyou_home" (Cmd+H): drop to Accessory like window close.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            } else if event.id().as_ref() == "check_updates" {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                }
                 let _ = app.emit("app://check-updates", ());
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
@@ -3061,6 +3078,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
+                #[cfg(target_os = "macos")]
+                {
+                    let app_handle = window.app_handle();
+                    let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
                 api.prevent_close();
             }
         })
@@ -3075,6 +3097,10 @@ pub fn run() {
                 if label == "main" {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.hide();
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
                     }
                     api.prevent_close();
                 }

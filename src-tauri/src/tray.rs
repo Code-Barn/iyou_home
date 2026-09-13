@@ -75,25 +75,39 @@ pub fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                }
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
                     let _ = window.unminimize();
+                    let _ = window.show();
                     let _ = window.set_focus();
                 }
             }
             "lock" => {
+                // The unlock screen handles biometrics / PIN in-window, so the
+                // app must be back in the foreground (Regular) to interact.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                }
                 let _ = app.emit("app://lock", ());
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
                     let _ = window.unminimize();
+                    let _ = window.show();
                     let _ = window.set_focus();
                 }
             }
             "check_updates" => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                }
                 let _ = app.emit("app://check-updates", ());
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
                     let _ = window.unminimize();
+                    let _ = window.show();
                     let _ = window.set_focus();
                 }
             }
@@ -109,9 +123,13 @@ pub fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } => {
                 let app = tray.app_handle();
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                }
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
                     let _ = window.unminimize();
+                    let _ = window.show();
                     let _ = window.set_focus();
                 }
             }
@@ -128,6 +146,12 @@ pub fn build_app_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std:
     #[cfg(target_os = "macos")]
     let check_updates_item = MenuItem::with_id(app, "check_updates", "Check for Updates…", true, None::<&str>)?;
 
+    // Custom hide action: unlike the predefined hide item (which keeps the app
+    // in the Dock), this mirrors the window-close transition to Accessory so
+    // the Dock / Cmd+Tab entry disappears while daemons keep running.
+    #[cfg(target_os = "macos")]
+    let hide_item = MenuItem::with_id(app, "hide", "Hide iyou_home", true, Some("Cmd+H"))?;
+
     #[cfg(target_os = "macos")]
     let app_menu = SubmenuBuilder::new(app, "iyou_home")
         .about(Some(AboutMetadata {
@@ -141,7 +165,7 @@ pub fn build_app_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std:
         .separator()
         .services()
         .separator()
-        .hide()
+        .item(&hide_item)
         .hide_others()
         .show_all()
         .separator()
