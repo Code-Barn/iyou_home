@@ -15,7 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
@@ -51,6 +51,14 @@ export default function BlobDetailDrawer({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const loopbackUrl = `http://127.0.0.1:9002/${blob.sha256}`;
   const category = categorizeBlob(blob.mime_type);
@@ -97,7 +105,7 @@ export default function BlobDetailDrawer({
         background: "#ffffff",
         borderLeft: "1px solid #e5e7eb",
         boxShadow: "-8px 0 24px rgba(0,0,0,0.12)",
-        zIndex: 60,
+        zIndex: 150,
         display: "flex",
         flexDirection: "column",
         animation: "slide-in-right 0.18s ease-out",
@@ -122,14 +130,7 @@ export default function BlobDetailDrawer({
         <button
           type="button"
           onClick={onClose}
-          style={{
-            background: "#f3f4f6",
-            border: "1px solid #d1d5db",
-            borderRadius: "6px",
-            padding: "0.3rem 0.7rem",
-            fontSize: "0.75rem",
-            cursor: "pointer",
-          }}
+          className="drawer-close-btn"
         >
           ✕ Close
         </button>
