@@ -253,6 +253,12 @@ function App() {
     return () => clearInterval(interval);
   }, [prefs?.app_lock_enabled, prefs?.inactivity_timeout_minutes, vaultExists, isAppLocked]);
 
+  // Keep the backend enclave lock flag in sync with the frontend lock state.
+  // This gates external signing at the signature bridge while locked.
+  useEffect(() => {
+    invoke("set_enclave_locked", { locked: isAppLocked }).catch(() => {});
+  }, [isAppLocked]);
+
   // Cross-tab chat handoff: switch to Messages and focus the given peer.
   const openChat = useCallback((target: ChatPeerTarget) => {
     setSelectedChatPeer(target);

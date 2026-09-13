@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -58,6 +59,10 @@ pub struct ServiceState {
     pub active_did: Mutex<Option<String>>,
     pub shutdown_signals: Mutex<HashMap<String, watch::Sender<bool>>>,
     pub auto_start_settings: Mutex<HashMap<String, bool>>,
+    /// Enclave lock flag mirrored from the frontend app-lock / auto-lock
+    /// screen. When `true`, the external signature bridge fails closed on
+    /// every gated signing frame so key material is never touched.
+    pub enclave_locked: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -297,6 +302,36 @@ fn resolve_profile_keypair(
     let pid = profile_id.unwrap_or_default();
     let kp = vault::get_profile_keypair(&vault, &pid)?;
     Ok((kp.signing_key, kp.did))
+}
+
+// ---------- enclave lock gate ----------
+
+/// Read the enclave lock flag mirrored by the frontend app-lock overlay.
+pub fn enclave_is_locked(app: &AppHandle) -> bool {
+    app.state::<ServiceState>()
+        .enclave_locked
+        .load(Ordering::SeqCst)
+}
+
+/// Fail-closed payload returned to bridge callers while the enclave is
+/// locked. Shape matches the satellite contract `ERR_ENCLAVE_LOCKED`.
+pub fn enclave_locked_error() -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "code": "ERR_ENCLAVE_LOCKED",
+        "message": "Enclave is locked. Unlock iyou_home to authorize signing."
+    })
+}
+
+#[tauri::command]
+fn set_enclave_locked(state: State<'_, ServiceState>, locked: bool) -> Result<(), String> {
+    state.enclave_locked.store(locked, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_enclave_lock_status(state: State<'_, ServiceState>) -> Result<bool, String> {
+    Ok(state.enclave_locked.load(Ordering::SeqCst))
 }
 
 // ---------- existing commands ----------
@@ -701,6 +736,9 @@ fn sign_auth_challenge(
     did_id: String,
     profile_id: Option<String>,
 ) -> Result<String, String> {
+    if crate::enclave_is_locked(&app) {
+        return Err("Enclave is locked. Unlock iyou_home to authorize signing.".to_string());
+    }
     let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
     if !did_id.is_empty() && did != did_id {
         return Err("Requested DID does not match the active Vault identity".to_string());
@@ -761,6 +799,13 @@ async fn submit_ws_response(
         return Ok(());
     }
 
+    // Enclave lock gate: an approval arriving while the app is locked must
+    // not produce a signature. Fail closed with the satellite contract frame.
+    if crate::enclave_is_locked(&app) {
+        let _ = sender.send(Message::Text(crate::enclave_locked_error().to_string().into()));
+        return Ok(());
+    }
+
     let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
     let signed_vp = sign_challenge_with_keypair(&signing_key, &did, &challenge)?;
     let vp_value: serde_json::Value = serde_json::from_str(&signed_vp)
@@ -792,6 +837,12 @@ async fn submit_ws_event_response(
     if !approved {
         let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
         println!("WS event sign request denied by user");
+        return Ok(());
+    }
+
+    // Enclave lock gate (see submit_ws_response).
+    if crate::enclave_is_locked(&app) {
+        let _ = sender.send(Message::Text(crate::enclave_locked_error().to_string().into()));
         return Ok(());
     }
 
@@ -903,6 +954,12 @@ async fn submit_ws_credential_response(
         return Ok(());
     }
 
+    // Enclave lock gate (see submit_ws_response).
+    if crate::enclave_is_locked(&app) {
+        let _ = sender.send(Message::Text(crate::enclave_locked_error().to_string().into()));
+        return Ok(());
+    }
+
     let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
 
     let credential_value: serde_json::Value = serde_json::from_str(&credential_json)
@@ -1002,6 +1059,13 @@ async fn submit_ws_credential_presentation(
     if !approved {
         let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
         println!("WS credential presentation denied by user");
+        guard.release();
+        return Ok(());
+    }
+
+    // Enclave lock gate (see submit_ws_response).
+    if crate::enclave_is_locked(&app) {
+        let _ = sender.send(Message::Text(crate::enclave_locked_error().to_string().into()));
         guard.release();
         return Ok(());
     }
@@ -2835,6 +2899,7 @@ pub fn run() {
         active_did: Mutex::new(None),
         shutdown_signals: Mutex::new(HashMap::new()),
         auto_start_settings: Mutex::new(HashMap::new()),
+        enclave_locked: Arc::new(AtomicBool::new(false)),
     };
     let ws_state = WsState::default();
     let transit_state = TransitState::default();
@@ -2988,6 +3053,8 @@ pub fn run() {
             get_active_profile,
             biometrics::verify_biometric_auth,
             certs::get_tls_status,
+            set_enclave_locked,
+            get_enclave_lock_status,
         ]);
 
     builder
@@ -3037,6 +3104,7 @@ mod tests {
             active_did: Mutex::new(None),
             shutdown_signals: Mutex::new(HashMap::new()),
             auto_start_settings: Mutex::new(HashMap::new()),
+            enclave_locked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3213,6 +3281,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_enclave_lock_gate_error_shape() {
+        let err = enclave_locked_error();
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["code"], "ERR_ENCLAVE_LOCKED");
+        assert_eq!(
+            err["message"],
+            "Enclave is locked. Unlock iyou_home to authorize signing."
+        );
+    }
+
+    #[test]
+    fn test_enclave_lock_flag_set_and_read() {
+        let state = create_test_state();
+        assert!(!state.enclave_locked.load(Ordering::SeqCst));
+        state.enclave_locked.store(true, Ordering::SeqCst);
+        assert!(state.enclave_locked.load(Ordering::SeqCst));
+        state.enclave_locked.store(false, Ordering::SeqCst);
+        assert!(!state.enclave_locked.load(Ordering::SeqCst));
     }
 
     #[test]

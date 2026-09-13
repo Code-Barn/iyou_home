@@ -534,8 +534,27 @@ where
                     continue;
                 }
 
+                // Enclave lock gate: while the app-lock / auto-lock screen is
+                // active, every gated signing frame is aborted before any key
+                // seed is loaded or signing event emitted. Informational
+                // frames (ping, get_profile, sync) are unaffected.
                 let is_sign_raw = json["action"] == "sign_raw" || json["type"] == "sign_raw";
                 let is_sign = json["action"] == "sign" || json["type"] == "sign" || is_sign_raw;
+                let is_signing_frame = is_sign
+                    || json["type"] == "sign_event"
+                    || json["action"] == "sign_event"
+                    || json["type"] == "sign_credential"
+                    || json["type"] == "POLY_CREDENTIAL_REQUEST"
+                    || json["type"] == "POLLY_CREDENTIAL_REQUEST"
+                    || json["type"] == "OMNI_SIGN_REQUEST";
+                if is_signing_frame && crate::enclave_is_locked(&app_handle) {
+                    println!("DEBUG: Rejected bridge signing request — enclave locked");
+                    let _ = response_tx.send(Message::Text(
+                        crate::enclave_locked_error().to_string().into(),
+                    ));
+                    continue;
+                }
+
                 if is_sign && (json["challenge"].is_string() || json["data"].is_string() || json["message"].is_string()) {
                     let challenge = json["challenge"]
                         .as_str()
