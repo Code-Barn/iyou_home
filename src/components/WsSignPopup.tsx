@@ -15,7 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { Profile } from "../lib/types";
 import { isAnchor } from "../lib/enclaveFilters";
@@ -54,12 +54,20 @@ function getCredentialTitle(credential: any): string {
   return name;
 }
 
+function truncateDid(did: string, lead = 22, tail = 8): string {
+  if (!did) return "";
+  if (did.length <= lead + tail + 3) return did;
+  return `${did.slice(0, lead)}...${did.slice(-tail)}`;
+}
+
 export default function WsSignPopup() {
   const [request, setRequest] = useState<SignRequest | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [autoSign, setAutoSign] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string>("primary");
+  const [selectedProfileId, setSelectedProfileId] = useState<string>("");
+  const prevRequestRef = useRef<SignRequest | null>(null);
 
   useEffect(() => {
     const channel = new Channel<string>();
@@ -107,30 +115,47 @@ export default function WsSignPopup() {
         invoke<string | null>("get_active_did"),
       ]);
 
-      const signable = (profilesList || []).filter((p) => !isAnchor(p));
+      const signable = (profilesList || []).filter(
+        (p) => !isAnchor(p) && (p.level === undefined || p.level >= 1),
+      );
       setProfiles(signable);
 
       // Find the active profile among signable profiles
+      let currentActiveId = "primary";
       if (activeDid) {
         const activeProfile = signable.find((p) => p.did === activeDid);
         if (activeProfile) {
-          setActiveProfileId(activeProfile.profile_id);
+          currentActiveId = activeProfile.profile_id;
         } else if (signable.length > 0) {
-          setActiveProfileId(signable[0].profile_id);
+          currentActiveId = signable[0].profile_id;
         }
       } else if (signable.length > 0) {
-        setActiveProfileId(signable[0].profile_id);
+        currentActiveId = signable[0].profile_id;
       }
+      setActiveProfileId(currentActiveId);
     } catch (err) {
       console.error("Failed to load profiles:", err);
     }
   };
 
   useEffect(() => {
+    if (request && request !== prevRequestRef.current) {
+      prevRequestRef.current = request;
+      // Default to currently active profile
+      setSelectedProfileId(activeProfileId || (profiles[0]?.profile_id ?? "primary"));
+    }
+  }, [request, activeProfileId, profiles]);
+
+  const effectiveSelectedId =
+    selectedProfileId || activeProfileId || (profiles[0]?.profile_id ?? "primary");
+  const currentSigningProfile =
+    profiles.find((p) => p.profile_id === effectiveSelectedId) ||
+    profiles.find((p) => p.profile_id === activeProfileId) ||
+    profiles[0];
+
+  useEffect(() => {
     if (autoSign && request && !isProcessing) {
-      const targetProfile = profiles.find(
-        (p) => p.profile_id === (request.profile_id || activeProfileId),
-      );
+      const targetProfile = currentSigningProfile;
       if (targetProfile && isAnchor(targetProfile)) {
         console.warn("REACT: Auto-sign blocked for Anchor Level 0 identity");
         return;
@@ -138,20 +163,22 @@ export default function WsSignPopup() {
       if (import.meta.env.DEV) console.log("REACT: Auto-sign enabled, approving immediately");
       handleResponse(true);
     }
-  }, [autoSign, request, profiles, activeProfileId, isProcessing]);
+  }, [autoSign, request, currentSigningProfile, isProcessing]);
 
   const handleResponse = async (approved: boolean) => {
     if (!request) return;
     setIsProcessing(true);
 
+    const effectiveProfileId = currentSigningProfile?.profile_id || activeProfileId || null;
+
     try {
-      if (import.meta.env.DEV) console.log("[TAURI_SIGN] Triggering response submission...");
+      if (import.meta.env.DEV) console.log("[TAURI_SIGN] Triggering response submission with profile:", effectiveProfileId);
 
       if (request.type === "sign_event") {
         await invoke("submit_ws_event_response", {
           eventJson: JSON.stringify(request.event),
           approved,
-          profileId: request.profile_id || null,
+          profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_event_response succeeded");
       } else if (request.type === "sign_credential") {
@@ -159,7 +186,7 @@ export default function WsSignPopup() {
           credentialJson: JSON.stringify(request.credential),
           holderDid: request.holder_did,
           approved,
-          profileId: request.profile_id || null,
+          profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_credential_response succeeded");
       } else if (request.type === "POLY_CREDENTIAL_REQUEST") {
@@ -167,7 +194,7 @@ export default function WsSignPopup() {
           credentialType: request.required_credential_type,
           challenge: request.challenge,
           approved,
-          profileId: request.profile_id || null,
+          profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_credential_presentation succeeded");
       } else {
@@ -175,7 +202,7 @@ export default function WsSignPopup() {
           id: "",
           challenge: request.challenge,
           approved,
-          profileId: request.profile_id || null,
+          profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_response succeeded");
       }
@@ -233,27 +260,104 @@ export default function WsSignPopup() {
                 : "Signature Request"}
         </h2>
 
-        {/* Persona Context Display */}
+        {/* Persona Selector inside WsSignPopup */}
         {profiles.length > 0 && (
           <div
+            className="persona-selector-section"
             style={{
-              background: "#e3f2fd",
-              padding: "0.75rem 1rem",
-              borderRadius: "6px",
+              background: "#eff6ff",
+              border: "1px solid #bfdbfe",
+              borderRadius: "8px",
+              padding: "0.85rem 1rem",
               margin: "1rem 0",
               display: "flex",
-              alignItems: "center",
-              gap: "0.5rem",
+              flexDirection: "column",
+              gap: "0.6rem",
             }}
           >
-            <span>👤</span>
-            <strong>Signing as:</strong>
-            <span>
-              {profiles.find(
-                (p) => p.profile_id === (request.profile_id || activeProfileId),
-              )?.profile_name || "Unknown Profile"}
-              {request.profile_id && ` (Profile ID: ${request.profile_id})`}
-            </span>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: "0.5rem",
+              }}
+            >
+              <label
+                htmlFor="signing-persona-select"
+                style={{
+                  fontWeight: 600,
+                  fontSize: "0.9rem",
+                  color: "#1e3a8a",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "0.35rem",
+                }}
+              >
+                <span>👤</span>
+                <span>Signing Persona:</span>
+              </label>
+              <select
+                id="signing-persona-select"
+                aria-label="Signing Persona"
+                value={effectiveSelectedId}
+                onChange={(e) => setSelectedProfileId(e.target.value)}
+                style={{
+                  padding: "0.4rem 0.75rem",
+                  borderRadius: "6px",
+                  border: "1px solid #93c5fd",
+                  background: "white",
+                  fontSize: "0.85rem",
+                  fontWeight: 500,
+                  color: "#1e40af",
+                  cursor: "pointer",
+                }}
+              >
+                {profiles.map((p) => (
+                  <option key={p.profile_id} value={p.profile_id}>
+                    {p.profile_name} (Level {p.level ?? (p.derivation_index === 1 ? 1 : 2)})
+                    {p.profile_id === activeProfileId ? " — Active" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {currentSigningProfile && (
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: "0.5rem",
+                  fontSize: "0.82rem",
+                  color: "#1e40af",
+                  background: "rgba(255, 255, 255, 0.8)",
+                  padding: "0.45rem 0.65rem",
+                  borderRadius: "6px",
+                  border: "1px solid #dbeafe",
+                }}
+              >
+                <div>
+                  <span style={{ color: "#4b5563", marginRight: "0.35rem" }}>Profile Name:</span>
+                  <strong style={{ color: "#1e3a8a" }}>{currentSigningProfile.profile_name}</strong>
+                </div>
+                <div>
+                  <span style={{ color: "#4b5563", marginRight: "0.35rem" }}>DID:</span>
+                  <span
+                    style={{
+                      fontFamily: "monospace",
+                      fontSize: "0.8rem",
+                      color: "#1f2937",
+                    }}
+                    title={currentSigningProfile.did}
+                  >
+                    {truncateDid(currentSigningProfile.did)}
+                  </span>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

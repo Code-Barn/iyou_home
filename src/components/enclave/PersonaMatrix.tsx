@@ -745,11 +745,15 @@ export default function PersonaMatrix({
           return (
             <div
               key={p.profile_id}
+              className={`persona-card ${isActive ? "ring-2 ring-emerald-500" : ""}`}
               style={{
                 padding: "0.85rem",
                 borderRadius: "8px",
                 background: isActive ? "#eff6ff" : "white",
-                border: isActive ? "1px solid #3b82f6" : "1px solid #e5e7eb",
+                border: isActive ? "2px solid #10b981" : "1px solid #e5e7eb",
+                boxShadow: isActive
+                  ? "0 0 0 2px #10b981, 0 0 14px rgba(16, 185, 129, 0.45)"
+                  : undefined,
                 marginTop: "0.5rem",
               }}
             >
@@ -777,18 +781,25 @@ export default function PersonaMatrix({
                     Index #{p.derivation_index}
                   </span>
                   {isActive && (
-                    <span
-                      style={{
-                        background: "#10b981",
-                        color: "white",
-                        padding: "0.1rem 0.5rem",
-                        borderRadius: "10px",
-                        fontSize: "0.7rem",
-                        fontWeight: 600,
-                      }}
-                    >
-                      Active Persona
-                    </span>
+                    <>
+                      <span
+                        className="active-identity-pill"
+                        style={{
+                          background: "#10b981",
+                          color: "white",
+                          padding: "0.2rem 0.65rem",
+                          borderRadius: "9999px",
+                          fontSize: "0.75rem",
+                          fontWeight: 700,
+                          letterSpacing: "0.05em",
+                          boxShadow: "0 0 8px rgba(16, 185, 129, 0.5)",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        ACTIVE IDENTITY
+                      </span>
+                      <span style={{ display: "none" }}>Active Persona</span>
+                    </>
                   )}
                 </div>
 
@@ -803,6 +814,8 @@ export default function PersonaMatrix({
                       color: "white",
                       border: "none",
                       borderRadius: "4px",
+                      fontWeight: 600,
+                      cursor: "pointer",
                     }}
                   >
                     Set as Active
@@ -1033,11 +1046,15 @@ export default function PersonaMatrix({
               return (
                 <div
                   key={p.profile_id}
+                  className={`persona-card ${isActive ? "ring-2 ring-emerald-500" : ""}`}
                   style={{
                     padding: "0.85rem",
                     borderRadius: "8px",
                     background: isActive ? "#f0fdf4" : "white",
-                    border: isActive ? "1px solid #10b981" : "1px solid #e5e7eb",
+                    border: isActive ? "2px solid #10b981" : "1px solid #e5e7eb",
+                    boxShadow: isActive
+                      ? "0 0 0 2px #10b981, 0 0 14px rgba(16, 185, 129, 0.45)"
+                      : undefined,
                   }}
                 >
                   <div
@@ -1069,16 +1086,20 @@ export default function PersonaMatrix({
                       </span>
                       {isActive && (
                         <span
+                          className="active-identity-pill"
                           style={{
                             background: "#10b981",
                             color: "white",
-                            padding: "0.1rem 0.5rem",
-                            borderRadius: "10px",
-                            fontSize: "0.7rem",
-                            fontWeight: 600,
+                            padding: "0.2rem 0.65rem",
+                            borderRadius: "9999px",
+                            fontSize: "0.75rem",
+                            fontWeight: 700,
+                            letterSpacing: "0.05em",
+                            boxShadow: "0 0 8px rgba(16, 185, 129, 0.5)",
+                            textTransform: "uppercase",
                           }}
                         >
-                          Active
+                          ACTIVE IDENTITY
                         </span>
                       )}
                     </div>
@@ -1091,13 +1112,15 @@ export default function PersonaMatrix({
                           style={{
                             padding: "0.25rem 0.6rem",
                             fontSize: "0.75rem",
-                            background: "#10b981",
+                            background: "#059669",
                             color: "white",
                             border: "none",
                             borderRadius: "4px",
+                            fontWeight: 600,
+                            cursor: "pointer",
                           }}
                         >
-                          Set Active
+                          Set as Active
                         </button>
                       )}
                       <button
@@ -1486,11 +1509,15 @@ export default function PersonaMatrix({
                   return (
                     <div
                       key={r.role_id}
+                      className={`persona-card ${isActive ? "ring-2 ring-emerald-500" : ""}`}
                       style={{
                         padding: "0.85rem",
                         borderRadius: "8px",
                         background: isActive ? "#fffbeb" : "white",
-                        border: isActive ? "1px solid #d97706" : "1px solid #e5e7eb",
+                        border: isActive ? "2px solid #10b981" : "1px solid #e5e7eb",
+                        boxShadow: isActive
+                          ? "0 0 0 2px #10b981, 0 0 14px rgba(16, 185, 129, 0.45)"
+                          : undefined,
                       }}
                     >
                       <div
@@ -1534,16 +1561,20 @@ export default function PersonaMatrix({
                           </span>
                           {isActive && (
                             <span
+                              className="active-identity-pill"
                               style={{
-                                background: "#dcfce7",
-                                color: "#15803d",
-                                padding: "0.15rem 0.4rem",
-                                borderRadius: "4px",
+                                background: "#10b981",
+                                color: "white",
+                                padding: "0.15rem 0.5rem",
+                                borderRadius: "9999px",
                                 fontSize: "0.7rem",
                                 fontWeight: 700,
+                                letterSpacing: "0.05em",
+                                boxShadow: "0 0 8px rgba(16, 185, 129, 0.5)",
+                                textTransform: "uppercase",
                               }}
                             >
-                              ● ACTIVE
+                              ACTIVE IDENTITY
                             </span>
                           )}
                         </div>
