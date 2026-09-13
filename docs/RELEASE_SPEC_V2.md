@@ -523,14 +523,15 @@ A high-transparency verification dialog presented before executing an update ins
 Validated `SHA256SUMS_LINUX.txt` (clean native build on `dc13`, `sha256sum -c` pass):
 
 ```
-b5498678a3ece713953749dbd902f60b1cb5c87fb31aae12f10219eef19ddcd7  iyou-home_0.2.0_amd64.AppImage
-e985ae08400a3f6c8ae671f23e005d4f7b05a66e20f551595df3b6b31f468d5a  iyou-home_0.2.0_amd64.deb
-39194d45166df97188dfbdedc7ca7f2e599b3fe50f903b5628d09aaf40ada7a7  iyou-home-0.2.0-1.x86_64.rpm
+2d83b20b3cda10cd0c85983cde678c31c820c5ea51abce2831649910b623ffc8  iyou-home_0.2.0_amd64.AppImage
+659b081c8e34e0b78f51c8458bd6efb3244b1e410066dcd36a7be598fb93c138  iyou-home_0.2.0_amd64.deb
+08d5a2f2da16184c0e70d63ba4f80a0d75f4c29e1053d6940943b9a1b1899573  iyou-home-0.2.0-1.x86_64.rpm
 ```
 
 - **Source tree:** `dc13:~/build-smoke/release-artifacts/` (mirrored to `release-artifacts/SHA256SUMS_LINUX.txt`).
 - **Toolchain:** rustc/cargo 1.98.0, node v20.19.2, patchelf 0.18.0.
 - **Result:** `npm ci` clean, `npm run tauri build` exit 0; canonical matrix `iyou-home_0.2.0_amd64.deb` + `iyou-home_0.2.0_amd64.AppImage` confirmed.
+- **Published (2026-09-13):** Final v0.2.0 assets — the above Linux bundles plus `iyou-home_0.2.0_x64.dmg` (`d98669ecc515a47115aab961b71296456bddfc6c7ac245e6f657b9892472d34c`) — uploaded to the GitHub Release `v0.2.0` via `scripts/release.sh`; `release-artifacts/SHA256SUMS.txt` is the consolidated manifest for all uploaded binaries.
 
 ### 10.2 Local macOS Multi-Architecture & Universal DMGs
 - **Universal & Native macOS Targets (`package.json`):**
