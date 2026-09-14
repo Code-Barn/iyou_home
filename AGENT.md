@@ -246,3 +246,12 @@ npx tsc --noEmit && npm run build
 # Vitest Suite (74 unit tests across 10 test files)
 npx vitest run
 ```
+
+
+## MANDATORY EXECUTION INVARIANT: AUTO-COMMIT ON PASSING VERIFICATION
+1. **Never Ask Permission to Commit:** NEVER conclude a build, fix, refactor, or test task with questions like "Would you like me to commit?", "Should I stage changes?", or "Ready to commit?". If system checks and tests pass, staging and committing is an immutable requirement.
+2. **Atomic Execution:** Immediately upon successful verification (clean linters, passing tests, zero runtime errors), stage all modified and added files relevant to the task (`git add <files>`).
+3. **Conventional Commit Message:** Commit immediately using conventional commit semantics (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`) describing the exact change.
+4. **Final Status Output:** Every final build report MUST end with the outputs of:
+   - `git log -n 1 --oneline`
+   - `git status --short`
