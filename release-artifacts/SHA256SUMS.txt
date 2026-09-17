@@ -1,3 +1,0 @@
-d9eb7aeb999f6eed67987c85a88d16cc6d3462d9e06e7953fb920f2dca8961ab  iyou-home_0.2.0_amd64.AppImage
-bfc4fe2bb15de9f687cb1355ff341cb823577ac5865ac2ee8bc94f526990f5da  iyou-home_0.2.0_amd64.deb
-97842e257f6ad9a66fcabb23dd9cc1b04a11dc4666a8c277a81f5e5965faa7d2  iyou-home_0.2.0_x64.dmg

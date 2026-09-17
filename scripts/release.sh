@@ -198,10 +198,16 @@ fi
 
 (
   cd "$RELEASE_DIR"
-  ${HASH_TOOL} iyou-home_* > SHA256SUMS.txt
+  shopt -s nullglob
+  staged_files=(iyou-home_*)
+  if [ ${#staged_files[@]} -gt 0 ]; then
+    ${HASH_TOOL} "${staged_files[@]}" > SHA256SUMS.txt
+    log "SHA256SUMS.txt:"
+    cat "$RELEASE_DIR/SHA256SUMS.txt"
+  else
+    log "No staged bundles found under ${RELEASE_DIR}."
+  fi
 )
-log "SHA256SUMS.txt:"
-cat "$RELEASE_DIR/SHA256SUMS.txt"
 
 if [[ "${SKIP_UPLOAD:-0}" == "1" ]]; then
   log "SKIP_UPLOAD=1 — staged assets only; not tagging or publishing."
