@@ -65,7 +65,7 @@ fi
 
 # Identify the GitHub remote that points at Code-Barn/iyou_home.
 pick_release_remote() {
-  for r in origin gh pushall; do
+  for r in pushall origin gh; do
     if url="$(git config --get "remote.$r.url")"; then
       case "$url" in
         *github.com*Code-Barn/iyou_home*) echo "$r"; return 0 ;;
