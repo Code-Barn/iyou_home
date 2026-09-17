@@ -23,6 +23,7 @@ import type { Profile, UpdateMetadata, UpdatePolicy, UpdatePreferences, UserPref
 import { DEFAULT_USER_PREFERENCES } from "../lib/types";
 import {
   INACTIVITY_TIMEOUT_OPTIONS,
+  SIGNING_GRACE_PERIOD_OPTIONS,
   isValidAppLockPin,
   loadUserPreferences,
   saveUserPreferences,
@@ -520,6 +521,24 @@ export default function KeysManager({
     }
   };
 
+  const handleChangeGracePeriod = async (minutes: number) => {
+    const current = appPrefs || DEFAULT_USER_PREFERENCES;
+    const updated: UserPreferences = {
+      ...current,
+      signing_grace_period_minutes: minutes,
+    };
+    try {
+      await saveUserPreferences(updated);
+      try {
+        localStorage.setItem("iyou_home_signing_grace_period", String(minutes));
+      } catch {}
+      setAppPrefs(updated);
+      onLockSettingsChange?.(updated);
+    } catch (err: any) {
+      setLockErrorMessage(`Failed to update grace period: ${err.toString()}`);
+    }
+  };
+
   const handleEnrollBiometrics = async () => {
     setBiometricEnrolling(true);
     setLockErrorMessage(null);
@@ -798,6 +817,28 @@ export default function KeysManager({
                 }}
               >
                 {INACTIVITY_TIMEOUT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+              <label style={{ fontSize: "0.88rem", fontWeight: 500 }}>Signing session grace period:</label>
+              <select
+                aria-label="Signing session grace period"
+                value={appPrefs.signing_grace_period_minutes ?? 0}
+                onChange={(e) => handleChangeGracePeriod(Number(e.target.value))}
+                style={{
+                  padding: "0.35rem 0.6rem",
+                  borderRadius: "6px",
+                  border: "1px solid #d1d5db",
+                  background: "#fff",
+                  fontSize: "0.88rem",
+                }}
+              >
+                {SIGNING_GRACE_PERIOD_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
                   </option>

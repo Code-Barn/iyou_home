@@ -446,6 +446,13 @@ textarea {
     font-style: italic;
 }
 
+/* App Lock Overlay: Highest priority gate above all other modals (z-1000), toolbars, and drawers */
+.app-lock-overlay {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+}
+
 .modal-overlay {
     position: fixed;
     top: 0;

@@ -85,12 +85,19 @@ function App() {
   const [prefs, setPrefs] = useState<UserPreferences | null>(null);
   const [vaultExists, setVaultExists] = useState(false);
   const [isAppLocked, setIsAppLocked] = useState(false);
+  const [authSessionValidUntil, setAuthSessionValidUntil] = useState<number>(0);
   const lastActivityRef = useRef<number>(Date.now());
 
   const unlockApp = useCallback(() => {
     lastActivityRef.current = Date.now();
     setIsAppLocked(false);
-  }, []);
+    const graceMinutes = prefs?.signing_grace_period_minutes ?? 0;
+    if (graceMinutes > 0) {
+      setAuthSessionValidUntil(Date.now() + graceMinutes * 60 * 1000);
+    } else {
+      setAuthSessionValidUntil(0);
+    }
+  }, [prefs?.signing_grace_period_minutes]);
 
   const handleSeedConfirmed = useCallback(() => {
     setPrefs((prev) => (prev ? { ...prev, seed_backup_confirmed: true } : prev));
@@ -103,9 +110,16 @@ function App() {
       if (next.app_lock_enabled && !wasEnabled) {
         lastActivityRef.current = Date.now();
         setIsAppLocked(true);
+        setAuthSessionValidUntil(0);
       } else if (!next.app_lock_enabled) {
         lastActivityRef.current = Date.now();
         setIsAppLocked(false);
+        const graceMinutes = next.signing_grace_period_minutes ?? 0;
+        if (graceMinutes > 0) {
+          setAuthSessionValidUntil(Date.now() + graceMinutes * 60 * 1000);
+        } else {
+          setAuthSessionValidUntil(0);
+        }
       }
     },
     [prefs?.app_lock_enabled],
@@ -168,11 +182,17 @@ function App() {
       if (!mounted) return;
       setPrefs(loadedPrefs);
       setVaultExists(hasVault === true);
-      setIsAppLocked(
+      const shouldLock =
         hasVault === true &&
-          loadedPrefs.app_lock_enabled &&
-          (!!loadedPrefs.app_lock_pin_hash || !!loadedPrefs.app_lock_prf_hash),
-      );
+        loadedPrefs.app_lock_enabled &&
+        (!!loadedPrefs.app_lock_pin_hash || !!loadedPrefs.app_lock_prf_hash);
+      setIsAppLocked(shouldLock);
+      if (!shouldLock) {
+        const graceMinutes = loadedPrefs.signing_grace_period_minutes ?? 0;
+        if (graceMinutes > 0) {
+          setAuthSessionValidUntil(Date.now() + graceMinutes * 60 * 1000);
+        }
+      }
     })();
     return () => {
       mounted = false;
@@ -197,6 +217,7 @@ function App() {
             inactivityMinutesToMs(prefs.inactivity_timeout_minutes)
         ) {
           setIsAppLocked(true);
+          setAuthSessionValidUntil(0);
         }
         lastActivityRef.current = Date.now();
       }
@@ -213,6 +234,7 @@ function App() {
     let unlisten: (() => void) | undefined;
     listen("app://lock", () => {
       setIsAppLocked(true);
+      setAuthSessionValidUntil(0);
     }).then((fn) => {
       unlisten = fn;
     }).catch(() => {
@@ -248,6 +270,7 @@ function App() {
         Date.now() - lastActivityRef.current >= timeoutMs
       ) {
         setIsAppLocked(true);
+        setAuthSessionValidUntil(0);
       }
     }, 5000);
     return () => clearInterval(interval);
@@ -269,7 +292,10 @@ function App() {
 
   return (
     <>
-      <WsSignPopup />
+      <WsSignPopup
+        isAppLocked={isAppLocked}
+        authSessionValidUntil={authSessionValidUntil}
+      />
       <GlobalStatusBar
         onNavigateEnclave={() => setActiveTab("enclave")}
         activeProfile={activeProfile}

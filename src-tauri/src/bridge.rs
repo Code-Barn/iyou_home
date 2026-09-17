@@ -549,6 +549,7 @@ where
                     || json["type"] == "OMNI_SIGN_REQUEST";
                 if is_signing_frame && crate::enclave_is_locked(&app_handle) {
                     println!("DEBUG: Rejected bridge signing request — enclave locked");
+                    crate::focus_main_window(&app_handle);
                     let _ = response_tx.send(Message::Text(
                         crate::enclave_locked_error().to_string().into(),
                     ));
@@ -880,6 +881,15 @@ async fn handle_omni_sign_request(
     app_handle: &AppHandle,
     response_tx: &mpsc::UnboundedSender<Message>,
 ) {
+    if crate::enclave_is_locked(app_handle) {
+        println!("DEBUG: Rejected OMNI_SIGN_REQUEST — enclave locked");
+        crate::focus_main_window(app_handle);
+        let _ = response_tx.send(Message::Text(
+            crate::enclave_locked_error().to_string().into(),
+        ));
+        return;
+    }
+
     let protocol = json["protocol"].as_str().unwrap_or("");
     // Accept both canonical POLY_V2 and legacy POLLY_V2 spellings; the
     // response always echoes the protocol the caller used.

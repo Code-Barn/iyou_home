@@ -110,10 +110,11 @@ export default function AppLockOverlay({
 
   return (
     <div
+      className="app-lock-overlay"
       style={{
         position: "fixed",
         inset: 0,
-        zIndex: 200,
+        zIndex: 9999,
         background:
           "linear-gradient(160deg, #0f172a 0%, #1e1b4b 55%, #312e81 100%)",
         display: "flex",

@@ -89,6 +89,9 @@ pub struct UserPreferences {
     /// Inactivity auto-lock timeout in minutes (5, 15, 60, or 0 = disabled).
     #[serde(default)]
     pub inactivity_timeout_minutes: u32,
+    /// Signing session grace period in minutes (0 = Always Prompt, 15, 60, 240).
+    #[serde(default)]
+    pub signing_grace_period_minutes: u32,
     /// SHA-256 of the local 6-digit PIN, never the PIN itself.
     #[serde(default)]
     pub app_lock_pin_hash: Option<String>,
@@ -126,6 +129,7 @@ impl Default for UserPreferences {
             seed_backup_confirmed: false,
             app_lock_enabled: false,
             inactivity_timeout_minutes: 15,
+            signing_grace_period_minutes: 0,
             app_lock_pin_hash: None,
             app_lock_prf_hash: None,
             last_backup_at: 0,
@@ -234,6 +238,9 @@ pub fn sign_omni_payload(
     payload: &serde_json::Value,
     profile_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    if crate::enclave_is_locked(app) {
+        return Err("Enclave is locked. Unlock iyou_home to authorize signing.".to_string());
+    }
     let poll_id = payload["poll_id"]
         .as_str()
         .ok_or("Missing poll_id")?
@@ -751,8 +758,7 @@ fn get_public_did_document(did: String) -> Result<String, String> {
     did_rust::resolve_did(&did).map_err(|e| format!("Failed to resolve DID document: {}", e))
 }
 
-#[tauri::command]
-fn show_main_window(app: AppHandle) {
+pub fn focus_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
@@ -762,6 +768,11 @@ fn show_main_window(app: AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+#[tauri::command]
+fn show_main_window(app: AppHandle) {
+    focus_main_window(&app);
 }
 
 #[tauri::command]
@@ -3193,6 +3204,7 @@ mod tests {
             seed_backup_confirmed: true,
             app_lock_enabled: true,
             inactivity_timeout_minutes: 5,
+            signing_grace_period_minutes: 60,
             app_lock_pin_hash: Some("deadbeef".to_string()),
             app_lock_prf_hash: None,
             last_backup_at: 1700000000,
@@ -3221,6 +3233,7 @@ mod tests {
         assert!(loaded.seed_backup_confirmed);
         assert!(loaded.app_lock_enabled);
         assert_eq!(loaded.inactivity_timeout_minutes, 5);
+        assert_eq!(loaded.signing_grace_period_minutes, 60);
         assert_eq!(loaded.app_lock_pin_hash.as_deref(), Some("deadbeef"));
         assert_eq!(loaded.last_backup_at, 1700000000);
         assert_eq!(loaded.relay_mesh, vec!["wss://custom.relay.io"]);
@@ -3241,6 +3254,7 @@ mod tests {
         assert!(!prefs.seed_backup_confirmed);
         assert!(!prefs.app_lock_enabled);
         assert_eq!(prefs.inactivity_timeout_minutes, 15);
+        assert_eq!(prefs.signing_grace_period_minutes, 0);
         assert!(prefs.app_lock_pin_hash.is_none());
         assert!(prefs.app_lock_prf_hash.is_none());
         assert_eq!(prefs.last_backup_at, 0);

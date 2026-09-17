@@ -126,6 +126,8 @@ export interface UserPreferences {
   app_lock_enabled: boolean;
   /** Inactivity auto-lock timeout in minutes (5, 15, 60, or 0 = never). */
   inactivity_timeout_minutes: number;
+  /** Signing session grace period in minutes (0 = Always Prompt, 15, 60, 240). */
+  signing_grace_period_minutes?: number;
   /** SHA-256 of the local 6-digit PIN (never the PIN itself). */
   app_lock_pin_hash?: string | null;
   /** SHA-256 of the WebAuthn PRF seed hex (never the seed itself). */
@@ -169,6 +171,7 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   seed_backup_confirmed: false,
   app_lock_enabled: false,
   inactivity_timeout_minutes: 15,
+  signing_grace_period_minutes: 0,
   app_lock_pin_hash: null,
   app_lock_prf_hash: null,
   last_backup_at: 0,

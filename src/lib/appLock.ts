@@ -32,6 +32,13 @@ export const INACTIVITY_TIMEOUT_OPTIONS = [
   { value: 0, label: "Never (auto-lock off)" },
 ] as const;
 
+export const SIGNING_GRACE_PERIOD_OPTIONS = [
+  { value: 0, label: "Always Prompt (off)" },
+  { value: 15, label: "15 minutes" },
+  { value: 60, label: "1 hour" },
+  { value: 240, label: "4 hours" },
+] as const;
+
 export async function loadUserPreferences(): Promise<UserPreferences> {
   try {
     const raw = await invoke<UserPreferences | null>("get_user_preferences");

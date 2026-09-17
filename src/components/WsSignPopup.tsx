@@ -20,7 +20,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { Profile } from "../lib/types";
 import { isAnchor } from "../lib/enclaveFilters";
 
-type SignRequest =
+export type SignRequest =
   | { type: "sign"; challenge: string; profile_id?: string }
   | { type: "sign_event"; event: any; profile_id?: string }
   | {
@@ -35,6 +35,48 @@ type SignRequest =
       challenge: string;
       profile_id?: string;
     };
+
+export function isEligibleForGraceAutoSign(
+  req: SignRequest | null,
+  profile?: Profile | null,
+): boolean {
+  if (!req) return false;
+  // Level 0 Anchor is strictly air-gapped and excluded from grace auto-signing
+  if (!profile || isAnchor(profile) || profile.level === 0 || profile.derivation_index === 0) {
+    return false;
+  }
+
+  // Credentials and presentation sharing always require explicit user review
+  if (req.type === "sign_credential" || req.type === "POLY_CREDENTIAL_REQUEST") {
+    return false;
+  }
+
+  // Nostr events: ONLY standard social note (kind: 1)
+  if (req.type === "sign_event") {
+    const kind = Number(req.event?.kind);
+    return kind === 1;
+  }
+
+  // OIDC login challenges (type: "sign")
+  if (req.type === "sign") {
+    const challengeStr = (req.challenge || "").toLowerCase();
+    // High-risk operations (master seed reveals, anchor exports, key rotations) must always ignore the grace timer
+    if (
+      challengeStr.includes("seed") ||
+      challengeStr.includes("master") ||
+      challengeStr.includes("anchor") ||
+      challengeStr.includes("export") ||
+      challengeStr.includes("rotate") ||
+      challengeStr.includes("rotation") ||
+      challengeStr.includes("burn")
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  return false;
+}
 
 function getCredentialTitle(credential: any): string {
   const rawTypes = credential?.type;
@@ -60,8 +102,25 @@ function truncateDid(did: string, lead = 22, tail = 8): string {
   return `${did.slice(0, lead)}...${did.slice(-tail)}`;
 }
 
-export default function WsSignPopup() {
+export interface WsSignPopupProps {
+  isAppLocked?: boolean;
+  authSessionValidUntil?: number;
+}
+
+export default function WsSignPopup({
+  isAppLocked = false,
+  authSessionValidUntil = 0,
+}: WsSignPopupProps = {}) {
   const [request, setRequest] = useState<SignRequest | null>(null);
+  const [_pendingRequest, setPendingRequest] = useState<SignRequest | null>(null);
+  const pendingRequestRef = useRef<SignRequest | null>(null);
+
+  const isAppLockedRef = useRef(isAppLocked);
+  isAppLockedRef.current = isAppLocked;
+  const authSessionValidUntilRef = useRef(authSessionValidUntil);
+  authSessionValidUntilRef.current = authSessionValidUntil;
+  const prevIsAppLockedRef = useRef(isAppLocked);
+
   const [isProcessing, setIsProcessing] = useState(false);
   const [autoSign, setAutoSign] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -69,82 +128,29 @@ export default function WsSignPopup() {
   const [selectedProfileId, setSelectedProfileId] = useState<string>("");
   const prevRequestRef = useRef<SignRequest | null>(null);
 
-  useEffect(() => {
-    const channel = new Channel<string>();
-    channel.onmessage = (data) => {
-      if (import.meta.env.DEV) console.log("REACT: Received message via direct channel pipe:", data);
-      try {
-        const parsed = JSON.parse(data);
-        const profile_id = parsed.profile_id || undefined;
-        if (parsed.__type__ === "sign_event") {
-          setRequest({ type: "sign_event", event: parsed.event, profile_id });
-        } else if (parsed.__type__ === "sign_credential") {
-          setRequest({
-            type: "sign_credential",
-            credential: parsed.credential,
-            holder_did: parsed.holder_did,
-            profile_id,
-          });
-        } else if (parsed.__type__ === "POLY_CREDENTIAL_REQUEST") {
-          setRequest({
-            type: "POLY_CREDENTIAL_REQUEST",
-            required_credential_type: parsed.required_credential_type,
-            challenge: parsed.challenge,
-            profile_id,
-          });
-        } else if (parsed.__type__ === "sign") {
-          setRequest({ type: "sign", challenge: parsed.challenge, profile_id });
-        } else {
-          setRequest({ type: "sign", challenge: data, profile_id });
-        }
-      } catch {
-        setRequest({ type: "sign", challenge: data });
-      }
-    };
-    invoke("register_challenge_pipe", { channel });
-    if (import.meta.env.DEV) console.log("REACT: Challenge channel registered with backend");
+  const profilesRef = useRef<Profile[]>([]);
+  profilesRef.current = profiles;
+  const activeProfileIdRef = useRef<string>(activeProfileId);
+  activeProfileIdRef.current = activeProfileId;
+  const selectedProfileIdRef = useRef<string>(selectedProfileId);
+  selectedProfileIdRef.current = selectedProfileId;
 
-    // Load profiles and active profile
-    loadProfiles();
-  }, []);
-
-  const loadProfiles = async () => {
-    try {
-      const [profilesList, activeDid] = await Promise.all([
-        invoke<Profile[]>("list_profiles"),
-        invoke<string | null>("get_active_did"),
-      ]);
-
-      const signable = (profilesList || []).filter(
-        (p) => !isAnchor(p) && (p.level === undefined || p.level >= 1),
-      );
-      setProfiles(signable);
-
-      // Find the active profile among signable profiles
-      let currentActiveId = "primary";
-      if (activeDid) {
-        const activeProfile = signable.find((p) => p.did === activeDid);
-        if (activeProfile) {
-          currentActiveId = activeProfile.profile_id;
-        } else if (signable.length > 0) {
-          currentActiveId = signable[0].profile_id;
-        }
-      } else if (signable.length > 0) {
-        currentActiveId = signable[0].profile_id;
-      }
-      setActiveProfileId(currentActiveId);
-    } catch (err) {
-      console.error("Failed to load profiles:", err);
+  const resolveProfileForRequest = (reqProfileId?: string): Profile | undefined => {
+    const list = profilesRef.current.length > 0 ? profilesRef.current : profiles;
+    if (reqProfileId) {
+      const match = list.find((p) => p.profile_id === reqProfileId);
+      if (match) return match;
     }
+    const targetId =
+      selectedProfileIdRef.current ||
+      activeProfileIdRef.current ||
+      (list[0]?.profile_id ?? "primary");
+    return (
+      list.find((p) => p.profile_id === targetId) ||
+      list.find((p) => p.profile_id === activeProfileIdRef.current) ||
+      list[0]
+    );
   };
-
-  useEffect(() => {
-    if (request && request !== prevRequestRef.current) {
-      prevRequestRef.current = request;
-      // Default to currently active profile
-      setSelectedProfileId(activeProfileId || (profiles[0]?.profile_id ?? "primary"));
-    }
-  }, [request, activeProfileId, profiles]);
 
   const effectiveSelectedId =
     selectedProfileId || activeProfileId || (profiles[0]?.profile_id ?? "primary");
@@ -153,46 +159,43 @@ export default function WsSignPopup() {
     profiles.find((p) => p.profile_id === activeProfileId) ||
     profiles[0];
 
-  useEffect(() => {
-    if (autoSign && request && !isProcessing) {
-      const targetProfile = currentSigningProfile;
-      if (targetProfile && isAnchor(targetProfile)) {
-        console.warn("REACT: Auto-sign blocked for Anchor Level 0 identity");
-        return;
-      }
-      if (import.meta.env.DEV) console.log("REACT: Auto-sign enabled, approving immediately");
-      handleResponse(true);
-    }
-  }, [autoSign, request, currentSigningProfile, isProcessing]);
-
-  const handleResponse = async (approved: boolean) => {
-    if (!request) return;
+  const handleResponse = async (
+    approved: boolean,
+    targetReqArg?: SignRequest | null,
+    targetProfileIdArg?: string | null,
+  ) => {
+    const activeReq = targetReqArg || request;
+    if (!activeReq) return;
     setIsProcessing(true);
 
-    const effectiveProfileId = currentSigningProfile?.profile_id || activeProfileId || null;
+    const effectiveProfileId =
+      targetProfileIdArg !== undefined
+        ? targetProfileIdArg
+        : (currentSigningProfile?.profile_id || activeProfileId || null);
 
     try {
-      if (import.meta.env.DEV) console.log("[TAURI_SIGN] Triggering response submission with profile:", effectiveProfileId);
+      if (import.meta.env.DEV)
+        console.log("[TAURI_SIGN] Triggering response submission with profile:", effectiveProfileId);
 
-      if (request.type === "sign_event") {
+      if (activeReq.type === "sign_event") {
         await invoke("submit_ws_event_response", {
-          eventJson: JSON.stringify(request.event),
+          eventJson: JSON.stringify(activeReq.event),
           approved,
           profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_event_response succeeded");
-      } else if (request.type === "sign_credential") {
+      } else if (activeReq.type === "sign_credential") {
         await invoke("submit_ws_credential_response", {
-          credentialJson: JSON.stringify(request.credential),
-          holderDid: request.holder_did,
+          credentialJson: JSON.stringify(activeReq.credential),
+          holderDid: activeReq.holder_did,
           approved,
           profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_credential_response succeeded");
-      } else if (request.type === "POLY_CREDENTIAL_REQUEST") {
+      } else if (activeReq.type === "POLY_CREDENTIAL_REQUEST") {
         await invoke("submit_ws_credential_presentation", {
-          credentialType: request.required_credential_type,
-          challenge: request.challenge,
+          credentialType: activeReq.required_credential_type,
+          challenge: activeReq.challenge,
           approved,
           profileId: effectiveProfileId,
         });
@@ -200,14 +203,15 @@ export default function WsSignPopup() {
       } else {
         await invoke("submit_ws_response", {
           id: "",
-          challenge: request.challenge,
+          challenge: activeReq.challenge,
           approved,
           profileId: effectiveProfileId,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_response succeeded");
       }
 
-      if (import.meta.env.DEV) console.log("[TAURI_SIGN] Submission accepted. Draining network buffers...");
+      if (import.meta.env.DEV)
+        console.log("[TAURI_SIGN] Submission accepted. Draining network buffers...");
       // Enforce a secure 250ms async hold window to allow the Rust TCP stack to flush cleanly
       await new Promise((resolve) => setTimeout(resolve, 250));
     } catch (err) {
@@ -221,7 +225,182 @@ export default function WsSignPopup() {
     setRequest(null);
   };
 
-  if (!request) return null;
+  const loadProfilesPromiseRef = useRef<Promise<Profile[]> | null>(null);
+
+  const loadProfiles = (): Promise<Profile[]> => {
+    const promise = (async () => {
+      try {
+        const [profilesList, activeDid] = await Promise.all([
+          invoke<Profile[]>("list_profiles"),
+          invoke<string | null>("get_active_did"),
+        ]);
+
+        const signable = (profilesList || []).filter(
+          (p) => !isAnchor(p) && (p.level === undefined || p.level >= 1),
+        );
+        profilesRef.current = signable;
+        setProfiles(signable);
+
+        // Find the active profile among signable profiles
+        let currentActiveId = "primary";
+        if (activeDid) {
+          const activeProfile = signable.find((p) => p.did === activeDid);
+          if (activeProfile) {
+            currentActiveId = activeProfile.profile_id;
+          } else if (signable.length > 0) {
+            currentActiveId = signable[0].profile_id;
+          }
+        } else if (signable.length > 0) {
+          currentActiveId = signable[0].profile_id;
+        }
+        activeProfileIdRef.current = currentActiveId;
+        setActiveProfileId(currentActiveId);
+        return signable;
+      } catch (err) {
+        console.error("Failed to load profiles:", err);
+        return [];
+      }
+    })();
+    loadProfilesPromiseRef.current = promise;
+    return promise;
+  };
+
+  useEffect(() => {
+    const channel = new Channel<string>();
+    channel.onmessage = async (data) => {
+      if (import.meta.env.DEV) console.log("REACT: Received message via direct channel pipe:", data);
+      let incomingReq: SignRequest;
+      try {
+        const parsed = JSON.parse(data);
+        const profile_id = parsed.profile_id || undefined;
+        if (parsed.__type__ === "sign_event") {
+          incomingReq = { type: "sign_event", event: parsed.event, profile_id };
+        } else if (parsed.__type__ === "sign_credential") {
+          incomingReq = {
+            type: "sign_credential",
+            credential: parsed.credential,
+            holder_did: parsed.holder_did,
+            profile_id,
+          };
+        } else if (parsed.__type__ === "POLY_CREDENTIAL_REQUEST") {
+          incomingReq = {
+            type: "POLY_CREDENTIAL_REQUEST",
+            required_credential_type: parsed.required_credential_type,
+            challenge: parsed.challenge,
+            profile_id,
+          };
+        } else if (parsed.__type__ === "sign") {
+          incomingReq = { type: "sign", challenge: parsed.challenge, profile_id };
+        } else {
+          incomingReq = { type: "sign", challenge: data, profile_id };
+        }
+      } catch {
+        incomingReq = { type: "sign", challenge: data };
+      }
+
+      if (isAppLockedRef.current) {
+        if (import.meta.env.DEV)
+          console.log("REACT: App is locked; stashing incoming challenge in pendingRequest");
+        pendingRequestRef.current = incomingReq;
+        setPendingRequest(incomingReq);
+        return;
+      }
+
+      if (profilesRef.current.length === 0) {
+        if (!loadProfilesPromiseRef.current) {
+          loadProfilesPromiseRef.current = loadProfiles();
+        }
+        await loadProfilesPromiseRef.current;
+      }
+
+      const targetProfile = resolveProfileForRequest(incomingReq.profile_id);
+      const now = Date.now();
+      if (
+        now < authSessionValidUntilRef.current &&
+        isEligibleForGraceAutoSign(incomingReq, targetProfile)
+      ) {
+        if (import.meta.env.DEV)
+          console.log("REACT: Session signing grace period active; auto-signing request without modal");
+        handleResponse(true, incomingReq, targetProfile?.profile_id || null);
+        return;
+      }
+
+      setRequest(incomingReq);
+    };
+    invoke("register_challenge_pipe", { channel });
+    if (import.meta.env.DEV) console.log("REACT: Challenge channel registered with backend");
+
+    // Load profiles and active profile
+    loadProfiles();
+  }, []);
+
+  useEffect(() => {
+    if (request && request !== prevRequestRef.current) {
+      prevRequestRef.current = request;
+      // Default to currently active profile
+      setSelectedProfileId(activeProfileId || (profiles[0]?.profile_id ?? "primary"));
+    }
+  }, [request, activeProfileId, profiles]);
+
+  // Handle lock state transitions
+  useEffect(() => {
+    // If transitioning from unlocked to locked: stash active request
+    if (!prevIsAppLockedRef.current && isAppLocked) {
+      if (request) {
+        pendingRequestRef.current = request;
+        setPendingRequest(request);
+        setRequest(null);
+      }
+    }
+
+    // If transitioning from locked to unlocked: reveal or auto-sign pending request
+    if (prevIsAppLockedRef.current && !isAppLocked) {
+      const pending = pendingRequestRef.current;
+      if (pending) {
+        pendingRequestRef.current = null;
+        setPendingRequest(null);
+        const processPending = async () => {
+          if (profilesRef.current.length === 0) {
+            if (!loadProfilesPromiseRef.current) {
+              loadProfilesPromiseRef.current = loadProfiles();
+            }
+            await loadProfilesPromiseRef.current;
+          }
+          const targetProfile = resolveProfileForRequest(pending.profile_id);
+          const now = Date.now();
+          if (
+            now < authSessionValidUntilRef.current &&
+            isEligibleForGraceAutoSign(pending, targetProfile)
+          ) {
+            if (import.meta.env.DEV)
+              console.log("REACT: Enclave unlocked with active grace period; auto-signing pending request");
+            handleResponse(true, pending, targetProfile?.profile_id || null);
+          } else {
+            if (import.meta.env.DEV)
+              console.log("REACT: Enclave unlocked; revealing pending request in modal");
+            setRequest(pending);
+          }
+        };
+        processPending();
+      }
+    }
+
+    prevIsAppLockedRef.current = isAppLocked;
+  }, [isAppLocked, authSessionValidUntil, request]);
+
+  useEffect(() => {
+    if (autoSign && request && !isProcessing) {
+      const targetProfile = currentSigningProfile;
+      if (targetProfile && isAnchor(targetProfile)) {
+        console.warn("REACT: Auto-sign blocked for Anchor Level 0 identity");
+        return;
+      }
+      if (import.meta.env.DEV) console.log("REACT: Auto-sign enabled, approving immediately");
+      handleResponse(true);
+    }
+  }, [autoSign, request, currentSigningProfile, isProcessing]);
+
+  if (isAppLocked || !request) return null;
 
   return (
     <div

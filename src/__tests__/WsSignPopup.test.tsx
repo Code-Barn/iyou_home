@@ -17,7 +17,7 @@
 
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
-import WsSignPopup from "../components/WsSignPopup";
+import WsSignPopup, { isEligibleForGraceAutoSign } from "../components/WsSignPopup";
 import type { Profile } from "../lib/types";
 
 let channelCallback: ((data: string) => void) | null = null;
@@ -236,6 +236,264 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
         approved: false,
         profileId: "burner_alpha",
       });
+    });
+  });
+
+  describe("Lock Suppression and Session Grace Period Gate", () => {
+    it("does not render modal when isAppLocked is true and stashes pending request", async () => {
+      const { rerender } = render(<WsSignPopup isAppLocked={true} />);
+
+      // Send signing request while locked
+      await act(async () => {
+        channelCallback?.(
+          JSON.stringify({
+            __type__: "sign",
+            challenge: "auth-challenge-while-locked",
+          }),
+        );
+      });
+
+      // Modal must NOT be in DOM
+      expect(screen.queryByText("Signature Request")).not.toBeInTheDocument();
+
+      // Unlock enclave (isAppLocked becomes false, grace period = 0)
+      await act(async () => {
+        rerender(<WsSignPopup isAppLocked={false} authSessionValidUntil={0} />);
+      });
+
+      // Now the pending request is revealed cleanly
+      await waitFor(() => {
+        expect(screen.getByText("Signature Request")).toBeInTheDocument();
+        expect(screen.getByText("auth-challenge-while-locked")).toBeInTheDocument();
+      });
+    });
+
+    it("auto-signs standard kind: 1 note when session grace period is active", async () => {
+      const futureSessionTime = Date.now() + 3600 * 1000;
+      render(<WsSignPopup isAppLocked={false} authSessionValidUntil={futureSessionTime} />);
+
+      const noteEvent = {
+        kind: 1,
+        content: "Hello micro-post without popup fatigue!",
+        tags: [],
+      };
+
+      await act(async () => {
+        channelCallback?.(
+          JSON.stringify({
+            __type__: "sign_event",
+            event: noteEvent,
+          }),
+        );
+      });
+
+      // Does not block on modal DOM
+      expect(screen.queryByText("Nostr Event Signing Request")).not.toBeInTheDocument();
+
+      // Directly submits approval
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("submit_ws_event_response", {
+          eventJson: JSON.stringify(noteEvent),
+          approved: true,
+          profileId: "burner_alpha",
+        });
+      });
+    });
+
+    it("auto-signs standard OIDC login challenge when session grace period is active", async () => {
+      const futureSessionTime = Date.now() + 3600 * 1000;
+      render(<WsSignPopup isAppLocked={false} authSessionValidUntil={futureSessionTime} />);
+
+      await act(async () => {
+        channelCallback?.(
+          JSON.stringify({
+            __type__: "sign",
+            challenge: "https://idp.iyou.me/auth?challenge=oauth_state_12345",
+          }),
+        );
+      });
+
+      // Modal is bypassed
+      expect(screen.queryByText("Signature Request")).not.toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("submit_ws_response", {
+          id: "",
+          challenge: "https://idp.iyou.me/auth?challenge=oauth_state_12345",
+          approved: true,
+          profileId: "burner_alpha",
+        });
+      });
+    });
+
+    it("ignores grace period and forces modal review for high-risk operations", async () => {
+      const futureSessionTime = Date.now() + 3600 * 1000;
+      render(<WsSignPopup isAppLocked={false} authSessionValidUntil={futureSessionTime} />);
+
+      await act(async () => {
+        channelCallback?.(
+          JSON.stringify({
+            __type__: "sign",
+            challenge: "high-risk-reveal-master-seed-challenge",
+          }),
+        );
+      });
+
+      // High-risk must ignore grace timer and display modal!
+      await waitFor(() => {
+        expect(screen.getByText("Signature Request")).toBeInTheDocument();
+        expect(screen.getByText("high-risk-reveal-master-seed-challenge")).toBeInTheDocument();
+      });
+    });
+
+    it("auto-signs pending request upon unlock when grace period is active", async () => {
+      const futureSessionTime = Date.now() + 3600 * 1000;
+      const { rerender } = render(<WsSignPopup isAppLocked={true} authSessionValidUntil={0} />);
+
+      const noteEvent = {
+        kind: 1,
+        content: "Queued note while locked",
+        tags: [],
+      };
+
+      // Arrives while locked
+      await act(async () => {
+        channelCallback?.(
+          JSON.stringify({
+            __type__: "sign_event",
+            event: noteEvent,
+          }),
+        );
+      });
+
+      expect(screen.queryByText("Nostr Event Signing Request")).not.toBeInTheDocument();
+
+      // Unlock with active grace period recorded
+      await act(async () => {
+        rerender(<WsSignPopup isAppLocked={false} authSessionValidUntil={futureSessionTime} />);
+      });
+
+      // Resolves smoothly via auto-approval without displaying popup
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("submit_ws_event_response", {
+          eventJson: JSON.stringify(noteEvent),
+          approved: true,
+          profileId: "burner_alpha",
+        });
+      });
+      expect(screen.queryByText("Nostr Event Signing Request")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("isEligibleForGraceAutoSign Predicate Evaluation", () => {
+    const publicProfile: Profile = {
+      profile_id: "primary",
+      profile_name: "Public Persona",
+      derivation_index: 1,
+      did: "did:key:z6MkPrimary11111111111111111111111111",
+      level: 1,
+      is_system_reserved: false,
+    };
+
+    const anchorProfile: Profile = {
+      profile_id: "anchor",
+      profile_name: "Anchor Persona",
+      derivation_index: 0,
+      did: "did:key:z6MkAnchor00000000000000000000000000",
+      level: 0,
+      is_system_reserved: true,
+    };
+
+    it("permits standard Nostr kind: 1 notes for public persona", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign_event", event: { kind: 1, content: "hello" } },
+          publicProfile,
+        ),
+      ).toBe(true);
+    });
+
+    it("rejects non-kind-1 Nostr events (e.g. kind 0, 3, 1063)", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign_event", event: { kind: 0, content: "{}" } },
+          publicProfile,
+        ),
+      ).toBe(false);
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign_event", event: { kind: 1063, content: "file" } },
+          publicProfile,
+        ),
+      ).toBe(false);
+    });
+
+    it("permits standard OIDC challenges for public persona", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign", challenge: "random-nonce-12345" },
+          publicProfile,
+        ),
+      ).toBe(true);
+    });
+
+    it("rejects high risk challenges mentioning seed, export, rotate", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign", challenge: "reveal master seed" },
+          publicProfile,
+        ),
+      ).toBe(false);
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign", challenge: "export root seed" },
+          publicProfile,
+        ),
+      ).toBe(false);
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign", challenge: "rotate keys" },
+          publicProfile,
+        ),
+      ).toBe(false);
+    });
+
+    it("strictly rejects any signing request targeting Level 0 Anchor", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign_event", event: { kind: 1, content: "hello" } },
+          anchorProfile,
+        ),
+      ).toBe(false);
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign", challenge: "random-nonce-12345" },
+          anchorProfile,
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects credentials and credential presentations", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          {
+            type: "sign_credential",
+            credential: {},
+            holder_did: "did:key:123",
+          },
+          publicProfile,
+        ),
+      ).toBe(false);
+      expect(
+        isEligibleForGraceAutoSign(
+          {
+            type: "POLY_CREDENTIAL_REQUEST",
+            required_credential_type: "Passport",
+            challenge: "123",
+          },
+          publicProfile,
+        ),
+      ).toBe(false);
     });
   });
 });
