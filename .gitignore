@@ -50,4 +50,5 @@ docs/archive/*
 # Release build bundles (large binaries) — never tracked
 # Text checksum manifests (SHA256SUMS*.txt) remain tracked
 release-artifacts/*
+release-artifacts/*.exe
 !release-artifacts/*.txt
