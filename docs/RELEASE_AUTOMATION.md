@@ -53,64 +53,94 @@ corresponds to a committed, reviewable state).
 
 ---
 
-## 3. Version Bumps
+## 3. Version Bumps & Automated Release
 
-`iyou_home` keeps the version in three manifests plus two lockfiles. Bump **all**
-of them together (a mismatch breaks `npm ci` or the Cargo build):
+`iyou_home` synchronizes versioning across all **five** required manifests:
 
-| File | Field | Example |
+| File | Field | Purpose |
 |---|---|---|
-| `package.json` | `"version"` | `"0.2.0"` |
-| `src-tauri/tauri.conf.json` | `"version"` | `"0.2.0"` |
-| `src-tauri/Cargo.toml` | `[package] version` | `version = "0.2.0"` |
-| `package-lock.json` | root + `packages[""]` `version` | `"0.2.0"` |
-| `src-tauri/Cargo.lock` | `[[package]] name = "iyou-home"` `version` | `0.2.0` |
+| `package.json` | `"version"` | Node / Frontend package definition |
+| `package-lock.json` | root + `packages[""]` `version` | NPM dependency lockfile |
+| `src-tauri/tauri.conf.json` | `"version"` | Tauri app bundle version & metadata |
+| `src-tauri/Cargo.toml` | `[package] version` | Rust crate manifest |
+| `src-tauri/Cargo.lock` | `[[package]] name = "iyou-home"` `version` | Cargo dependency lockfile |
 
-The version string MUST be plain SemVer (`X.Y.Z`). The script rejects anything
-else (e.g. the legacy `-SOVEREIGN-RELEASE` suffix) because Debian/AppImage bundle
-names and the iyou.me download modal depend on exactly `iyou-home_X.Y.Z_amd64.deb`
-and `iyou-home_X.Y.Z_x64.dmg`.
+The release script (`scripts/release.sh`) provides an **automated bumping engine** that
+updates all 5 manifests atomically, creates the bump commit, tags `vX.Y.Z`, and pushes
+the changes to the repository remote before initiating builds.
 
-Commit the bump, push, then tag. The script can create/push the tag itself.
+### Usage Examples
+
+```bash
+# 1. Default patch bump (0.2.0 -> 0.2.1)
+./scripts/release.sh
+
+# 2. Explicit patch bump
+./scripts/release.sh patch
+
+# 3. Minor version bump (0.2.0 -> 0.3.0)
+./scripts/release.sh minor
+
+# 4. Major version bump (0.2.0 -> 1.0.0)
+./scripts/release.sh major
+
+# 5. Explicit target version
+./scripts/release.sh 0.3.5
+
+# 6. Re-run release pipeline on current version without bumping
+./scripts/release.sh current
+# or:
+BUMP=none ./scripts/release.sh
+```
+
+The version string MUST be plain SemVer (`X.Y.Z`). The script validates this rule
+and rejects anything else because Debian/RPM/AppImage/DMG/NSIS bundle filenames
+depend strictly on the canonical SemVer format.
 
 ---
 
 ## 4. Triggering a Release
 
 ```bash
-./scripts/release.sh
+./scripts/release.sh [patch|minor|major|<version>|current]
 ```
 
 What it does, in order:
 
-1. **Pre-flight** — verifies clean tree, extracts `VERSION` from `package.json`,
-   confirms `gh` auth and `ssh dc13` connectivity.
-2. **macOS build** — `npm run tauri build`; stages the DMG as
+1. **Version bump (automated)** — unless running `current`/`none`, checks that the working
+   tree is clean, executes `npm version <target> --no-git-tag-version`, updates
+   `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`, runs `cargo check` to update
+   `src-tauri/Cargo.lock`, and commits all 5 manifests with
+   `chore(release): bump version to v${NEW_VERSION}`.
+2. **Pre-flight** — verifies clean tree, extracts `VERSION` from `package.json`,
+   confirms `gh` auth, `node`, `cargo`, and `ssh dc13` connectivity.
+3. **macOS build** — `npm run tauri build`; stages the DMG as
    `release-artifacts/iyou-home_${VERSION}_x64.dmg`.
-3. **Linux build** — streams the repository (excluding `.git`, `node_modules`,
+4. **Linux build** — streams the repository (excluding `.git`, `node_modules`,
    `src-tauri/target`, `dist`) to `dc13:~/build-runner/`, runs
    `npm ci && npm run tauri build`, and pulls back `.deb`, `.AppImage` (and `.rpm`).
    *Note:* the stream uses `--no-xattrs` on macOS `bsdtar` — without it the pipe
    stalls on per-file extended-attribute headers.
-4. **Checksums** — writes `release-artifacts/SHA256SUMS.txt`.
-5. **Publish** — tags `v${VERSION}` (if absent), pushes the tag, then
-   `gh release create` (asset upload). If the release already exists it falls back to
-   `gh release upload --clobber`, making the script **idempotent**.
-6. **Windows build dispatch** — unless `SKIP_WINDOWS=1`, dispatches
+5. **Checksums** — writes `release-artifacts/SHA256SUMS.txt`.
+6. **Publish** — pushes branch `HEAD` to `$REMOTE`, tags `v${VERSION}` (if absent),
+   pushes the tag, then `gh release create` (asset upload). If the release already exists
+   it falls back to `gh release upload --clobber`, making the script **idempotent**.
+7. **Windows build dispatch** — unless `SKIP_WINDOWS=1`, dispatches
    `.github/workflows/build-windows.yml` on the GitHub Actions `windows-latest` runner
    for `v${VERSION}`. Compilation runs asynchronously (~9-10 mins) and uploads the
    `.exe` installer and `SHA256SUMS_WINDOWS.txt` directly to the release.
-7. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
+8. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
    logs `[OK]` (HTTP 302/200), `[ASYNC]` (for Windows build underway), or `[FAIL]`.
 
 ### Environment overrides
 
 | Variable | Effect |
 |---|---|
+| `BUMP` | SemVer bump type: `patch` (default), `minor`, `major`, `X.Y.Z`, or `current`/`none` |
 | `SKIP_MAC=1` | skip the local macOS build (uses existing `release-artifacts` DMG) |
 | `SKIP_LINUX=1` | skip the remote dc13 Linux build |
 | `SKIP_WINDOWS=1` | skip the Windows NSIS GitHub Actions build dispatch |
-| `SKIP_UPLOAD=1` | stage + checksum only; no tag, no publish |
+| `SKIP_UPLOAD=1` | stage + checksum only; no tag, no push, no publish |
 | `RELEASE_NOTES` | custom GitHub Release notes text |
 | `RELEASE_REMOTE` | git remote to push the tag to (default: auto-detected) |
 

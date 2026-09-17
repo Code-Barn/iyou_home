@@ -2,21 +2,32 @@
 #
 # iyou_home — One-Click Sovereign Release Pipeline
 #
-# Builds macOS (local) and Linux (remote dc13 runner) release bundles,
+# Automatically bumps SemVer across all 5 manifests, commits the bump,
+# builds macOS (local) and Linux (remote dc13 runner) release bundles,
 # triggers Windows NSIS installer compilation via GitHub Actions,
 # stages them under release-artifacts/, computes SHA-256 sums, publishes a
 # GitHub Release for tag "v${VERSION}", and self-checks the download URLs.
+#
+# Usage:
+#   ./scripts/release.sh           # bump patch (default: 0.2.0 -> 0.2.1)
+#   ./scripts/release.sh patch     # explicit patch bump
+#   ./scripts/release.sh minor     # bump minor (0.2.0 -> 0.3.0)
+#   ./scripts/release.sh major     # bump major (0.2.0 -> 1.0.0)
+#   ./scripts/release.sh 0.3.5     # explicit target version
+#   ./scripts/release.sh current   # build/publish current version without bumping
 #
 # Idempotent: safe to re-run when a release tag already exists (it will
 # re-upload and clobber assets). Requires: gh CLI (authenticated), ssh dc13
 # (runner reachable), node/npm, and the Tauri toolchain on the local machine.
 #
 # Env overrides:
+#   BUMP=patch|minor|major|current|X.Y.Z (alternative to CLI argument)
 #   SKIP_MAC=1      skip the local macOS build
 #   SKIP_LINUX=1    skip the remote dc13 Linux build
 #   SKIP_WINDOWS=1  skip the Windows NSIS GitHub Actions build dispatch
 #   SKIP_UPLOAD=1   skip tagging + GitHub release publish (staging only)
 #   RELEASE_NOTES   custom release notes text
+#   RELEASE_REMOTE  target git remote (default: auto-detected)
 #
 set -euo pipefail
 
@@ -26,6 +37,31 @@ fail() { printf '\n[FATAL] %s\n' "$*" >&2; exit 1; }
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
+
+BUMP_ARG="${1:-${BUMP:-patch}}"
+
+if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
+  echo "iyou_home — One-Click Sovereign Release Pipeline"
+  echo ""
+  echo "Usage: $0 [patch|minor|major|<version>|current]"
+  echo ""
+  echo "Arguments:"
+  echo "  patch     Bump patch version (default, e.g. 0.2.0 -> 0.2.1)"
+  echo "  minor     Bump minor version (e.g. 0.2.0 -> 0.3.0)"
+  echo "  major     Bump major version (e.g. 0.2.0 -> 1.0.0)"
+  echo "  X.Y.Z     Bump to explicit SemVer version"
+  echo "  current   Build & publish current version without bumping (alias: none)"
+  echo ""
+  echo "Environment variables:"
+  echo "  BUMP          Alternative to positional argument"
+  echo "  SKIP_MAC=1    Skip local macOS build"
+  echo "  SKIP_LINUX=1  Skip remote dc13 Linux build"
+  echo "  SKIP_WINDOWS=1 Skip Windows NSIS GitHub Actions workflow dispatch"
+  echo "  SKIP_UPLOAD=1 Stage and checksum only (no tag, no push, no publish)"
+  echo "  RELEASE_NOTES Custom release notes string"
+  echo "  RELEASE_REMOTE Target git remote (default: auto-detected)"
+  exit 0
+fi
 
 # Identify the GitHub remote that points at Code-Barn/iyou_home.
 pick_release_remote() {
@@ -43,6 +79,55 @@ REPO="Code-Barn/iyou_home"
 RELEASE_DIR="$ROOT/release-artifacts"
 mkdir -p "$RELEASE_DIR"
 
+# ---------------------------------------------------------------- version bump
+case "$BUMP_ARG" in
+  current|none|0)
+    log "Releasing currently committed version without bumping"
+    ;;
+  patch|minor|major|[0-9]*)
+    log "Bumping version ($BUMP_ARG)..."
+    [[ -z "$(git status --porcelain)" ]] || fail "git working tree is dirty; commit or stash before bumping version"
+
+    CURRENT_VERSION="$(node -p "require('./package.json').version")"
+    log "Current version: ${CURRENT_VERSION}"
+
+    # 1. Update package.json & package-lock.json
+    npm version "$BUMP_ARG" --no-git-tag-version >/dev/null
+    NEW_VERSION="$(node -p "require('./package.json').version")"
+    [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "non-SemVer version '$NEW_VERSION' produced by npm version"
+    log "New version: ${NEW_VERSION}"
+
+    # 2. Update src-tauri/tauri.conf.json
+    node -e '
+      const fs = require("fs");
+      const p = "src-tauri/tauri.conf.json";
+      const conf = JSON.parse(fs.readFileSync(p, "utf8"));
+      conf.version = process.argv[1];
+      fs.writeFileSync(p, JSON.stringify(conf, null, 4) + "\n");
+    ' "$NEW_VERSION"
+
+    # 3. Update src-tauri/Cargo.toml
+    node -e '
+      const fs = require("fs");
+      const p = "src-tauri/Cargo.toml";
+      let content = fs.readFileSync(p, "utf8");
+      content = content.replace(/(\[package\][\s\S]*?version\s*=\s*")[^"]+(")/, `$1${process.argv[1]}$2`);
+      fs.writeFileSync(p, content);
+    ' "$NEW_VERSION"
+
+    # 4. Update src-tauri/Cargo.lock
+    cargo check --manifest-path src-tauri/Cargo.toml --quiet
+
+    # 5. Commit the 5 manifests
+    git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+    git commit -m "chore(release): bump version to v${NEW_VERSION}"
+    log "Committed version bump to v${NEW_VERSION}"
+    ;;
+  *)
+    fail "unrecognized bump argument '$BUMP_ARG' (expected: patch, minor, major, explicit X.Y.Z, or current/none)"
+    ;;
+esac
+
 # ---------------------------------------------------------------- pre-flight
 log "Pre-flight checks"
 
@@ -56,6 +141,7 @@ git rev-parse --git-dir >/dev/null
 command -v gh >/dev/null || fail "gh CLI not found"
 gh auth status >/dev/null 2>&1 || fail "gh not authenticated"
 command -v node >/dev/null || fail "node not found"
+command -v cargo >/dev/null || fail "cargo not found"
 
 if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
   ssh -o BatchMode=yes -o ConnectTimeout=15 dc13 "true" || fail "ssh dc13 unreachable"
@@ -125,6 +211,7 @@ fi
 # ---------------------------------------------------------------- publish
 log "Tagging and publishing v${VERSION} to ${REPO} (remote '${REMOTE}')"
 
+git push "$REMOTE" HEAD
 if ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
   git tag "v${VERSION}"
   log "Created tag v${VERSION}"
