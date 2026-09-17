@@ -38,6 +38,21 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
+      - name: Stage Production Certificates
+        shell: bash
+        env:
+          PROD_CRT_B64: ${{ secrets.PRODUCTION_CRT_B64 }}
+          PROD_KEY_B64: ${{ secrets.PRODUCTION_KEY_B64 }}
+        run: |
+          mkdir -p src-tauri/certs
+          if [ -n "$PROD_CRT_B64" ] && [ -n "$PROD_KEY_B64" ]; then
+            echo "$PROD_CRT_B64" | base64 -d > src-tauri/certs/production.crt
+            echo "$PROD_KEY_B64" | base64 -d > src-tauri/certs/production.key
+          else
+            echo "Generating self-signed fallback certs for home.iyou.me"
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout src-tauri/certs/production.key -out src-tauri/certs/production.crt -days 365 -nodes -subj "/CN=home.iyou.me"
+          fi
+
       - name: Install Frontend Dependencies
         run: npm ci
 
