@@ -17,20 +17,24 @@ the GitHub Release for every version tag — eliminating manual staging and the
 │   ├─ Linux build  (tar . | ssh dc13 → npm ci && tauri build → deb/AppImage)   │
 │   ├─ checksums    (release-artifacts/SHA256SUMS.txt)                           │
 │   ├─ publish      (tag vX.Y.Z, gh release create|upload --clobber)             │
-│   └─ self-check   (curl HEAD each asset URL → [OK]/[FAIL])                     │
+│   ├─ Windows CI   (gh workflow run build-windows.yml -f tag=vX.Y.Z)            │
+│   └─ self-check   (curl HEAD each asset URL → [OK]/[ASYNC]/[FAIL])             │
 └────────────────────────────────────────────────────────────────────────────────┘
-                              │ ssh dc13 (self-hosted runner)
-                              ▼
-┌────────────────────────── dc13 metal runner ──────────────────────────────────┐
-│  ~/build-runner/  (fresh copy of repo each run)                                │
-│  npm ci && npm run tauri build                                                 │
-│  → bundle/deb/*.deb, bundle/appimage/*.AppImage, bundle/rpm/*.rpm              │
-└────────────────────────────────────────────────────────────────────────────────┘
+          │ ssh dc13 (self-hosted runner)       │ gh workflow dispatch
+          ▼                                     ▼
+┌────────────────── dc13 metal runner ┐ ┌────────────── GitHub Actions (windows-latest) ─┐
+│  ~/build-runner/                    │ │  .github/workflows/build-windows.yml             │
+│  npm ci && npm run tauri build      │ │  npm ci && npm run tauri build -- --bundles nsis │
+│  → deb/*.deb, appimage/*.AppImage,  │ │  → bundle/nsis/*-setup.exe                       │
+│    rpm/*.rpm                        │ │  → SHA256SUMS_WINDOWS.txt (gh release upload)    │
+└─────────────────────────────────────┘ └─────────────────────────────────────────────────┘
 ```
 
 Linux bundles are produced on the sovereign self-hosted runner (`dc13`,
 `[self-hosted, linux, dc13, tauri-builder]`) matching `.github/workflows/release.yml`;
-macOS bundles are produced locally via `npm run tauri build`.
+macOS bundles are produced locally via `npm run tauri build`; Windows NSIS installer
+`.exe` bundles are compiled on GitHub Actions (`windows-latest`) via
+`.github/workflows/build-windows.yml` and attached directly to the release upon completion.
 
 ---
 
@@ -92,8 +96,12 @@ What it does, in order:
 5. **Publish** — tags `v${VERSION}` (if absent), pushes the tag, then
    `gh release create` (asset upload). If the release already exists it falls back to
    `gh release upload --clobber`, making the script **idempotent**.
-6. **Self-check** — issues a `curl -I HEAD` against every uploaded asset URL and
-   logs `[OK]` (HTTP 302/200) or `[FAIL]`.
+6. **Windows build dispatch** — unless `SKIP_WINDOWS=1`, dispatches
+   `.github/workflows/build-windows.yml` on the GitHub Actions `windows-latest` runner
+   for `v${VERSION}`. Compilation runs asynchronously (~9-10 mins) and uploads the
+   `.exe` installer and `SHA256SUMS_WINDOWS.txt` directly to the release.
+7. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
+   logs `[OK]` (HTTP 302/200), `[ASYNC]` (for Windows build underway), or `[FAIL]`.
 
 ### Environment overrides
 
@@ -101,6 +109,7 @@ What it does, in order:
 |---|---|
 | `SKIP_MAC=1` | skip the local macOS build (uses existing `release-artifacts` DMG) |
 | `SKIP_LINUX=1` | skip the remote dc13 Linux build |
+| `SKIP_WINDOWS=1` | skip the Windows NSIS GitHub Actions build dispatch |
 | `SKIP_UPLOAD=1` | stage + checksum only; no tag, no publish |
 | `RELEASE_NOTES` | custom GitHub Release notes text |
 | `RELEASE_REMOTE` | git remote to push the tag to (default: auto-detected) |
@@ -113,8 +122,10 @@ release-artifacts/
 ├── iyou-home_<V>_amd64.AppImage     # standalone Linux image
 ├── iyou-home-<V>-1.x86_64.rpm       # Fedora/openSUSE package (best effort)
 ├── iyou-home_<V>_x64.dmg            # macOS Intel disk image
-├── SHA256SUMS.txt                   # all of the above
-└── SHA256SUMS_LINUX.txt             # Linux-only manifest (from CI workflow)
+├── iyou-home_<V>_x64-setup.exe      # Windows NSIS standalone installer
+├── SHA256SUMS.txt                   # Local/Linux manifest
+├── SHA256SUMS_LINUX.txt             # Linux CI manifest
+└── SHA256SUMS_WINDOWS.txt           # Windows CI manifest
 ```
 
 Verify a download against the published manifest:
@@ -127,6 +138,25 @@ shasum -a 256 -c SHA256SUMS.txt
 ---
 
 ## 5. Troubleshooting
+
+### Windows build manual recovery / re-dispatch
+If the Windows GitHub Actions runner fails, times out, or needs to be compiled independently of macOS/Linux:
+```bash
+gh workflow run build-windows.yml -f tag=v0.2.0
+```
+To monitor the build progress:
+```bash
+gh run list --workflow="build-windows.yml"
+gh run watch <RUN_ID>
+```
+Once complete, verify the uploaded executable asset on the release:
+```bash
+gh release view v0.2.0 --json assets
+```
+When iterating on macOS or Linux builds locally without needing a Windows binary rebuilt, pass `SKIP_WINDOWS=1`:
+```bash
+SKIP_WINDOWS=1 ./scripts/release.sh
+```
 
 ### Uploads fail / the release stays a draft
 - `gh release create` uploads assets **sequentially**; a 100 MB+ AppImage can exceed
@@ -166,10 +196,15 @@ validation will abort.
 
 ---
 
-## 6. Reference: existing GitHub Release workflow
+## 6. Reference: GitHub Actions workflows
 
-`.github/workflows/release.yml` mirrors the Linux half of this pipeline on
-push of `v*` tags (self-hosted `dc13` runner, `npm ci`, `npm run tauri build`,
-checksum staging, optional asset publish on tag push). `scripts/release.sh` is the
-interactive/manual equivalent used for production releases, and also handles the
-macOS DMG that the CI workflow does not build.
+- `.github/workflows/release.yml` mirrors the Linux half of this pipeline on
+  push of `v*` tags (self-hosted `dc13` runner, `npm ci`, `npm run tauri build`,
+  checksum staging, optional asset publish on tag push).
+- `.github/workflows/build-windows.yml` compiles the native Windows standalone
+  installer (`.exe`) via NSIS on GitHub-hosted `windows-latest` runners, stages
+  TLS assets, computes SHA-256 sums, and uploads `iyou-home_<V>_x64-setup.exe` and
+  `SHA256SUMS_WINDOWS.txt` to the release.
+- `scripts/release.sh` is the unified, interactive one-command entry point that
+  coordinates macOS local compilation, Linux dc13 streaming, GitHub release publishing,
+  and the Windows CI build dispatch.

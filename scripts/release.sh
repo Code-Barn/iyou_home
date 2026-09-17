@@ -3,6 +3,7 @@
 # iyou_home — One-Click Sovereign Release Pipeline
 #
 # Builds macOS (local) and Linux (remote dc13 runner) release bundles,
+# triggers Windows NSIS installer compilation via GitHub Actions,
 # stages them under release-artifacts/, computes SHA-256 sums, publishes a
 # GitHub Release for tag "v${VERSION}", and self-checks the download URLs.
 #
@@ -13,6 +14,7 @@
 # Env overrides:
 #   SKIP_MAC=1      skip the local macOS build
 #   SKIP_LINUX=1    skip the remote dc13 Linux build
+#   SKIP_WINDOWS=1  skip the Windows NSIS GitHub Actions build dispatch
 #   SKIP_UPLOAD=1   skip tagging + GitHub release publish (staging only)
 #   RELEASE_NOTES   custom release notes text
 #
@@ -134,9 +136,11 @@ assets=(
   "$RELEASE_DIR/iyou-home_${VERSION}_amd64.deb"
   "$RELEASE_DIR/iyou-home_${VERSION}_amd64.AppImage"
   "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
+  "$RELEASE_DIR/iyou-home_${VERSION}_x64-setup.exe"
   "$RELEASE_DIR"/iyou-home-*.rpm
   "$RELEASE_DIR/SHA256SUMS.txt"
   "$RELEASE_DIR/SHA256SUMS_LINUX.txt"
+  "$RELEASE_DIR/SHA256SUMS_WINDOWS.txt"
 )
 asset_args=()
 for a in "${assets[@]}"; do
@@ -146,6 +150,15 @@ done
 if ! gh release create "v${VERSION}" "${asset_args[@]}" --repo "$REPO" --title "iyou_home v${VERSION}" --notes "$notes" 2>/dev/null; then
   log "Release v${VERSION} already exists — uploading and clobbering assets."
   gh release upload "v${VERSION}" "${asset_args[@]}" --repo "$REPO" --clobber
+fi
+
+if [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
+  log "Triggering Windows NSIS build on GitHub Actions runner..."
+  gh workflow run build-windows.yml --repo "$REPO" -f tag="v${VERSION}"
+  log "Windows NSIS build dispatched (~9-10 min build time on windows-latest)."
+  log "The .exe installer and SHA256SUMS_WINDOWS.txt will attach directly to release v${VERSION} upon completion."
+else
+  log "Skipping Windows build dispatch (SKIP_WINDOWS=1)"
 fi
 
 # ---------------------------------------------------------------- self-check
@@ -161,6 +174,23 @@ for a in "${asset_args[@]}"; do
     printf '  [OK]   %-40s HTTP %s\n' "$name" "$code"
   fi
 done
+
+# Acknowledge Windows NSIS assets in self-check
+win_exe="iyou-home_${VERSION}_x64-setup.exe"
+win_code="$(curl -sI -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/v${VERSION}/${win_exe}" || true)"
+if [[ "$win_code" == "302" || "$win_code" == "200" ]]; then
+  printf '  [OK]   %-40s HTTP %s\n' "$win_exe" "$win_code"
+elif [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
+  printf '  [ASYNC] %-40s (Compiling via GitHub Actions windows-latest runner...)\n' "$win_exe"
+fi
+
+win_sum="SHA256SUMS_WINDOWS.txt"
+win_sum_code="$(curl -sI -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/v${VERSION}/${win_sum}" || true)"
+if [[ "$win_sum_code" == "302" || "$win_sum_code" == "200" ]]; then
+  printf '  [OK]   %-40s HTTP %s\n' "$win_sum" "$win_sum_code"
+elif [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
+  printf '  [ASYNC] %-40s (Will attach with Windows .exe on completion)\n' "$win_sum"
+fi
 
 [[ "$failed" == "0" ]] || fail "one or more assets returned a non-200/302 status"
 log "Release automation complete: https://github.com/$REPO/releases/tag/v${VERSION}"
