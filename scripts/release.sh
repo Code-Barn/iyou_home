@@ -149,7 +149,7 @@ fi
 
 # ---------------------------------------------------------------- stage
 log "Staging directory: ${RELEASE_DIR}"
-rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt
+rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt
 
 # ---------------------------------------------------------------- Mac build
 if [[ "${SKIP_MAC:-0}" != "1" ]]; then
@@ -209,6 +209,190 @@ fi
   fi
 )
 
+# ---------------------------------------------------------------- mirrors
+log "Generating BitTorrent metainfo and IPFS mirror manifests"
+
+# 1. BitTorrent (.torrent + magnet URI)
+TORRENT_FILE="iyou-home_${VERSION}.torrent"
+TORRENT_PATH="$RELEASE_DIR/$TORRENT_FILE"
+
+PYTHON_BIN=""
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+fi
+
+if [[ -n "$PYTHON_BIN" ]]; then
+  log "Generating BitTorrent metainfo using $PYTHON_BIN (bencode engine)..."
+  eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" << 'PYEOF'
+import os
+import sys
+import hashlib
+import time
+import urllib.parse
+
+def bencode(val):
+    if isinstance(val, int):
+        return f"i{val}e".encode("ascii")
+    elif isinstance(val, str):
+        b = val.encode("utf-8")
+        return f"{len(b)}:".encode("ascii") + b
+    elif isinstance(val, bytes):
+        return f"{len(val)}:".encode("ascii") + val
+    elif isinstance(val, list):
+        return b"l" + b"".join(bencode(x) for x in val) + b"e"
+    elif isinstance(val, dict):
+        items = []
+        for k, v in val.items():
+            kb = k.encode("utf-8") if isinstance(k, str) else k
+            items.append((kb, v))
+        items.sort(key=lambda x: x[0])
+        res = b"d"
+        for kb, v in items:
+            res += f"{len(kb)}:".encode("ascii") + kb + bencode(v)
+        res += b"e"
+        return res
+    raise TypeError(f"Cannot bencode {type(val)}")
+
+release_dir = sys.argv[1]
+version = sys.argv[2]
+torrent_name = f"iyou-home_{version}.torrent"
+torrent_path = os.path.join(release_dir, torrent_name)
+
+trackers = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce"
+]
+
+files = []
+if os.path.isdir(release_dir):
+    for f in sorted(os.listdir(release_dir)):
+        full = os.path.join(release_dir, f)
+        if os.path.isfile(full):
+            # Include installer packages, exclude .torrent and .txt
+            if (f.startswith(('iyou-home_', 'iyou-home-')) and not f.endswith(('.torrent', '.txt'))) or f.endswith(('.deb', '.AppImage', '.dmg', '.exe', '.rpm')):
+                files.append(f)
+
+if not files:
+    btih = "0" * 40
+    magnet = f"magnet:?xt=urn:btih:{btih}&dn=iyou-home_{version}"
+    for tr in trackers:
+        magnet += f"&tr={urllib.parse.quote(tr, safe='')}"
+    print(f"BTIH={btih}")
+    print(f"MAGNET_LINK='{magnet}'")
+    sys.exit(0)
+
+piece_len = 262144  # 256 KiB
+pieces = bytearray()
+buffer = bytearray()
+files_info = []
+
+for f in files:
+    full = os.path.join(release_dir, f)
+    sz = os.path.getsize(full)
+    files_info.append({"length": sz, "path": [f]})
+    with open(full, "rb") as fh:
+        while True:
+            chunk = fh.read(piece_len - len(buffer))
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            if len(buffer) == piece_len:
+                pieces.extend(hashlib.sha1(buffer).digest())
+                buffer.clear()
+
+if len(buffer) > 0:
+    pieces.extend(hashlib.sha1(buffer).digest())
+    buffer.clear()
+
+info_dict = {
+    "files": files_info,
+    "name": f"iyou-home_{version}",
+    "piece length": piece_len,
+    "pieces": bytes(pieces),
+}
+
+torrent_dict = {
+    "announce": trackers[0],
+    "announce-list": [[tr] for tr in trackers],
+    "comment": f"iyou_home v{version} sovereign release",
+    "created by": "iyou_home release automation",
+    "creation date": int(time.time()),
+    "info": info_dict,
+}
+
+info_bencoded = bencode(info_dict)
+btih = hashlib.sha1(info_bencoded).hexdigest()
+
+with open(torrent_path, "wb") as fh:
+    fh.write(bencode(torrent_dict))
+
+magnet = f"magnet:?xt=urn:btih:{btih}&dn=iyou-home_{version}"
+for tr in trackers:
+    magnet += f"&tr={urllib.parse.quote(tr, safe='')}"
+
+print(f"BTIH={btih}")
+print(f"MAGNET_LINK='{magnet}'")
+PYEOF
+)"
+  log "BitTorrent Info Hash (BTIH): ${BTIH}"
+  log "Magnet URI: ${MAGNET_LINK}"
+else
+  log "Warning: Python interpreter not found; skipping BitTorrent generation"
+  BTIH="[NOT_GENERATED]"
+  MAGNET_LINK="[NOT_GENERATED]"
+fi
+
+# 2. IPFS Root CID & Gateways
+IPFS_ROOT_CID=""
+if command -v ipfs >/dev/null 2>&1; then
+  log "Computing deterministic IPFS root CID via local ipfs CLI..."
+  IPFS_ROOT_CID="$(ipfs add -r -Q --only-hash "$RELEASE_DIR" 2>/dev/null || true)"
+elif ssh -o BatchMode=yes -o ConnectTimeout=5 dc13 'export PATH="$PATH:/usr/local/bin"; which ipfs' >/dev/null 2>&1; then
+  log "Computing deterministic IPFS root CID via runner dc13..."
+  tar_flags=(--exclude='.DS_Store' --exclude='MIRRORS.txt')
+  if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
+    tar_flags+=(--no-xattrs)
+  fi
+  IPFS_ROOT_CID="$(tar "${tar_flags[@]}" -czf - -C "$RELEASE_DIR" . | ssh -o BatchMode=yes dc13 '
+    export PATH="$PATH:/usr/local/bin"
+    TMPDIR=$(mktemp -d)
+    tar -xzf - -C "$TMPDIR"
+    ipfs add -r -Q --only-hash "$TMPDIR" 2>/dev/null || true
+    rm -rf "$TMPDIR"
+  ')"
+fi
+
+if [[ -n "$IPFS_ROOT_CID" && "$IPFS_ROOT_CID" =~ ^Qm[1-9A-HJ-NP-Za-km-z]{44}|^bafy[a-z0-9]+ ]]; then
+  IPFS_GATEWAY_URL="https://ipfs.io/ipfs/${IPFS_ROOT_CID}/"
+  IPFS_ALT_GATEWAY_URL="https://dweb.link/ipfs/${IPFS_ROOT_CID}/"
+  IPFS_NATIVE_URI="ipfs://${IPFS_ROOT_CID}/"
+  log "IPFS Root CID: ${IPFS_ROOT_CID}"
+  log "IPFS Gateway URL: ${IPFS_GATEWAY_URL}"
+else
+  IPFS_ROOT_CID="[PENDING_CLUSTER_PIN]"
+  IPFS_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
+  IPFS_ALT_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
+  IPFS_NATIVE_URI="[PENDING_CLUSTER_PIN]"
+  log "IPFS CLI not available locally or on runner dc13; marked [PENDING_CLUSTER_PIN]"
+fi
+
+# 3. Assemble MIRRORS.txt
+cat << EOF > "$RELEASE_DIR/MIRRORS.txt"
+RELEASE_VERSION=v${VERSION}
+MAGNET_LINK=${MAGNET_LINK}
+TORRENT_FILE=${TORRENT_FILE}
+IPFS_ROOT_CID=${IPFS_ROOT_CID}
+IPFS_GATEWAY_URL=${IPFS_GATEWAY_URL}
+IPFS_ALT_GATEWAY_URL=${IPFS_ALT_GATEWAY_URL}
+IPFS_NATIVE_URI=${IPFS_NATIVE_URI}
+EOF
+
+log "MIRRORS.txt:"
+cat "$RELEASE_DIR/MIRRORS.txt"
+
 if [[ "${SKIP_UPLOAD:-0}" == "1" ]]; then
   log "SKIP_UPLOAD=1 — staged assets only; not tagging or publishing."
   exit 0
@@ -234,6 +418,8 @@ assets=(
   "$RELEASE_DIR/SHA256SUMS.txt"
   "$RELEASE_DIR/SHA256SUMS_LINUX.txt"
   "$RELEASE_DIR/SHA256SUMS_WINDOWS.txt"
+  "$RELEASE_DIR/iyou-home_${VERSION}.torrent"
+  "$RELEASE_DIR/MIRRORS.txt"
 )
 asset_args=()
 for a in "${assets[@]}"; do

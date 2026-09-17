@@ -16,6 +16,7 @@ the GitHub Release for every version tag — eliminating manual staging and the
 │   ├─ macOS build  (npm run tauri build → .dmg → release-artifacts/)            │
 │   ├─ Linux build  (tar . | ssh dc13 → npm ci && tauri build → deb/AppImage)   │
 │   ├─ checksums    (release-artifacts/SHA256SUMS.txt)                           │
+│   ├─ mirrors      (BitTorrent .torrent, magnet URI & IPFS root CID)            │
 │   ├─ publish      (tag vX.Y.Z, gh release create|upload --clobber)             │
 │   ├─ Windows CI   (gh workflow run build-windows.yml -f tag=vX.Y.Z)            │
 │   └─ self-check   (curl HEAD each asset URL → [OK]/[ASYNC]/[FAIL])             │
@@ -122,14 +123,21 @@ What it does, in order:
    *Note:* the stream uses `--no-xattrs` on macOS `bsdtar` — without it the pipe
    stalls on per-file extended-attribute headers.
 5. **Checksums** — writes `release-artifacts/SHA256SUMS.txt`.
-6. **Publish** — pushes branch `HEAD` to `$REMOTE`, tags `v${VERSION}` (if absent),
+6. **Peer-to-Peer Mirrors** — packages all installer binaries into
+   `release-artifacts/iyou-home_${VERSION}.torrent` embedded with public trackers
+   (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.stealth.si:80/announce`,
+   `udp://tracker.torrent.eu.org:451/announce`), computes the 40-character BitTorrent
+   Info Hash (BTIH) and standard Magnet URI, computes the deterministic IPFS root CID
+   (using local `ipfs` or the `dc13` runner with `ipfs add -r -Q --only-hash`), and writes
+   structured mirror links to `release-artifacts/MIRRORS.txt`.
+7. **Publish** — pushes branch `HEAD` to `$REMOTE`, tags `v${VERSION}` (if absent),
    pushes the tag, then `gh release create` (asset upload). If the release already exists
    it falls back to `gh release upload --clobber`, making the script **idempotent**.
-7. **Windows build dispatch** — unless `SKIP_WINDOWS=1`, dispatches
+8. **Windows build dispatch** — unless `SKIP_WINDOWS=1`, dispatches
    `.github/workflows/build-windows.yml` on the GitHub Actions `windows-latest` runner
    for `v${VERSION}`. Compilation runs asynchronously (~9-10 mins) and uploads the
    `.exe` installer and `SHA256SUMS_WINDOWS.txt` directly to the release.
-8. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
+9. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
    logs `[OK]` (HTTP 302/200), `[ASYNC]` (for Windows build underway), or `[FAIL]`.
 
 ### Environment overrides
@@ -153,6 +161,8 @@ release-artifacts/
 ├── iyou-home-<V>-1.x86_64.rpm       # Fedora/openSUSE package (best effort)
 ├── iyou-home_<V>_x64.dmg            # macOS Intel disk image
 ├── iyou-home_<V>_x64-setup.exe      # Windows NSIS standalone installer
+├── iyou-home_<V>.torrent            # BitTorrent metainfo bundle
+├── MIRRORS.txt                      # P2P mirrors manifest (magnet & IPFS)
 ├── SHA256SUMS.txt                   # Local/Linux manifest
 ├── SHA256SUMS_LINUX.txt             # Linux CI manifest
 └── SHA256SUMS_WINDOWS.txt           # Windows CI manifest
@@ -164,6 +174,24 @@ Verify a download against the published manifest:
 curl -sLO https://github.com/Code-Barn/iyou_home/releases/download/v0.2.0/SHA256SUMS.txt
 shasum -a 256 -c SHA256SUMS.txt
 ```
+
+### Peer-to-Peer Mirrors & IPFS Manifest (`MIRRORS.txt`)
+
+Every release automatically generates and publishes `MIRRORS.txt` containing direct
+decentralized retrieval URIs:
+
+```ini
+RELEASE_VERSION=v0.2.0
+MAGNET_LINK=magnet:?xt=urn:btih:d96ed3eb2faf...&dn=iyou-home_0.2.0&tr=udp%3A%2F%2Ftracker.opentrackr.org...
+TORRENT_FILE=iyou-home_0.2.0.torrent
+IPFS_ROOT_CID=Qm...
+IPFS_GATEWAY_URL=https://ipfs.io/ipfs/Qm.../
+IPFS_ALT_GATEWAY_URL=https://dweb.link/ipfs/Qm.../
+IPFS_NATIVE_URI=ipfs://Qm.../
+```
+
+- **BitTorrent Client:** Open `iyou-home_<V>.torrent` or copy `MAGNET_LINK` into any standard client (Transmission, qBittorrent, aria2c).
+- **IPFS Gateways:** Fetch directly via public gateway (`IPFS_GATEWAY_URL`) or natively via Brave/IPFS daemon (`IPFS_NATIVE_URI`).
 
 ---
 
