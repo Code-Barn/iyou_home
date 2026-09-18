@@ -21,6 +21,7 @@ import { TlsStatus } from "../lib/types";
 import BlossomBrowser from "./BlossomBrowser";
 import SovereignFootprint from "./SovereignFootprint";
 import SovereigntyStatusPanel from "./SovereigntyStatusPanel";
+import InviteManager from "./invites/InviteManager";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -68,7 +69,7 @@ const AUTO_START_DEFAULTS: Record<string, boolean> = {
 };
 
 export default function ServiceSwitchPanel() {
-  const [subView, setSubView] = useState<"daemons" | "media">("daemons");
+  const [subView, setSubView] = useState<"daemons" | "media" | "invites">("daemons");
   const [serviceStatus, setServiceStatus] = useState<
     Record<string, ServiceStatus>
   >({
@@ -246,6 +247,24 @@ export default function ServiceSwitchPanel() {
           }}
         >
           🗄️ Offline Media Vault
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubView("invites")}
+          style={{
+            padding: "0.6rem 1.2rem",
+            background: subView === "invites" ? "#312e81" : "transparent",
+            color: subView === "invites" ? "#ffffff" : "#4b5563",
+            border: "none",
+            borderRadius: "6px",
+            fontWeight: 600,
+            fontSize: "0.9rem",
+            boxShadow: subView === "invites" ? "0 2px 4px rgba(0,0,0,0.1)" : "none",
+            cursor: "pointer",
+            transition: "all 0.15s",
+          }}
+        >
+          📨 Invites & Referrals
         </button>
       </div>
 
@@ -455,6 +474,8 @@ export default function ServiceSwitchPanel() {
       )}
 
       {subView === "media" && <BlossomBrowser />}
+
+      {subView === "invites" && <InviteManager />}
     </>
   );
 }

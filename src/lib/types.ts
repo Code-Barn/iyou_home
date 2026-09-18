@@ -258,3 +258,75 @@ export interface TlsStatus {
   domain: string;
   cert_path: string;
 }
+
+// ---------- Invite Capability Tokens (RFC-002) ----------
+
+/** Issuer / invite tier. Wire values are lowercase: "admin" | "member" | "guest". */
+export type InviteTier = "admin" | "member" | "guest";
+
+/** Mirrors the Rust `invites::InviteCapabilityToken` (RFC-002 §3). */
+export interface InviteCapabilityToken {
+  v: number;
+  issuer_did: string;
+  /** Empty string = portable across satellites. */
+  satellite_id: string;
+  /** >= 16 random hex bytes (32+ lowercase hex chars). */
+  nonce: string;
+  max_uses: number;
+  uses_count: number;
+  tier: InviteTier;
+  created_at: number;
+  expires_at: number;
+  scope: string[];
+  /** Base58 Ed25519 signature over SHA-256(canonical payload). */
+  signature: string;
+}
+
+/** Outcome of the admission-gate preview (`validate_invite_token`). */
+export interface ValidationResult {
+  valid: boolean;
+  /** RFC-002 denial code when invalid: INVITE_INVALID | EXPIRED | USED | REVOKED. */
+  reason?: string | null;
+  detail?: string | null;
+  issuer_did?: string | null;
+  tier?: InviteTier | null;
+  expires_at?: number | null;
+}
+
+/** One issued invite row (mirrors `invites::InviteRecord`). */
+export interface InviteRecord {
+  nonce: string;
+  /** Full signed token JSON — copyable and QR-encodable. */
+  token_json: string;
+  issuer_did: string;
+  tier: InviteTier;
+  created_at: number;
+  expires_at: number;
+  /** Recipient DID once claimed; null while unclaimed. */
+  child_did?: string | null;
+  uses_count: number;
+  max_uses: number;
+  /** "live" | "used" | "revoked" | "expired". */
+  status: "live" | "used" | "revoked" | "expired";
+}
+
+/** Vetting progress for the issuer badge (RFC-002 §5.2). */
+export interface VettingStatus {
+  account_age_days: number;
+  contact_count: number;
+  active_moderation_flags: number;
+  account_age_ok: boolean;
+  contacts_ok: boolean;
+  flags_ok: boolean;
+  eligible: boolean;
+}
+
+/** Issuer standing (mirrors `invites::IssuerStatus`). */
+export interface IssuerStatus {
+  did: string;
+  role: InviteTier;
+  quota_used_last_30d: number;
+  /** 0 = unlimited (admin). */
+  quota_limit: number;
+  vetting: VettingStatus;
+}

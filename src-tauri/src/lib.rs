@@ -38,6 +38,7 @@ mod blossom;
 mod bridge;
 mod certs;
 mod contacts;
+mod invites;
 mod nostr_relay;
 mod omemo;
 mod pairing;
@@ -796,6 +797,141 @@ fn sign_auth_challenge(
 #[tauri::command]
 fn get_public_did_document(did: String) -> Result<String, String> {
     did_rust::resolve_did(&did).map_err(|e| format!("Failed to resolve DID document: {}", e))
+}
+
+// ---------- invite capability tokens (RFC-002) ----------
+
+/// Mint a signed invite capability token with the active Level 1 identity.
+/// Issuance is gated on the caller's resolved role (RFC-002 §5.2): Admin is
+/// unlimited, Member is vetted and quota-capped at 3 per rolling 30 days,
+/// Guest cannot mint.
+#[tauri::command]
+fn create_invite_token(
+    app: AppHandle,
+    tier: String,
+    max_uses: u32,
+    valid_days: u64,
+    scope: Vec<String>,
+    satellite_id: Option<String>,
+) -> Result<invites::InviteCapabilityToken, String> {
+    if crate::enclave_is_locked(&app) {
+        return Err("Enclave is locked. Unlock iyou_home to authorize signing.".to_string());
+    }
+    let (signing_key, did) = resolve_profile_keypair(&app, None)?;
+    invites::mint_invite_token(
+        &app,
+        &signing_key,
+        &did,
+        &tier,
+        max_uses,
+        valid_days,
+        scope,
+        satellite_id,
+    )
+}
+
+/// List every issued invite (newest first) with its computed status pill.
+#[tauri::command]
+fn list_invites(app: AppHandle) -> Result<Vec<invites::InviteRecord>, String> {
+    let conn = invites::invites_connection(&app)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    invites::list_invite_records(&conn, now)
+}
+
+/// Revoke an invite by nonce: tombstones the nonce, stamps `revoked_at` on
+/// the graph edge and token store, and refuses unknown nonces (fail-closed).
+#[tauri::command]
+fn revoke_invite(app: AppHandle, nonce: String) -> Result<(), String> {
+    if crate::enclave_is_locked(&app) {
+        return Err("Enclave is locked. Unlock iyou_home to authorize revocation.".to_string());
+    }
+    let (_, did) = resolve_profile_keypair(&app, None)?;
+    let mut conn = invites::invites_connection(&app)?;
+    invites::revoke_invite_nonce(&mut conn, &nonce, &did)
+}
+
+/// Admission-gate preview: schema → expiry → signature → revocation → use
+/// budget → replay/self-claim, returning the RFC-002 denial code on failure.
+#[tauri::command]
+fn validate_invite_token(
+    app: AppHandle,
+    token_json: String,
+    presenting_did: String,
+) -> Result<invites::ValidationResult, String> {
+    let token: invites::InviteCapabilityToken = serde_json::from_str(&token_json)
+        .map_err(|e| format!("Invalid token schema: {}", e))?;
+    let conn = invites::invites_connection(&app)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let revoked = invites::is_nonce_revoked(&conn, &token.nonce)?;
+    let (known_uses, claimed_child) = invites::lookup_issued_uses(&conn, &token.nonce)?
+        .map(|(uses, child)| (Some(uses), child))
+        .unwrap_or((None, String::new()));
+    let claimed = if claimed_child.is_empty() {
+        None
+    } else {
+        Some(claimed_child)
+    };
+    let outcome = invites::validate_token(
+        &token,
+        now,
+        revoked,
+        known_uses,
+        claimed.as_deref(),
+        &presenting_did,
+    );
+    match outcome {
+        Ok(()) => Ok(invites::ValidationResult {
+            valid: true,
+            reason: None,
+            detail: None,
+            issuer_did: Some(token.issuer_did),
+            tier: Some(token.tier),
+            expires_at: Some(token.expires_at),
+        }),
+        Err(reason) => Ok(invites::ValidationResult {
+            valid: false,
+            reason: Some(reason.code().to_string()),
+            detail: Some(reason.message()),
+            issuer_did: Some(token.issuer_did),
+            tier: Some(token.tier),
+            expires_at: Some(token.expires_at),
+        }),
+    }
+}
+
+/// Issuer standing for the UI badge: role, rolling quota, vetting progress.
+#[tauri::command]
+fn get_issuer_status(app: AppHandle) -> Result<invites::IssuerStatus, String> {
+    let (_, did) = resolve_profile_keypair(&app, None)?;
+    invites::issuer_status(&app, &did)
+}
+
+/// Operator configuration: upsert an issuer role in the local registry.
+/// This mirrors the RFC-002 node-side `admin_dids` list for the stand-alone
+/// client so Admin tier (unlimited) issuance can be exercised locally.
+#[tauri::command]
+fn set_issuer_role(app: AppHandle, did: String, role: String) -> Result<(), String> {
+    if did.trim().is_empty() {
+        return Err("issuer DID must not be empty".to_string());
+    }
+    let role_enum = invites::InviteTier::parse(&role)?;
+    let conn = invites::invites_connection(&app)?;
+    invites::set_issuer_role_in_db(&conn, &did, role_enum)
+}
+
+/// Render a signed invite token as a base64 PNG data URL for display.
+#[tauri::command]
+fn render_invite_qr(token_json: String) -> Result<String, String> {
+    // Reject malformed payloads before handing bytes to the QR encoder.
+    let _: serde_json::Value = serde_json::from_str(&token_json)
+        .map_err(|e| format!("Invalid token JSON for QR encoding: {}", e))?;
+    crate::pairing::render_qr_png_b64(&token_json)
 }
 
 pub fn focus_main_window(app: &AppHandle) {
@@ -3087,6 +3223,13 @@ pub fn run() {
             remove_profile,
             sign_auth_challenge,
             get_public_did_document,
+            create_invite_token,
+            list_invites,
+            revoke_invite,
+            validate_invite_token,
+            get_issuer_status,
+            set_issuer_role,
+            render_invite_qr,
             submit_ws_response,
             submit_ws_event_response,
             submit_ws_credential_response,
