@@ -1,7 +1,7 @@
 RELEASE_VERSION=v0.2.1
-MAGNET_LINK=magnet:?xt=urn:btih:cac4b4c62f319c0d62764d588973a92f6105e537&dn=iyou-home_0.2.1&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce
+MAGNET_LINK=magnet:?xt=urn:btih:009db8abe8badd124b262b756c243141d3bf4548&dn=iyou-home_0.2.1&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce
 TORRENT_FILE=iyou-home_0.2.1.torrent
-IPFS_ROOT_CID=Qmc2HhYkib3rtpSNUU8BnuKJMnAbV3QwY622NsUSwvxVKm
-IPFS_GATEWAY_URL=https://ipfs.io/ipfs/Qmc2HhYkib3rtpSNUU8BnuKJMnAbV3QwY622NsUSwvxVKm/
-IPFS_ALT_GATEWAY_URL=https://dweb.link/ipfs/Qmc2HhYkib3rtpSNUU8BnuKJMnAbV3QwY622NsUSwvxVKm/
-IPFS_NATIVE_URI=ipfs://Qmc2HhYkib3rtpSNUU8BnuKJMnAbV3QwY622NsUSwvxVKm/
+IPFS_ROOT_CID=QmeGFPQwTAN8gBtZR2LqACEsqH1tsY2GccAU5hwgnYtmEg
+IPFS_GATEWAY_URL=https://ipfs.io/ipfs/QmeGFPQwTAN8gBtZR2LqACEsqH1tsY2GccAU5hwgnYtmEg/
+IPFS_ALT_GATEWAY_URL=https://dweb.link/ipfs/QmeGFPQwTAN8gBtZR2LqACEsqH1tsY2GccAU5hwgnYtmEg/
+IPFS_NATIVE_URI=ipfs://QmeGFPQwTAN8gBtZR2LqACEsqH1tsY2GccAU5hwgnYtmEg/
