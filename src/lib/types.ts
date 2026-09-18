@@ -17,6 +17,13 @@
 
 export type TrustLevel = 'level0' | 'level0_5' | 'level1' | 'Level0' | 'Level0_5' | 'Level1';
 
+/**
+ * First-run lifecycle mirror of the Rust `vault::VaultStatus` enum. The
+ * gateway renders for `"Uninitialized"`; `"Corrupt"` is a terminal error
+ * state that must never be silently regenerated.
+ */
+export type VaultStatus = "Uninitialized" | "Ready" | "Corrupt";
+
 export interface Profile {
   profile_id: string;
   profile_name: string;

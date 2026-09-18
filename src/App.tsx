@@ -18,10 +18,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ChatPeerTarget, PersonaProfile, UserPreferences } from "./lib/types";
+import type { ChatPeerTarget, PersonaProfile, UserPreferences, VaultStatus } from "./lib/types";
 import { inactivityMinutesToMs, loadUserPreferences } from "./lib/appLock";
 import AppLockOverlay from "./components/auth/AppLockOverlay";
 import FirstRunSeedGate from "./components/auth/FirstRunSeedGate";
+import FirstRunGateway from "./components/onboarding/FirstRunGateway";
 import GlobalStatusBar from "./components/GlobalStatusBar";
 import ServiceSwitchPanel from "./components/ServiceSwitchPanel";
 import KeysManager from "./components/KeysManager";
@@ -83,10 +84,42 @@ function App() {
 
   // App-lock / first-run seed-gate state.
   const [prefs, setPrefs] = useState<UserPreferences | null>(null);
-  const [vaultExists, setVaultExists] = useState(false);
+  // Vault lifecycle: null until the boot query resolves.
+  const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
+  // True while the onboarding gateway is on screen. Stays true across the
+  // Create ceremony (when the vault flips to Ready on disk but the user has
+  // not yet finished writing down the seed) so the gateway never unmounts
+  // mid-ceremony. Cleared by `handleInitialized` after services start.
+  const [gatewayActive, setGatewayActive] = useState(false);
   const [isAppLocked, setIsAppLocked] = useState(false);
   const [authSessionValidUntil, setAuthSessionValidUntil] = useState<number>(0);
   const lastActivityRef = useRef<number>(Date.now());
+
+  const isVaultReady = vaultStatus === "Ready";
+  const vaultExists = vaultStatus !== null && vaultStatus !== "Uninitialized";
+  const showGateway =
+    vaultStatus === "Uninitialized" || gatewayActive;
+
+  /** Re-query the vault lifecycle from the backend. */
+  const checkVaultStatus = useCallback(async (): Promise<VaultStatus> => {
+    const status = await invoke<VaultStatus>("get_vault_status").catch(
+      () => "Uninitialized" as VaultStatus,
+    );
+    setVaultStatus(status);
+    setGatewayActive(status === "Uninitialized");
+    return status;
+  }, []);
+
+  /** Fired by the gateway once the vault is provisioned: start the deferred
+   *  daemon fleet (SigBridge + auto-start services) and enter the app. */
+  const handleInitialized = useCallback(async () => {
+    try {
+      await invoke("start_ready_services");
+    } catch {
+      // Daemons are best-effort and must never block navigation.
+    }
+    await checkVaultStatus();
+  }, [checkVaultStatus]);
 
   const unlockApp = useCallback(() => {
     lastActivityRef.current = Date.now();
@@ -171,19 +204,25 @@ function App() {
     };
   }, []);
 
-  // Load stored preferences + vault existence once at boot.
+  // Load stored preferences + vault lifecycle once at boot. A greenfield
+  // vault ("Uninitialized") never enables the app lock and routes straight to
+  // the onboarding gateway.
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const [loadedPrefs, hasVault] = await Promise.all([
+      const [loadedPrefs, status] = await Promise.all([
         loadUserPreferences(),
-        invoke<boolean>("get_vault_status").catch(() => false),
+        invoke<VaultStatus>("get_vault_status").catch(
+          () => "Uninitialized" as VaultStatus,
+        ),
       ]);
       if (!mounted) return;
       setPrefs(loadedPrefs);
-      setVaultExists(hasVault === true);
+      setVaultStatus(status);
+      setGatewayActive(status === "Uninitialized");
+      const hasVault = status === "Ready";
       const shouldLock =
-        hasVault === true &&
+        hasVault &&
         loadedPrefs.app_lock_enabled &&
         (!!loadedPrefs.app_lock_pin_hash || !!loadedPrefs.app_lock_prf_hash);
       setIsAppLocked(shouldLock);
@@ -259,9 +298,10 @@ function App() {
     return () => window.removeEventListener("contextmenu", handleContextMenu);
   }, []);
 
-  // Periodic inactivity check while the app lock is armed.
+  // Periodic inactivity check while the app lock is armed. Only arms for a
+  // Ready vault — the onboarding gateway and corrupt state are never locked.
   useEffect(() => {
-    if (!prefs?.app_lock_enabled || !vaultExists) return;
+    if (!prefs?.app_lock_enabled || !isVaultReady) return;
     const timeoutMs = inactivityMinutesToMs(prefs.inactivity_timeout_minutes);
     if (timeoutMs <= 0) return;
     const interval = setInterval(() => {
@@ -274,7 +314,7 @@ function App() {
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [prefs?.app_lock_enabled, prefs?.inactivity_timeout_minutes, vaultExists, isAppLocked]);
+  }, [prefs?.app_lock_enabled, prefs?.inactivity_timeout_minutes, isVaultReady, isAppLocked]);
 
   // Keep the backend enclave lock flag in sync with the frontend lock state.
   // This gates external signing at the signature bridge while locked.
@@ -289,6 +329,102 @@ function App() {
   }, []);
 
   const visibleTabs = TABS.filter((t) => !t.devOnly || showDevMode);
+
+  // Boot splash while the vault lifecycle query is in flight — avoids
+  // flashing the gateway (or the tabs) before the backend answers.
+  if (vaultStatus === null) {
+    return (
+      <div
+        data-testid="boot-splash"
+        style={{
+          position: "fixed",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#0f172a",
+          color: "#a5b4fc",
+          fontFamily:
+            "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+          fontSize: "0.95rem",
+        }}
+      >
+        Initializing sovereign enclave…
+      </div>
+    );
+  }
+
+  // Corrupt vault: a terminal state that must never be silently regenerated.
+  // The damaged file was quarantined by the backend; guide the user to their
+  // recovery path instead of offering a destructive bootstrap.
+  if (vaultStatus === "Corrupt") {
+    return (
+      <div
+        data-testid="corrupt-vault-screen"
+        style={{
+          position: "fixed",
+          inset: 0,
+          overflow: "auto",
+          background:
+            "linear-gradient(160deg, #1e1b4b 0%, #312e81 50%, #4338ca 100%)",
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "center",
+          padding: "3rem 1.5rem",
+          fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+          color: "#e0e7ff",
+        }}
+      >
+        <div
+          style={{
+            background: "rgba(255,255,255,0.04)",
+            border: "1px solid rgba(199, 210, 254, 0.2)",
+            borderRadius: "16px",
+            padding: "2rem",
+            maxWidth: "680px",
+            width: "100%",
+          }}
+        >
+          <h2 style={{ margin: "0 0 0.5rem 0", color: "#fff" }}>
+            ⚠️ Vault Corrupted
+          </h2>
+          <p style={{ fontSize: "0.95rem", color: "#c7d2fe", lineHeight: 1.6 }}>
+            Your vault file could not be loaded and was quarantined to a
+            <code> .corrupt_*.bak </code> backup rather than being destroyed.
+            Your identity has <strong>not</strong> been regenerated.
+          </p>
+          <p style={{ fontSize: "0.9rem", color: "#c7d2fe", lineHeight: 1.6 }}>
+            Restore from an encrypted <strong>.iyoubackup</strong> archive or
+            your written master seed on a fresh install. If you need
+            assistance, keep your seed phrase and backup files safe and contact
+            support.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // First-run onboarding gateway: no tabs, no status bar, no daemons. The
+  // gateway stays mounted through the seed ceremony until `onInitialized`.
+  if (showGateway) {
+    return (
+      <>
+        <FirstRunGateway
+          onInitialized={() => {
+            void handleInitialized();
+          }}
+        />
+        {isAppLocked && (
+          <AppLockOverlay
+            pinHash={prefs?.app_lock_pin_hash ?? null}
+            prfHash={prefs?.app_lock_prf_hash ?? null}
+            autoLockMinutes={prefs?.inactivity_timeout_minutes ?? 15}
+            onUnlock={unlockApp}
+          />
+        )}
+      </>
+    );
+  }
 
   return (
     <>
@@ -368,8 +504,9 @@ function App() {
         />
       )}
 
-      {/* First-Run Master Seed Confirmation Gate */}
-      {!isAppLocked && vaultExists && prefs && !prefs.seed_backup_confirmed && (
+      {/* First-Run Master Seed Confirmation Gate (legacy vaults that predate
+          the onboarding gateway; the gateway itself completes this ceremony) */}
+      {!isAppLocked && !showGateway && vaultExists && prefs && !prefs.seed_backup_confirmed && (
         <FirstRunSeedGate onConfirmed={handleSeedConfirmed} />
       )}
     </>

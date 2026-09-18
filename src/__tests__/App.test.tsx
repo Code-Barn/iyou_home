@@ -21,9 +21,30 @@ import App from "../App";
 import { DEFAULT_USER_PREFERENCES } from "../lib/types";
 import { sha256Hex } from "../lib/appLock";
 
-const { mockInvoke, defaultMockHandler } = vi.hoisted(() => {
+const { mockInvoke, mockOpen, defaultMockHandler } = vi.hoisted(() => {
+  const mockOpen = vi.fn().mockResolvedValue(null);
   const handler = (cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
+      case "get_vault_status":
+        return Promise.resolve("Ready");
+      case "get_user_preferences":
+        return Promise.resolve({
+          active_profile_id: "primary",
+          default_signing_profile: "primary",
+          auto_sign: false,
+          last_active_tab: "enclave",
+          active_sovereign_did: null,
+          last_synced_at: 0,
+          // A Ready vault (post-gateway) has completed the seed ceremony.
+          seed_backup_confirmed: true,
+          app_lock_enabled: false,
+          inactivity_timeout_minutes: 15,
+          signing_grace_period_minutes: 0,
+          app_lock_pin_hash: null,
+          app_lock_prf_hash: null,
+          last_backup_at: 0,
+          relay_mesh: ["wss://relay.iyou.me"],
+        });
       case "get_auto_start_settings":
         return Promise.resolve({ Blossom: true, Nostr: true, Chat: true });
       case "get_service_statuses":
@@ -152,7 +173,7 @@ const { mockInvoke, defaultMockHandler } = vi.hoisted(() => {
     }
   };
   const mockInvoke = vi.fn(handler);
-  return { mockInvoke, defaultMockHandler: handler };
+  return { mockInvoke, mockOpen, defaultMockHandler: handler };
 });
 
 const eventListeners: Record<string, ((event: any) => void)[]> = {};
@@ -184,15 +205,30 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
   writeText: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: mockOpen,
+}));
+
 describe("App", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(defaultMockHandler);
+    mockOpen.mockReset();
+    mockOpen.mockResolvedValue(null);
     Object.keys(eventListeners).forEach((k) => delete eventListeners[k]);
   });
 
-  it("renders all main tabs", () => {
+  /** Mount App with the default "Ready" vault and wait for the boot query to
+   *  resolve so the main tabs are mounted before assertions. */
+  const renderReadyApp = async () => {
     render(<App />);
+    await waitFor(() => {
+      expect(document.querySelector(".tabs")).toBeInTheDocument();
+    });
+  };
+
+  it("renders all main tabs", async () => {
+    await renderReadyApp();
     // Tab buttons are inside .tabs container; status bar also has button text matching "Enclave"
     const tabs = document.querySelector(".tabs");
     expect(tabs?.textContent).toContain("Messages");
@@ -204,7 +240,7 @@ describe("App", () => {
   });
 
   it("navigates to the Messages tab and renders the split-pane inbox", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Messages/i }));
@@ -218,16 +254,16 @@ describe("App", () => {
     });
   });
 
-  it("defaults to Enclave tab on launch", () => {
-    render(<App />);
+  it("defaults to Enclave tab on launch", async () => {
+    await renderReadyApp();
     const tabs = document.querySelector(".tabs");
     const enclaveTab = tabs?.querySelector("button.active");
     expect(enclaveTab).toBeTruthy();
     expect(enclaveTab?.textContent).toContain("Enclave");
   });
 
-  it("renders status bar with daemon indicators", () => {
-    render(<App />);
+  it("renders status bar with daemon indicators", async () => {
+    await renderReadyApp();
     expect(screen.getByText("iyou_home")).toBeInTheDocument();
     expect(screen.getByText("SigBridge")).toBeInTheDocument();
     expect(screen.getByText("Nostr")).toBeInTheDocument();
@@ -235,7 +271,7 @@ describe("App", () => {
   });
 
   it("navigates to Services tab and renders service list", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Services/i }));
@@ -250,7 +286,7 @@ describe("App", () => {
   });
 
   it("calls the toggle_service command when a start button is clicked", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Services/i }));
@@ -279,7 +315,7 @@ describe("App", () => {
   });
 
   it("handles service stop correctly", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Services/i }));
@@ -315,13 +351,13 @@ describe("App", () => {
     });
   });
 
-  it("renders Developer Mode toggle in footer", () => {
-    render(<App />);
+  it("renders Developer Mode toggle in footer", async () => {
+    await renderReadyApp();
     expect(screen.getByText("Developer Mode")).toBeInTheDocument();
   });
 
   it("Developer Mode toggle shows Manual Signer tab", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     // Manual Signer tab should not be visible by default
     expect(screen.queryByRole("button", { name: /Manual Signer/i })).not.toBeInTheDocument();
@@ -346,7 +382,7 @@ describe("App", () => {
   });
 
   it("renders Sync to Home card in Services tab and handles manual sync", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Services/i }));
@@ -370,12 +406,12 @@ describe("App", () => {
   });
 
   it("renders Sync indicator in global status bar", async () => {
-    render(<App />);
+    await renderReadyApp();
     expect(screen.getByText("Sync")).toBeInTheDocument();
   });
 
   it("navigates to Vault tab, renders redundancy banner and handles session revocation", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Vault/i }));
@@ -409,7 +445,7 @@ describe("App", () => {
   });
 
   it("navigates to Trust Assets tab, opens import modal and imports a credential", async () => {
-    render(<App />);
+    await renderReadyApp();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Credentials/i }));
@@ -461,9 +497,9 @@ describe("App", () => {
     });
   });
 
-  it("renders FirstRunSeedGate overlay on greenfield initialization when seed backup is unconfirmed", async () => {
+  it("renders FirstRunSeedGate overlay for legacy Ready vaults with an unconfirmed seed backup", async () => {
     mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "get_vault_status") return Promise.resolve(true);
+      if (cmd === "get_vault_status") return Promise.resolve("Ready");
       if (cmd === "get_user_preferences")
         return Promise.resolve({
           ...DEFAULT_USER_PREFERENCES,
@@ -487,7 +523,7 @@ describe("App", () => {
     const pin = "123456";
     const pinHash = await sha256Hex(pin);
     mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "get_vault_status") return Promise.resolve(true);
+      if (cmd === "get_vault_status") return Promise.resolve("Ready");
       if (cmd === "get_user_preferences")
         return Promise.resolve({
           ...DEFAULT_USER_PREFERENCES,
@@ -533,6 +569,200 @@ describe("App", () => {
 
     await waitFor(() => {
       expect(screen.getByText("iyou_home is locked")).toBeInTheDocument();
+    });
+  });
+
+  // ---------- First-run onboarding gateway ----------
+
+  it("renders the FirstRunGateway and hides main tabs when the vault is Uninitialized", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_vault_status") return Promise.resolve("Uninitialized");
+      return defaultMockHandler(cmd, args);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("first-run-gateway")).toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("button", { name: /Create Sovereign Identity/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Sync \/ Restore Existing Device/i }),
+    ).toBeInTheDocument();
+    // No main navigation while uninitialized.
+    expect(document.querySelector(".tabs")).not.toBeInTheDocument();
+    expect(screen.queryByText("Developer Mode")).not.toBeInTheDocument();
+  });
+
+  it("Create flow: generate_did, then locked seed ceremony before entering the app", async () => {
+    const SEED = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    let status: string = "Uninitialized";
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_vault_status") return Promise.resolve(status);
+      if (cmd === "generate_did") {
+        status = "Ready"; // bootstrapping the vault flips the disk state
+        return Promise.resolve("did:key:z6Mku...");
+      }
+      if (cmd === "reveal_master_seed") return Promise.resolve(SEED);
+      return defaultMockHandler(cmd, args);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("first-run-gateway")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Create Sovereign Identity/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gateway-seed-ceremony")).toBeInTheDocument();
+      expect(screen.getByText(/Write Down Your Recovery Seed/i)).toBeInTheDocument();
+    });
+
+    // The confirmation button must be disabled until the ceremony completes.
+    const confirmSeed = screen.getByTestId("gateway-confirm-seed");
+    expect(confirmSeed).toBeDisabled();
+    // Seed chunks are rendered for the word challenge (default ceremony mode).
+    expect(document.querySelectorAll("[data-chunk-index]").length).toBeGreaterThan(0);
+
+    // Switch to the typed-acknowledgment path, which is the primary proof
+    // required before the vault handoff.
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /Use the typed acknowledgment instead/i }),
+      );
+    });
+    expect(screen.getByTestId("gateway-ack-input")).toBeInTheDocument();
+
+    // The ack phrase unlocks the ceremony on the typed path.
+    await act(async () => {
+      fireEvent.change(screen.getByTestId("gateway-ack-input"), {
+        target: { value: "I HAVE WRITTEN THIS DOWN" },
+      });
+    });
+    await waitFor(() => {
+      expect(confirmSeed).not.toBeDisabled();
+    });
+    await act(async () => {
+      fireEvent.click(confirmSeed);
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_seed_backup_confirmed", {
+        confirmed: true,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("start_ready_services");
+    });
+
+    // Gateway unmounts and the main app appears.
+    await waitFor(() => {
+      expect(document.querySelector(".tabs")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("first-run-gateway")).not.toBeInTheDocument();
+  });
+
+  it("restore-from-seed flow calls bootstrap_from_seed and enters the app", async () => {
+    const SEED = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    let status: string = "Uninitialized";
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_vault_status") return Promise.resolve(status);
+      if (cmd === "bootstrap_from_seed") {
+        status = "Ready";
+        return Promise.resolve("did:key:z6Mku...");
+      }
+      return defaultMockHandler(cmd, args);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("first-run-gateway")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Sync \/ Restore Existing Device/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("gateway-restore-seed"));
+    });
+    expect(screen.getByTestId("gateway-restore-seed-panel")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.change(screen.getByTestId("gateway-seed-input"), {
+        target: { value: SEED },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("gateway-restore-seed-confirm"));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("bootstrap_from_seed", {
+        seedPhraseOrHex: SEED,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("start_ready_services");
+    });
+    await waitFor(() => {
+      expect(document.querySelector(".tabs")).toBeInTheDocument();
+    });
+  });
+
+  it("restore-from-backup flow reads the archive, restores it, and enters the app", async () => {
+    let status: string = "Uninitialized";
+    mockOpen.mockResolvedValue("/tmp/iyou_home_restore.iyoubackup");
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_vault_status") return Promise.resolve(status);
+      if (cmd === "read_binary_file") return Promise.resolve([1, 2, 3, 4]);
+      if (cmd === "restore_vault_backup") {
+        status = "Ready";
+        return Promise.resolve(true);
+      }
+      return defaultMockHandler(cmd, args);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("first-run-gateway")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Sync \/ Restore Existing Device/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("gateway-restore-backup"));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("read_binary_file", {
+        path: "/tmp/iyou_home_restore.iyoubackup",
+      });
+      expect(screen.getByTestId("gateway-restore-backup-panel")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.change(screen.getByTestId("gateway-backup-password"), {
+        target: { value: "hunter2" },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("gateway-restore-backup-confirm"));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("restore_vault_backup", {
+        backupBytes: [1, 2, 3, 4],
+        password: "hunter2",
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("start_ready_services");
+    });
+    await waitFor(() => {
+      expect(document.querySelector(".tabs")).toBeInTheDocument();
     });
   });
 });

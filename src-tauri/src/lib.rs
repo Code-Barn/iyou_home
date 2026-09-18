@@ -406,12 +406,11 @@ async fn start_service_internal(
                 .path()
                 .app_local_data_dir()
                 .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-            // Self-healing loader: provisions the missing Level 1 persona on
-            // legacy single-profile vaults before relay identity resolution.
-            let vault = match vault::load_or_bootstrap_vault(app) {
+            // Strict read-only load: daemon init must NEVER silently
+            // bootstrap a greenfield vault. Missing vaults defer the relay
+            // to the first-run gateway, which triggers start_ready_services.
+            let vault = match vault::load_vault(app) {
                 Ok(v) => v,
-                // Fresh install: defer identity creation to onboarding
-                // (generate_did) instead of failing auto-start.
                 Err(vault::VaultLoadError::NotFound) => {
                     eprintln!("Nostr relay deferred: vault not yet provisioned (onboarding pending)");
                     return Ok(());
@@ -468,6 +467,17 @@ async fn start_service_internal(
             });
             tx
         }
+        "SigBridge" => {
+            let bridge_app = app.clone();
+            let (tx, _rx) = watch::channel(false);
+            tauri::async_runtime::spawn(async move {
+                // The bridge binds 127.0.0.1:9001 and serves forever. The
+                // shutdown_signals guard above prevents a double-bind; the
+                // receiver is intentionally dropped (SigBridge is alwaysOn).
+                bridge::start_ws_server(bridge_app).await;
+            });
+            tx
+        }
         _ => return Ok(()),
     };
 
@@ -499,6 +509,36 @@ fn stop_service_internal(name: &str, state: &ServiceState) {
 #[tauri::command]
 fn get_service_statuses(state: State<'_, ServiceState>) -> HashMap<String, ServiceStatus> {
     state.services.lock().unwrap().clone()
+}
+
+/// Deferred daemon fleet bootstrap: runs once the vault flips to `Ready`
+/// (first-run gateway completed via create, seed-restore, or backup-restore).
+/// Never runs before the vault exists — the gateway is the sole trigger.
+/// Idempotent: SigBridge and already-running auto-start services are skipped.
+#[tauri::command]
+async fn start_ready_services(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<(), String> {
+    if vault::vault_status(&app) != vault::VaultStatus::Ready {
+        return Err("Vault is not Ready; refusing to start services".to_string());
+    }
+
+    // The Signature Bridge is alwaysOn but deferred until onboarding so it
+    // never binds before an active L1 persona exists.
+    if !state.shutdown_signals.lock().unwrap().contains_key("SigBridge") {
+        start_service_internal("SigBridge", &app, &state).await?;
+    }
+
+    // Remaining auto-start services (Blossom, Nostr relay, Chat).
+    let auto_start = state.auto_start_settings.lock().unwrap().clone();
+    for (name, enabled) in &auto_start {
+        if *enabled && name != "SigBridge" {
+            start_service_internal(name, &app, &state).await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1956,14 +1996,40 @@ fn reveal_master_seed(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_vault_status(app: AppHandle) -> Result<bool, String> {
-    match vault::load_vault(&app) {
-        Ok(_) => Ok(true),
-        // First-run: no vault yet is a normal empty state, not an error.
-        Err(vault::VaultLoadError::NotFound) => Ok(false),
-        // Corruption/IO faults must surface, never be masked.
-        Err(e) => Err(e.to_string()),
+fn get_vault_status(app: AppHandle) -> vault::VaultStatus {
+    // Read-only lifecycle classification: Uninitialized / Ready / Corrupt.
+    // Never creates, heals, or regenerates anything on this path.
+    vault::vault_status(&app)
+}
+
+/// Deterministically bootstrap the vault from a recovery seed (64-char hex or
+/// base58 of 32 bytes), minting the L0 Anchor and L1 Primary. Fail-closed:
+/// refuses to run when a vault already exists.
+#[tauri::command]
+fn bootstrap_from_seed(
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+    seed_phrase_or_hex: String,
+) -> Result<String, String> {
+    let vault = vault::bootstrap_vault_from_seed(&app, &seed_phrase_or_hex)?;
+
+    // Point the active signer and preferences at the canonical L1 primary.
+    let persona = vault
+        .public_persona()
+        .ok_or_else(|| "No public persona found in restored vault".to_string())?;
+    {
+        let mut active = state.active_did.lock().unwrap();
+        *active = Some(persona.did.clone());
     }
+
+    let mut prefs = load_preferences(&app);
+    prefs.active_profile_id = vault::DEFAULT_PERSONA_PROFILE_ID.to_string();
+    prefs.active_sovereign_did = None;
+    // The user just typed this seed back — the backup ceremony is complete.
+    prefs.seed_backup_confirmed = true;
+    save_preferences(&app, &prefs)?;
+
+    Ok(persona.did.clone())
 }
 
 #[tauri::command]
@@ -2045,7 +2111,7 @@ fn require_l1_persona(vault: &vault::VaultStore) -> Result<vault::Profile, Strin
 fn l1_persona_jid(
     app: &AppHandle,
 ) -> Result<(vault::Profile, String, String), String> {
-    let vault = vault::load_or_bootstrap_vault(app)
+    let vault = vault::load_vault(app)
         .map_err(|e| format!("Failed to load vault: {}", e))?;
     let persona = require_l1_persona(&vault)?;
     let keypair = vault::get_profile_keypair(&vault, &persona.profile_id)
@@ -2104,7 +2170,7 @@ fn create_vault_backup(app: AppHandle, password: String) -> Result<Vec<u8>, Stri
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    let vault = vault::load_or_bootstrap_vault(&app)
+    let vault = vault::load_vault(&app)
         .map_err(|e| format!("Failed to load vault: {}", e))?;
     let backup_bytes = vault::export_vault_backup(&vault, &app_data, &password)?;
 
@@ -2964,23 +3030,38 @@ pub fn run() {
             // only starts lightweight PDS services (Blossom, Nostr relay,
             // Chat).  IPFS node/DHT initialization must NEVER be added here
             // — that responsibility belongs to server-side infrastructure.
-            for (name, enabled) in &auto_start {
-                if *enabled {
-                    let app = app_handle.clone();
-                    let name = name.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = app.state::<ServiceState>();
-                        if let Err(e) = start_service_internal(&name, &app, &state).await {
-                            eprintln!("Auto-start {} failed: {}", name, e);
-                        }
-                    });
+            // Greenfield vaults are left in the "Uninitialized" state: the
+            // daemons and signature bridge only start after the first-run
+            // gateway completes via `start_ready_services`.
+            if vault::vault_status(&app_handle) == vault::VaultStatus::Ready {
+                for (name, enabled) in &auto_start {
+                    if *enabled {
+                        let app = app_handle.clone();
+                        let name = name.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<ServiceState>();
+                            if let Err(e) = start_service_internal(&name, &app, &state).await {
+                                eprintln!("Auto-start {} failed: {}", name, e);
+                            }
+                        });
+                    }
                 }
+            } else {
+                eprintln!(
+                    "Auto-start deferred: vault not yet provisioned (status={:?})",
+                    vault::vault_status(&app_handle)
+                );
             }
 
-            let ws_handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                bridge::start_ws_server(ws_handle).await;
-            });
+            // The Signature Bridge binds 127.0.0.1:9001 and must never listen
+            // before a Ready vault exists (no identity to sign for). The
+            // FirstRunGateway triggers it via `start_ready_services`.
+            if vault::vault_status(&app_handle) == vault::VaultStatus::Ready {
+                let ws_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    bridge::start_ws_server(ws_handle).await;
+                });
+            }
 
             // Native System Tray
             tray::build_tray(app)?;
@@ -2996,6 +3077,8 @@ pub fn run() {
             toggle_service,
             generate_did,
             import_did,
+            bootstrap_from_seed,
+            start_ready_services,
             get_active_did,
             list_profiles,
             add_profile,

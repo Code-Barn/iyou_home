@@ -764,19 +764,98 @@ fn get_storage_path(app: &AppHandle) -> PathBuf {
 pub fn create_vault_at_path(path: &Path) -> Result<VaultStore, String> {
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    let root_seed_base58 = bs58::encode(seed).into_string();
+    let vault = vault_from_seed(&seed);
+    save_vault_inner(path, &vault)?;
+    Ok(vault)
+}
 
-    let vault = VaultStore {
-        root_seed_base58,
-        profiles: initial_profiles(&seed),
+/// Build a fully provisioned vault (L0 Anchor + L1 Primary) from an explicit
+/// 32-byte root seed. Every key derives deterministically from
+/// `seed || LE(index)`, so two bootstraps from the same seed are
+/// byte-for-byte identical.
+pub fn vault_from_seed(seed: &[u8; 32]) -> VaultStore {
+    VaultStore {
+        root_seed_base58: bs58::encode(seed).into_string(),
+        profiles: initial_profiles(seed),
         sovereign_identities: Vec::new(),
         dependents: Vec::new(),
         roles: Vec::new(),
         businesses: Vec::new(),
+    }
+}
+
+/// Parse a recovery seed supplied as either a 64-character hex string
+/// (optionally `0x`-prefixed, the format produced by `reveal_root_seed_hex`)
+/// or a base58 encoding of exactly 32 raw bytes (the format stored in
+/// `VaultStore::root_seed_base58`). Fail-closed on any other shape.
+pub fn parse_root_seed(seed_phrase_or_hex: &str) -> Result<[u8; 32], String> {
+    let input = seed_phrase_or_hex.trim();
+    if input.is_empty() {
+        return Err("Seed phrase must not be empty".to_string());
+    }
+
+    let hex_body = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+        .unwrap_or(input);
+
+    let to_arr = |bytes: Vec<u8>| -> Result<[u8; 32], String> {
+        if bytes.len() != 32 {
+            return Err(format!(
+                "Seed must decode to exactly 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
     };
 
+    // Hex path: exactly 64 hex characters decode cleanly.
+    if hex_body.len() == 64 && hex_body.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(hex_body)
+            .map_err(|_| "Invalid hex seed (expected 64 hex characters)".to_string())?;
+        return to_arr(bytes);
+    }
+
+    // Base58 path: a 32-byte payload encodes as base58. A 64-char all-hex
+    // string is handled above, so anything reaching here is irregular.
+    let b58 = bs58::decode(input)
+        .into_vec()
+        .map_err(|_| {
+            "Invalid seed: expected a 64-character hex string (optionally 0x-prefixed) or a base58-encoded 32-byte seed"
+                .to_string()
+        })?;
+    to_arr(b58)
+}
+
+/// Deterministically bootstrap a vault from a user-supplied recovery seed and
+/// persist it atomically. Fail-closed: refuses to touch any path where a
+/// `vault.json` already exists, so a restore can never silently clobber an
+/// existing identity.
+pub fn bootstrap_vault_from_seed_at_path(
+    path: &Path,
+    seed_phrase_or_hex: &str,
+) -> Result<VaultStore, String> {
+    if path.exists() {
+        return Err(format!(
+            "A vault already exists at {}; refusing to overwrite it",
+            path.display()
+        ));
+    }
+    let seed = parse_root_seed(seed_phrase_or_hex)?;
+    let vault = vault_from_seed(&seed);
     save_vault_inner(path, &vault)?;
     Ok(vault)
+}
+
+/// App-scoped `bootstrap_vault_from_seed_at_path` for the `bootstrap_from_seed`
+/// IPC command.
+pub fn bootstrap_vault_from_seed(
+    app: &AppHandle,
+    seed_phrase_or_hex: &str,
+) -> Result<VaultStore, String> {
+    bootstrap_vault_from_seed_at_path(&get_storage_path(app), seed_phrase_or_hex)
 }
 
 /// Bootstrap the reserved identity hierarchy from a root seed:
@@ -976,6 +1055,35 @@ pub fn load_vault_from_path(path: &Path) -> Result<VaultStore, VaultLoadError> {
 
 pub fn load_vault(app: &AppHandle) -> Result<VaultStore, VaultLoadError> {
     load_vault_from_path(&get_storage_path(app))
+}
+
+/// High-level first-run lifecycle state. Serializes to exactly
+/// `"Uninitialized"` / `"Ready"` / `"Corrupt"` for the frontend gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum VaultStatus {
+    /// No `vault.json` yet — greenfield. The onboarding gateway must run.
+    Uninitialized,
+    /// A valid vault exists and loads cleanly.
+    Ready,
+    /// The vault file exists but is damaged (quarantined) or unreadable due
+    /// to an IO fault. NEVER silently regenerate from this state.
+    Corrupt,
+}
+
+/// Classify the vault lifecycle state at a given path without ever creating,
+/// healing, or quarantining anything.
+pub fn vault_status_at_path(path: &Path) -> VaultStatus {
+    match load_vault_from_path(path) {
+        Ok(_) => VaultStatus::Ready,
+        Err(VaultLoadError::NotFound) => VaultStatus::Uninitialized,
+        Err(VaultLoadError::Corrupt { .. }) | Err(VaultLoadError::Io(_)) => VaultStatus::Corrupt,
+    }
+}
+
+/// App-scoped `vault_status_at_path`.
+pub fn vault_status(app: &AppHandle) -> VaultStatus {
+    vault_status_at_path(&get_storage_path(app))
 }
 
 /// Self-healing migration for legacy vaults that predate the dual-bootstrap
@@ -4167,5 +4275,165 @@ mod tests {
         assert!(dup.is_err());
 
         let _ = fs::remove_file(path);
+    }
+
+    // ---------- First-run status classification ----------
+
+    #[test]
+    fn test_vault_status_classification() {
+        let mut path = temp_dir();
+        path.push("test_status_classification_vault.json");
+        let _ = fs::remove_file(&path);
+
+        // Greenfield: missing file is Uninitialized, never auto-created.
+        assert_eq!(vault_status_at_path(&path), VaultStatus::Uninitialized);
+        assert!(!path.exists(), "Status query must never create a vault");
+
+        // Freshly created vault is Ready.
+        create_vault_at_path(&path).expect("Should create vault");
+        assert_eq!(vault_status_at_path(&path), VaultStatus::Ready);
+
+        // Corrupt payload is Corrupt and quarantined, never reparsed as ready.
+        fs::write(&path, "not base64 at all").expect("Should write corrupt payload");
+        assert_eq!(
+            vault_status_at_path(&path),
+            VaultStatus::Corrupt,
+            "Corrupt payload must classify as Corrupt"
+        );
+
+        // IO fault on an existing file also classifies as Corrupt.
+        fs::write(&path, "garbage").expect("Should write payload");
+        let raw = fs::read(&path).expect("Should read back");
+        let _ = raw;
+        // Replace the file with a directory at the same path? Not portable —
+        // instead simulate an IO fault by making the path unreadable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+                .expect("Should drop permissions");
+            // Root ignores mode bits; skip assertion when still readable.
+            if fs::read(&path).is_err() {
+                assert_eq!(
+                    vault_status_at_path(&path),
+                    VaultStatus::Corrupt,
+                    "IO fault must classify as Corrupt"
+                );
+            }
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parse_root_seed_hex_and_base58_equivalence() {
+        let raw = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99,
+        ];
+
+        let hex_form = hex::encode(raw);
+        let parsed_hex = parse_root_seed(&hex_form).expect("Hex should parse");
+        assert_eq!(parsed_hex, raw);
+        assert_eq!(parsed_hex.len(), 32);
+
+        // 0x prefix variants accepted.
+        let parsed_prefixed = parse_root_seed(&format!("0x{}", hex_form)).expect("0x hex parses");
+        assert_eq!(parsed_prefixed, raw);
+        let parsed_upper = parse_root_seed(&hex_form.to_uppercase()).expect("Uppercase hex parses");
+        assert_eq!(parsed_upper, raw);
+
+        // Base58 of the same 32 raw bytes must decode to the same seed.
+        let b58_form = bs58::encode(raw).into_string();
+        let parsed_b58 = parse_root_seed(&b58_form).expect("Base58 should parse");
+        assert_eq!(parsed_b58, raw);
+    }
+
+    #[test]
+    fn test_parse_root_seed_rejects_invalid_shapes() {
+        assert!(parse_root_seed("").is_err());
+        assert!(parse_root_seed("   ").is_err());
+        // Not hex (letters beyond f) and not valid base58.
+        assert!(parse_root_seed("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+        // 64 hex chars decode to 32 bytes — good shape; short hex must fail.
+        assert!(parse_root_seed("aabb").is_err());
+        // Hex string of wrong length (63 chars).
+        assert!(parse_root_seed(&"a".repeat(63)).is_err());
+        // Base58 payload that decodes to 31 bytes.
+        let short = bs58::encode([0u8; 31]).into_string();
+        assert!(parse_root_seed(&short).is_err());
+        // Plain text garbage.
+        assert!(parse_root_seed("not a seed at all").is_err());
+    }
+
+    #[test]
+    fn test_bootstrap_from_seed_deterministic_and_fail_closed() {
+        let mut path = temp_dir();
+        path.push("test_bootstrap_from_seed_vault.json");
+        let _ = fs::remove_file(&path);
+
+        let seed_hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let seed_b58 = bs58::encode(hex::decode(seed_hex).unwrap()).into_string();
+
+        // Bootstrap via hex form.
+        let v1 = bootstrap_vault_from_seed_at_path(&path, seed_hex).expect("Hex bootstrap");
+        assert_eq!(v1.root_seed_base58, seed_b58);
+        assert_eq!(v1.profiles.len(), 2);
+
+        // L0 anchor invariants.
+        let anchor = v1.profiles.iter().find(|p| p.derivation_index == 0).unwrap();
+        assert_eq!(anchor.profile_id, "anchor");
+        assert_eq!(anchor.profile_name, "Anchor Identity");
+        assert_eq!(anchor.level, 0);
+        assert!(anchor.is_system_reserved);
+        assert!(!anchor.active);
+
+        // L1 primary invariants + default active persona pointer.
+        let primary = v1.profiles.iter().find(|p| p.derivation_index == 1).unwrap();
+        assert_eq!(primary.profile_id, "primary");
+        assert_eq!(primary.profile_name, "Primary Identity");
+        assert_eq!(primary.level, 1);
+        assert!(!primary.is_system_reserved);
+        assert!(primary.active);
+
+        // Determinism: base58 path + reload produce byte-identical profiles.
+        let mut path2 = temp_dir();
+        path2.push("test_bootstrap_from_seed_vault_2.json");
+        let _ = fs::remove_file(&path2);
+        let v2 = bootstrap_vault_from_seed_at_path(&path2, &seed_b58).expect("Base58 bootstrap");
+        assert_eq!(v1.root_seed_base58, v2.root_seed_base58);
+        assert_eq!(
+            v1.profiles.iter().map(|p| p.did.clone()).collect::<Vec<_>>(),
+            v2.profiles.iter().map(|p| p.did.clone()).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_file(&path2);
+
+        // Reload from disk matches.
+        let reloaded = load_vault_from_path(&path).expect("Reload should succeed");
+        assert_eq!(reloaded.root_seed_base58, v1.root_seed_base58);
+        let _ = fs::remove_file(&path);
+
+        // Fail-closed: overwriting an existing vault is refused.
+        let mut path3 = temp_dir();
+        path3.push("test_bootstrap_from_seed_overwrite.json");
+        create_vault_at_path(&path3).expect("Should create probe vault");
+        let before = load_vault_from_path(&path3).expect("Probe vault loads");
+        let overwrite = bootstrap_vault_from_seed_at_path(&path3, seed_hex);
+        assert!(
+            matches!(overwrite, Err(e) if e.contains("refusing to overwrite")),
+            "Existing vault must never be overwritten by seed bootstrap"
+        );
+        let after = load_vault_from_path(&path3).expect("Original vault unchanged");
+        assert_eq!(before.root_seed_base58, after.root_seed_base58);
+        let _ = fs::remove_file(&path3);
+
+        // Invalid seed input fails without touching the filesystem.
+        let mut path4 = temp_dir();
+        path4.push("test_bootstrap_from_seed_invalid.json");
+        let _ = fs::remove_file(&path4);
+        assert!(bootstrap_vault_from_seed_at_path(&path4, "garbage input").is_err());
+        assert!(!path4.exists());
     }
 }
