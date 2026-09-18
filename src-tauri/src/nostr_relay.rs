@@ -32,6 +32,7 @@ pub async fn start_relay(
     listener: TcpListener,
     mut shutdown_rx: watch::Receiver<bool>,
     vault_pubkey_b64: String,
+    moderation_db_path: Option<PathBuf>,
 ) {
     let db = match init_db(&db_path) {
         Ok(db) => Arc::new(Mutex::new(db)),
@@ -51,8 +52,9 @@ pub async fn start_relay(
                         println!("Nostr relay connection from {:?}", peer);
                         let db = db.clone();
                         let pubkey = vault_pubkey_b64.clone();
+                        let moderation = moderation_db_path.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, db, pubkey).await;
+                            handle_connection(stream, db, pubkey, moderation).await;
                         });
                     }
                     Err(e) => {
@@ -83,20 +85,46 @@ fn init_db(path: &PathBuf) -> Result<rusqlite::Connection, String> {
             kind INTEGER NOT NULL,
             tags TEXT NOT NULL,
             content TEXT NOT NULL,
-            sig TEXT NOT NULL
+            sig TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_events_pubkey ON events(pubkey);
         CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);",
     )
     .map_err(|e| e.to_string())?;
+    // Existing databases predating the RFC-003 moderation column get it
+    // added in place so tombstones and queries stay consistent.
+    ensure_deleted_column(&conn)?;
     Ok(conn)
+}
+
+/// Idempotently add the RFC-003 `deleted` (moderation tombstone) column to the
+/// relay events table. Used by both the relay and the purge cascade
+/// (`moderation::tombstone_and_purge`).
+pub fn ensure_deleted_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    let has_deleted: bool = conn
+        .prepare("PRAGMA table_info(events)")
+        .map_err(|e| e.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .any(|name| name == "deleted");
+    if !has_deleted {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 async fn handle_connection(
     stream: TcpStream,
     db: Arc<Mutex<rusqlite::Connection>>,
     vault_pubkey_b64: String,
+    moderation_db_path: Option<PathBuf>,
 ) {
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -139,7 +167,8 @@ async fn handle_connection(
                     continue;
                 }
                 let event = &arr[1];
-                let result = verify_and_store_event(event, &db, &vault_pubkey_b64);
+                let result =
+                    verify_and_store_event(event, &db, &vault_pubkey_b64, moderation_db_path.as_deref());
                 match result {
                     Ok(event_id) => {
                         let ok = format!("[\"OK\",\"{}\",true,\"\"]", event_id);
@@ -185,6 +214,7 @@ fn verify_and_store_event(
     event: &Value,
     db: &Arc<Mutex<rusqlite::Connection>>,
     vault_pubkey_b64: &str,
+    moderation_db_path: Option<&std::path::Path>,
 ) -> Result<String, String> {
     let pubkey = event["pubkey"]
         .as_str()
@@ -199,6 +229,18 @@ fn verify_and_store_event(
 
     if pubkey != vault_pubkey_b64 {
         return Err("Event pubkey does not match vault identity".to_string());
+    }
+
+    // RFC-003 §5.2 reject gate: banned identities are refused pre-store with
+    // an `OK false BANNED: <reason>` frame before any signature work.
+    if let Some(mod_path) = moderation_db_path {
+        if mod_path.exists() {
+            if let Ok(mod_conn) = rusqlite::Connection::open(mod_path) {
+                if let Err(reason) = crate::moderation::reject_if_banned(&mod_conn, &pubkey) {
+                    return Err(reason);
+                }
+            }
+        }
     }
 
     // Recompute id
@@ -284,12 +326,20 @@ fn query_events(db: &Arc<Mutex<rusqlite::Connection>>, filters: &[Value]) -> Vec
         String::from("SELECT id, pubkey, created_at, kind, tags, content, sig FROM events");
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
+    // RFC-003 tombstoned events are soft-deleted (`deleted = 1`) so they are
+    // filtered out of every REQ response.
+    let mut conditions: Vec<String> = vec!["deleted = 0".to_string()];
+
     if !kinds.is_empty() {
         let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
-        query.push_str(&format!(" WHERE kind IN ({})", placeholders.join(",")));
+        conditions.push(format!("kind IN ({})", placeholders.join(",")));
         for k in &kinds {
             params.push(Box::new(*k));
         }
+    }
+
+    if !conditions.is_empty() {
+        query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
     }
 
     query.push_str(" ORDER BY created_at DESC LIMIT ?");

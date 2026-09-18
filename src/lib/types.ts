@@ -330,3 +330,72 @@ export interface IssuerStatus {
   quota_limit: number;
   vetting: VettingStatus;
 }
+
+// ---------- Satellite Admin & Moderation (RFC-003) ----------
+
+/** Result of `admin_probe` — whether the active L1 DID is an authorized
+ *  `admin_dids` entry for the connected node. */
+export interface AdminProbeResult {
+  authorized: boolean;
+  admin_did: string | null;
+  satellite_id: string | null;
+}
+
+/** Member directory row projected from the RFC-002 invite graph. */
+export interface MemberRecord {
+  did: string;
+  joined_at: number | null;
+  referrer_did: string | null;
+  invite_nonce: string | null;
+  flags: number;
+  /** "active" | "banned". */
+  status: string;
+}
+
+/** One row of the `banned_identities` ledger. */
+export interface BanRecord {
+  event_id: number;
+  did: string;
+  ban_reason: string;
+  banned_by_did: string;
+  banned_at: number;
+  expires_at: number | null;
+  evidence_sha256: string | null;
+  scope: string;
+  severed_conns: number;
+  /** False after `admin_unban` (soft-delete). */
+  active: boolean;
+  unbanned_at: number | null;
+}
+
+/** One append-only `moderation_actions` row. */
+export interface ModerationAction {
+  action_id: number;
+  /** "ban" | "unban" | "sever" | "purge" | "reject". */
+  kind: string;
+  subject_did: string;
+  actor_did: string;
+  payload: string;
+  created_at: number;
+}
+
+/** Aggregate reply for `admin_ban`. */
+export interface BanReport {
+  ban_id: number;
+  did: string;
+  severed_conns: number;
+  pruned_tokens: number;
+  tombstones: number;
+  blobs_deleted: number;
+  events_broadcast: number;
+}
+
+/** Aggregate reply for `admin_purge` / the purge half of `admin_ban`. */
+export interface PurgeReport {
+  subject_did: string;
+  tombstones: number;
+  blobs_deleted: number;
+  events_broadcast: number;
+  /** Event ids tombstoned by this run (kind:1605 refs). */
+  tombstoned_ids: string[];
+}

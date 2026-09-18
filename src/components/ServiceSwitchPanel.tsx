@@ -22,6 +22,7 @@ import BlossomBrowser from "./BlossomBrowser";
 import SovereignFootprint from "./SovereignFootprint";
 import SovereigntyStatusPanel from "./SovereigntyStatusPanel";
 import InviteManager from "./invites/InviteManager";
+import AdminPanel from "./admin/AdminPanel";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -69,7 +70,7 @@ const AUTO_START_DEFAULTS: Record<string, boolean> = {
 };
 
 export default function ServiceSwitchPanel() {
-  const [subView, setSubView] = useState<"daemons" | "media" | "invites">("daemons");
+  const [subView, setSubView] = useState<"daemons" | "media" | "invites" | "admin">("daemons");
   const [serviceStatus, setServiceStatus] = useState<
     Record<string, ServiceStatus>
   >({
@@ -265,6 +266,24 @@ export default function ServiceSwitchPanel() {
           }}
         >
           📨 Invites & Referrals
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubView("admin")}
+          style={{
+            padding: "0.6rem 1.2rem",
+            background: subView === "admin" ? "#312e81" : "transparent",
+            color: subView === "admin" ? "#ffffff" : "#4b5563",
+            border: "none",
+            borderRadius: "6px",
+            fontWeight: 600,
+            fontSize: "0.9rem",
+            boxShadow: subView === "admin" ? "0 2px 4px rgba(0,0,0,0.1)" : "none",
+            cursor: "pointer",
+            transition: "all 0.15s",
+          }}
+        >
+          🛡️ Admin
         </button>
       </div>
 
@@ -476,6 +495,8 @@ export default function ServiceSwitchPanel() {
       {subView === "media" && <BlossomBrowser />}
 
       {subView === "invites" && <InviteManager />}
+
+      {subView === "admin" && <AdminPanel />}
     </>
   );
 }

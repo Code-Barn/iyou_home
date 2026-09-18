@@ -557,6 +557,33 @@ pub fn revoke_invite_nonce(
     Ok(())
 }
 
+/// RFC-003 branch pruning: revoke every invite token issued by `issuer_did`
+/// (claimed or unredeemed), stamping its whole `invite_graph` subtree as
+/// revoked. Returns the number of tokens revoked. Tokens already revoked are
+/// skipped (idempotent re-pruning).
+pub fn prune_issuer_branch(
+    conn: &mut Connection,
+    issuer_did: &str,
+    actor_did: &str,
+) -> Result<usize, String> {
+    let nonces: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT nonce FROM issued_tokens WHERE issuer_did = ?1 AND revoked_at IS NULL",
+            )
+            .map_err(|e| format!("Failed to prepare branch prune: {}", e))?;
+        let rows = stmt
+            .query_map(params![issuer_did], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query issued tokens: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+    };
+
+    for nonce in &nonces {
+        revoke_invite_nonce(conn, nonce, actor_did)?;
+    }
+    Ok(nonces.len())
+}
+
 /// Full list of issued invites, newest first, with computed status evaluated
 /// at `now`.
 pub fn list_invite_records(conn: &Connection, now: u64) -> Result<Vec<InviteRecord>, String> {

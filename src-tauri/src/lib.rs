@@ -39,6 +39,7 @@ mod bridge;
 mod certs;
 mod contacts;
 mod invites;
+mod moderation;
 mod nostr_relay;
 mod omemo;
 mod pairing;
@@ -64,6 +65,11 @@ pub struct ServiceState {
     /// screen. When `true`, the external signature bridge fails closed on
     /// every gated signing frame so key material is never touched.
     pub enclave_locked: Arc<AtomicBool>,
+    /// RFC-003 live-connection registry: DID → count of active sockets to a
+    /// (future) satellite node. The client relay only serves the local vault
+    /// identity, so this is typically empty; severance counts derive from
+    /// here and are committed to `banned_identities.severed_conns`.
+    pub moderation_connections: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -425,8 +431,9 @@ async fn start_service_internal(
                 .await
                 .map_err(|e| format!("Failed to bind Nostr relay: {}", e))?;
             let (tx, rx) = watch::channel(false);
+            let moderation_path = app_data.join("moderation.db");
             tauri::async_runtime::spawn(async move {
-                nostr_relay::start_relay(db_path, listener, rx, pubkey).await;
+                nostr_relay::start_relay(db_path, listener, rx, pubkey, Some(moderation_path)).await;
             });
             tx
         }
@@ -934,6 +941,318 @@ fn render_invite_qr(token_json: String) -> Result<String, String> {
     crate::pairing::render_qr_png_b64(&token_json)
 }
 
+// ---------- RFC-003 satellite admin & moderation ----------
+
+/// Probe whether the active L1 DID is an authorized `admin_dids` entry.
+/// Never errors on authorization — the caller renders a lock badge instead.
+#[tauri::command]
+fn admin_probe(satellite_id: String, app: AppHandle) -> Result<moderation::AdminProbeResult, String> {
+    let admin_did = moderation::require_admin(&app).ok();
+    Ok(moderation::AdminProbeResult {
+        authorized: admin_did.is_some(),
+        admin_did,
+        satellite_id: if satellite_id.trim().is_empty() {
+            None
+        } else {
+            Some(satellite_id.trim().to_string())
+        },
+    })
+}
+
+/// Member directory projected from the RFC-002 invite graph.
+#[tauri::command]
+fn admin_list_members(
+    satellite_id: String,
+    app: AppHandle,
+) -> Result<Vec<moderation::MemberRecord>, String> {
+    let _admin = moderation::require_admin(&app)?;
+    let (_, active_did) = resolve_profile_keypair(&app, None)?;
+    let mod_conn = moderation::moderation_connection(&app)?;
+    let invite_conn = invites::invites_connection(&app)?;
+    let now = moderation::now_unix();
+    let members = moderation::list_members(&mod_conn, &invite_conn, &active_did, now)?;
+    let _ = satellite_id;
+    Ok(members)
+}
+
+/// Active (non-expired, non-soft-deleted) ban rows.
+#[tauri::command]
+fn admin_list_bans(
+    satellite_id: String,
+    app: AppHandle,
+) -> Result<Vec<moderation::BanRecord>, String> {
+    let _admin = moderation::require_admin(&app)?;
+    let conn = moderation::moderation_connection(&app)?;
+    let _ = satellite_id;
+    moderation::list_bans(&conn, false)
+}
+
+/// Chronological `moderation_actions` audit trail (append-only).
+#[tauri::command]
+fn admin_list_actions(
+    satellite_id: String,
+    app: AppHandle,
+    limit: Option<u32>,
+) -> Result<Vec<moderation::ModerationAction>, String> {
+    let _admin = moderation::require_admin(&app)?;
+    let conn = moderation::moderation_connection(&app)?;
+    let _ = satellite_id;
+    moderation::list_actions(&conn, limit.unwrap_or(100))
+}
+
+/// Sever live connections for a DID (RFC-003 §5.1): build the typed
+/// termination frame, increment `severed_conns`, and append the audit row.
+#[tauri::command]
+fn admin_sever(
+    satellite_id: String,
+    target_did: String,
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<u32, String> {
+    let admin_did = moderation::require_admin(&app)?;
+    let live = state
+        .moderation_connections
+        .lock()
+        .unwrap()
+        .get(&target_did)
+        .copied()
+        .unwrap_or(0);
+    let mut conn = moderation::moderation_connection(&app)?;
+    let _ = satellite_id;
+    moderation::sever_connections(
+        &mut conn,
+        &target_did,
+        live,
+        &admin_did,
+        "operator: manual disconnect",
+        None,
+        "node",
+    )
+}
+
+/// 1-click ban: ledger insert + sever + optional invite-branch pruning and
+/// content purge (with kind:1605 tombstone broadcast).
+#[tauri::command]
+fn admin_ban(
+    satellite_id: String,
+    target_did: String,
+    reason: String,
+    scope: String,
+    expires_at: Option<u64>,
+    prune_branch: bool,
+    purge_content: bool,
+    evidence_hashes: Vec<String>,
+    app: AppHandle,
+    state: State<'_, ServiceState>,
+) -> Result<moderation::BanReport, String> {
+    let admin_did = moderation::require_admin(&app)?;
+    let _ = satellite_id;
+    if target_did.trim().is_empty() {
+        return Err("target DID must not be empty".to_string());
+    }
+    if admin_did == target_did {
+        return Err("Refusing to ban the active admin identity".to_string());
+    }
+    let scope = if scope.trim().is_empty() {
+        "node".to_string()
+    } else {
+        scope.trim().to_ascii_lowercase()
+    };
+    let evidence = if evidence_hashes.is_empty() {
+        None
+    } else {
+        Some(
+            evidence_hashes
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+
+    let mut conn = moderation::moderation_connection(&app)?;
+    let ban_id = moderation::insert_ban(
+        &mut conn,
+        &target_did,
+        &reason,
+        &admin_did,
+        &scope,
+        expires_at,
+        evidence.as_deref(),
+    )?;
+
+    let live = state
+        .moderation_connections
+        .lock()
+        .unwrap()
+        .get(&target_did)
+        .copied()
+        .unwrap_or(0);
+    let severed = moderation::sever_connections(
+        &mut conn,
+        &target_did,
+        live,
+        &admin_did,
+        &reason,
+        Some(ban_id),
+        &scope,
+    )?;
+
+    // RFC-002 branch pruning: revoke every invite the banned DID issued.
+    let mut invite_conn = invites::invites_connection(&app)?;
+    let pruned = if prune_branch {
+        invites::prune_issuer_branch(&mut invite_conn, &target_did, &admin_did)?
+    } else {
+        0
+    };
+
+    // Content purge cascade (T1 tombstone + T2 media + T3 peer broadcast).
+    let mut tombstones = 0;
+    let mut blobs_deleted = 0;
+    let mut events_broadcast = 0;
+    if purge_content {
+        let report = purge_content_internal(&app, &admin_did, &target_did, true)?;
+        tombstones = report.tombstones;
+        blobs_deleted = report.blobs_deleted;
+        events_broadcast = report.events_broadcast;
+    }
+
+    println!(
+        "[MODERATION] ban #{} {} by {} (severed {}, pruned {}, tombstones {}, media {}, broadcast {})",
+        ban_id, target_did, admin_did, severed, pruned, tombstones, blobs_deleted, events_broadcast
+    );
+
+    Ok(moderation::BanReport {
+        ban_id,
+        did: target_did,
+        severed_conns: severed,
+        pruned_tokens: pruned,
+        tombstones,
+        blobs_deleted,
+        events_broadcast,
+    })
+}
+
+/// Soft-delete the ban row; the immutable audit trail keeps the origin.
+#[tauri::command]
+fn admin_unban(satellite_id: String, target_did: String, app: AppHandle) -> Result<(), String> {
+    let admin_did = moderation::require_admin(&app)?;
+    let _ = satellite_id;
+    let mut conn = moderation::moderation_connection(&app)?;
+    moderation::soft_delete_ban(&mut conn, &target_did, &admin_did)
+}
+
+/// Tombstone & purge engine for a subject DID (RFC-003 §5.3).
+#[tauri::command]
+fn admin_purge(
+    satellite_id: String,
+    target_did: String,
+    cascade_media: bool,
+    app: AppHandle,
+) -> Result<moderation::PurgeReport, String> {
+    let admin_did = moderation::require_admin(&app)?;
+    let _ = satellite_id;
+    purge_content_internal(&app, &admin_did, &target_did, cascade_media)
+}
+
+/// T1 + T2 purge cascade, then T3: construct, sign and persist a kind:1605
+/// moderation tombstone referencing every newly tombstoned event id.
+fn purge_content_internal(
+    app: &AppHandle,
+    actor_did: &str,
+    subject_did: &str,
+    cascade_media: bool,
+) -> Result<moderation::PurgeReport, String> {
+    let mod_conn = moderation::moderation_connection(app)?;
+    let db_path = moderation::relay_db_path(app);
+    let relay = if db_path.exists() {
+        Some(
+            rusqlite::Connection::open(&db_path)
+                .map_err(|e| format!("Failed to open relay ledger: {}", e))?,
+        )
+    } else {
+        None
+    };
+    let blobs_dir = moderation::blobs_dir_path(app);
+    let mut report = moderation::tombstone_and_purge(
+        &mod_conn,
+        relay.as_ref(),
+        &blobs_dir,
+        subject_did,
+        actor_did,
+        cascade_media,
+    )?;
+    if !report.tombstoned_ids.is_empty() {
+        report.events_broadcast = broadcast_moderation_tombstone(app, subject_did, &report.tombstoned_ids)?;
+    }
+    Ok(report)
+}
+
+/// Build, sign (active L1 persona, secp256k1 Schnorr) and persist a NIP-01
+/// `kind:1605` moderation_tombstone with `["e", event_id]` refs, written to
+/// the local relay datastore as the node's local copy of the peer broadcast.
+fn broadcast_moderation_tombstone(
+    app: &AppHandle,
+    subject_did: &str,
+    event_ids: &[String],
+) -> Result<usize, String> {
+    if event_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let vault = vault::load_vault(app)?;
+    let profile = vault::get_active_profile(&vault).map_err(|e| e.to_string())?;
+    let nostr_pubkey_hex = profile.nostr_pubkey_hex.clone();
+    let now = moderation::now_unix() as i64;
+
+    let e_tags: Vec<serde_json::Value> = event_ids
+        .iter()
+        .map(|id| serde_json::json!(["e", id]))
+        .collect();
+    let mut event = serde_json::json!({
+        "pubkey": nostr_pubkey_hex,
+        "created_at": now,
+        "kind": 1605,
+        "tags": serde_json::Value::Array(e_tags),
+        "content": serde_json::json!({
+            "type": "moderation_tombstone",
+            "subject_did": subject_did,
+        })
+        .to_string(),
+    });
+
+    let id_hex = sign_event_with_vault(app, &mut event)?;
+
+    // Persist the tombstone to the local relay datastore.
+    let db_path = moderation::relay_db_path(app);
+    if db_path.exists() {
+        if let Ok(relay) = rusqlite::Connection::open(&db_path) {
+            let _ = nostr_relay::ensure_deleted_column(&relay);
+            let _ = relay.execute(
+                "INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    id_hex,
+                    nostr_pubkey_hex,
+                    now,
+                    1605_i64,
+                    event["tags"].to_string(),
+                    event["content"].as_str().unwrap_or(""),
+                    event["sig"].as_str().unwrap_or(""),
+                ],
+            );
+        }
+    }
+
+    println!(
+        "[MODERATION] kind:1605 tombstone {} broadcast for {} ({} event refs)",
+        id_hex,
+        subject_did,
+        event_ids.len()
+    );
+    Ok(1)
+}
+
 pub fn focus_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
@@ -1041,6 +1360,35 @@ async fn submit_ws_event_response(
         .map_err(|e| format!("Failed to parse event JSON: {}", e))?;
 
     let kind = event["kind"].as_i64().unwrap_or(1);
+    let event_id = sign_event_with_vault(&app, &mut event)?;
+
+    let response = serde_json::json!({
+        "type": "signed_event",
+        "event": event
+    });
+
+    println!(
+        "[SIGN_DEBUG] Kind {} signed with secp256k1 pubkey `{}` (id {})",
+        kind,
+        response["event"]["pubkey"].as_str().unwrap_or(""),
+        event_id
+    );
+
+    println!("Sending signed Nostr event back to browser");
+    let _ = sender.send(Message::Text(response.to_string().into()));
+    Ok(())
+}
+
+/// Sign a NIP-01 event with the vault persona whose secp256k1 pubkey matches
+/// `event["pubkey"]`. Populates `id` and `sig` and returns the event id.
+///
+/// Shared by interactive WS signing (`submit_ws_event_response`) and the
+/// RFC-003 moderation tombstone broadcast (kind:1605).
+pub fn sign_event_with_vault(
+    app: &AppHandle,
+    event: &mut serde_json::Value,
+) -> Result<String, String> {
+    let kind = event["kind"].as_i64().unwrap_or(1);
     let pubkey = event["pubkey"].as_str().unwrap_or("").to_string();
     let created_at = event["created_at"].as_i64().unwrap_or(0);
     let tags = event.get("tags").cloned().unwrap_or(serde_json::json!([]));
@@ -1061,7 +1409,7 @@ async fn submit_ws_event_response(
         .ok_or_else(|| "Missing pubkey field in event".to_string())?
         .to_string();
 
-    let vault = vault::load_vault(&app)?;
+    let vault = vault::load_vault(app)?;
     let seed = vault::decode_root_seed(&vault)?;
 
     // All Nostr events use secp256k1 Schnorr (NIP-01 standard).
@@ -1107,22 +1455,9 @@ async fn submit_ws_event_response(
         .map_err(|_| "Schnorr signing failed".to_string())?;
     let sig_hex = hex::encode(schnorr_sig.to_bytes());
 
-    event["id"] = serde_json::Value::String(id_hex);
+    event["id"] = serde_json::Value::String(id_hex.clone());
     event["sig"] = serde_json::Value::String(sig_hex);
-
-    println!(
-        "[SIGN_DEBUG] Kind {} signed with secp256k1 pubkey `{}`",
-        kind, event_pubkey
-    );
-
-    let response = serde_json::json!({
-        "type": "signed_event",
-        "event": event
-    });
-
-    println!("Sending signed Nostr event back to browser");
-    let _ = sender.send(Message::Text(response.to_string().into()));
-    Ok(())
+    Ok(id_hex)
 }
 
 #[tauri::command]
@@ -3117,6 +3452,7 @@ pub fn run() {
         shutdown_signals: Mutex::new(HashMap::new()),
         auto_start_settings: Mutex::new(HashMap::new()),
         enclave_locked: Arc::new(AtomicBool::new(false)),
+        moderation_connections: Arc::new(Mutex::new(HashMap::new())),
     };
     let ws_state = WsState::default();
     let transit_state = TransitState::default();
@@ -3230,6 +3566,14 @@ pub fn run() {
             get_issuer_status,
             set_issuer_role,
             render_invite_qr,
+            admin_probe,
+            admin_list_members,
+            admin_list_bans,
+            admin_list_actions,
+            admin_sever,
+            admin_ban,
+            admin_unban,
+            admin_purge,
             submit_ws_response,
             submit_ws_event_response,
             submit_ws_credential_response,
@@ -3368,6 +3712,7 @@ mod tests {
             shutdown_signals: Mutex::new(HashMap::new()),
             auto_start_settings: Mutex::new(HashMap::new()),
             enclave_locked: Arc::new(AtomicBool::new(false)),
+            moderation_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
