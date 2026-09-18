@@ -296,6 +296,12 @@ describe("GlobalStatusBar Phase 10", () => {
     expect(screen.getByText(/Dual-Broadcast to Local Relay & Mesh Nodes/i)).toBeInTheDocument();
   });
 
+  it("renders dynamic version badge matching package.json", async () => {
+    const onNavigate = vi.fn();
+    render(<GlobalStatusBar onNavigateEnclave={onNavigate} />);
+    expect(screen.getByText("v0.2.1 · Enclave Active")).toBeInTheDocument();
+  });
+
   it("renders active persona pill dynamically from props", async () => {
     const onNavigate = vi.fn();
     const l2Persona: Profile = {

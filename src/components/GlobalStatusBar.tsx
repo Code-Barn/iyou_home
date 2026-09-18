@@ -22,6 +22,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Profile, TlsStatus, UpdateMetadata, UpdatePreferences } from "../lib/types";
 import QuickDispatchModal from "./QuickDispatchModal";
 import UpdateVettingModal from "./updater/UpdateVettingModal";
+import pkg from "../../package.json";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -227,7 +228,7 @@ export default function GlobalStatusBar({
           onClick={onNavigateEnclave}
         >
           <span className="wordmark-text">iyou_home</span>
-          <span className="wordmark-badge">v2.0 · Enclave Active</span>
+          <span className="wordmark-badge">v{pkg.version} · Enclave Active</span>
         </button>
 
         {/* Center cluster: Daemon indicators + sync */}
