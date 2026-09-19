@@ -4,8 +4,10 @@
 #
 # Automatically bumps SemVer across all 5 manifests, commits the bump,
 # builds macOS (local) and Linux (remote dc13 runner) release bundles,
-# triggers Windows NSIS installer compilation via GitHub Actions,
-# stages them under release-artifacts/, computes SHA-256 sums, publishes a
+# stages any available Windows NSIS .exe and triggers its GitHub Actions
+# compilation, gathers every platform bundle under
+# dist/releases/iyou_home_${VERSION}/, computes SHA-256 sums, wraps them in a
+# BitTorrent .torrent + magnet URI (seeded via public trackers), publishes a
 # GitHub Release for tag "v${VERSION}", and self-checks the download URLs.
 #
 # Usage:
@@ -28,12 +30,67 @@
 #   SKIP_UPLOAD=1   skip tagging + GitHub release publish (staging only)
 #   RELEASE_NOTES   custom release notes text
 #   RELEASE_REMOTE  target git remote (default: auto-detected)
+#   WINDOWS_EXE     explicit path to a Windows NSIS .exe to stage into the payload
+#   WINDOWS_STAGE_DIR directory scanned for a staged/downloaded Windows .exe
+#   FORCE_PARTIAL_TORRENT=1  skip the missing-bundle prompt (partial payload ok)
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------- helpers
 log()  { printf '\n==> %s\n' "$*"; }
 fail() { printf '\n[FATAL] %s\n' "$*" >&2; exit 1; }
+
+# Locate a Windows NSIS installer to stage into the release payload, in
+# priority order:
+#   1. $WINDOWS_EXE                    explicit path to an .exe
+#   2. local NSIS bundles              cross-compiled x86_64-pc-windows-msvc,
+#                                      then the default-target NSIS bundle
+#   3. $WINDOWS_STAGE_DIR              directory holding a staged .exe
+#   4. $ROOT/release-artifacts/windows conventional drop folder for
+#                                      .exe files downloaded from the release
+# Prints the matching path, or nothing when none is found (callers use `|| true`).
+find_windows_exe() {
+  if [[ -n "${WINDOWS_EXE:-}" && -f "$WINDOWS_EXE" ]]; then
+    printf '%s\n' "$WINDOWS_EXE"
+    return 0
+  fi
+  local search_dir exe
+  for search_dir in \
+    "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" \
+    "src-tauri/target/release/bundle/nsis" \
+    "${WINDOWS_STAGE_DIR:-}" \
+    "$ROOT/release-artifacts/windows"; do
+    [[ -n "$search_dir" && -d "$search_dir" ]] || continue
+    exe="$(find "$search_dir" -maxdepth 1 -type f -name '*.exe' -print -quit 2>/dev/null || true)"
+    if [[ -n "$exe" ]]; then
+      printf '%s\n' "$exe"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Terminal instructions for the assembled payload: torrent path, release
+# folder, the magnet URI (to verify against iyou_idp '_download_modal.html'),
+# and immediate seeding commands. No-op when the torrent section has not run.
+print_release_summary() {
+  if [[ -z "${TORRENT_FILE:-}" || -z "${RELEASE_DIR:-}" ]]; then
+    return 0
+  fi
+  log "Release payload ready — ${RELEASE_DIR}"
+  printf '\n═══════════════════════════════════════════════════════════════════\n'
+  printf '  Release folder : %s\n'                 "$RELEASE_DIR"
+  printf '  Torrent file   : %s\n'                 "$RELEASE_DIR/$TORRENT_FILE"
+  printf '  Magnet URI     : %s\n'                 "${MAGNET_LINK:-[NOT_GENERATED]}"
+  printf '  Verify against : iyou_idp _download_modal.html (magnet field)\n'
+  printf '\n  Seed immediately on this machine:\n'
+  printf '    transmission-cli "%s/%s" -w "%s" &\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
+  printf '    # or: transmission-remote -a "%s/%s" -w "%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
+  printf '    # or: aria2c --follow-torrent=mem "%s/%s" --dir="%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
+  printf '\n  Mirror manifest (magnet + IPFS URIs, matches the release notes):\n'
+  printf '    cat "%s/MIRRORS.txt"\n'              "$RELEASE_DIR"
+  printf '═══════════════════════════════════════════════════════════════════\n'
+}
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -60,6 +117,9 @@ if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "  SKIP_UPLOAD=1 Stage and checksum only (no tag, no push, no publish)"
   echo "  RELEASE_NOTES Custom release notes string"
   echo "  RELEASE_REMOTE Target git remote (default: auto-detected)"
+  echo "  WINDOWS_EXE=path   Stage this Windows NSIS .exe into the payload"
+  echo "  WINDOWS_STAGE_DIR  Directory scanned for a staged/downloaded Windows .exe"
+  echo "  FORCE_PARTIAL_TORRENT=1 Bypass the missing-bundle prompt (partial payload ok)"
   exit 0
 fi
 
@@ -76,8 +136,13 @@ pick_release_remote() {
 }
 REMOTE="${RELEASE_REMOTE:-$(pick_release_remote)}"
 REPO="Code-Barn/iyou_home"
-RELEASE_DIR="$ROOT/release-artifacts"
-mkdir -p "$RELEASE_DIR"
+# The versioned release payload directory is computed in pre-flight once
+# VERSION is resolved — see "release payload" below. It defaults to
+# dist/releases/iyou_home_${VERSION} (under the git-ignored dist/ tree) so
+# every platform bundle for a single tag is staged in one flat folder that
+# becomes the .torrent source root.
+RELEASE_DIR=""
+mkdir -p "$ROOT/dist/releases"
 
 # ---------------------------------------------------------------- version bump
 case "$BUMP_ARG" in
@@ -135,6 +200,12 @@ VERSION="$(node -p "require('./package.json').version")"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "non-SemVer version '$VERSION' in package.json"
 log "Version: ${VERSION} (tag v${VERSION})"
 
+# Release payload directory — one flat folder holding every platform bundle
+# (dmg/deb/AppImage/rpm/exe) so the torrent can wrap the whole release.
+RELEASE_DIR="$ROOT/dist/releases/iyou_home_${VERSION}"
+mkdir -p "$RELEASE_DIR"
+log "Release payload dir: ${RELEASE_DIR}"
+
 [[ -z "$(git status --porcelain)" ]] || fail "git working tree is dirty; commit or stash before releasing"
 git rev-parse --git-dir >/dev/null
 
@@ -183,6 +254,69 @@ if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
   log "Linux bundles staged: .deb, .AppImage (+ .rpm)"
 else
   log "Skipping dc13 Linux build (SKIP_LINUX=1)"
+fi
+
+# ---------------------------------------------------------------- Windows .exe
+# Tauri's NSIS installer produced by GitHub Actions lands on the release AFTER
+# this script exits. To include Windows in the local payload (and therefore in
+# the .torrent + magnet), stage an .exe up front — either from a local
+# cross-compile output or by dropping a previously built / downloaded
+# installer into $ROOT/release-artifacts/windows/ (or WINDOWS_STAGE_DIR).
+if [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
+  log "Staging Windows NSIS installer (.exe)"
+  staged_exe="$(find_windows_exe || true)"
+  if [[ -n "$staged_exe" ]]; then
+    cp "$staged_exe" "$RELEASE_DIR/iyou-home_${VERSION}_x64-setup.exe"
+    log "Windows installer staged: iyou-home_${VERSION}_x64-setup.exe (from ${staged_exe})"
+  else
+    log "WARN: no Windows .exe available to stage (the GitHub Actions build is asynchronous)."
+    log "      The .torrent/.magnet will NOT cover Windows unless one is staged:"
+    log "        - set WINDOWS_EXE=/path/to/iyou-home_${VERSION}_x64-setup.exe, or"
+    log "        - drop it into $ROOT/release-artifacts/windows/, or"
+    log "        - re-run after the GH Actions build finishes and download it from the release."
+  fi
+else
+  log "Skipping Windows .exe staging (SKIP_WINDOWS=1)"
+fi
+
+# ---------------------------------------------------------------- payload check
+# Every platform this run was asked to build must be present before the
+# torrent is generated; otherwise the .torrent/.magnet silently under-ships
+# and iyou_idp's _download_modal.html points at a partial payload. Warn and
+# prompt (fail closed) unless FORCE_PARTIAL_TORRENT=1.
+log "Validating release payload completeness"
+payload_missing=()
+if [[ "${SKIP_MAC:-0}" != "1" ]]; then
+  [[ -f "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg" ]] \
+    || payload_missing+=("macOS .dmg (iyou-home_${VERSION}_x64.dmg)")
+fi
+if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
+  [[ -n "$(ls "$RELEASE_DIR"/*.deb 2>/dev/null | head -n1)" ]] \
+    || payload_missing+=("Linux .deb")
+  [[ -n "$(ls "$RELEASE_DIR"/*.AppImage 2>/dev/null | head -n1)" ]] \
+    || payload_missing+=("Linux .AppImage")
+fi
+if [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
+  [[ -f "$RELEASE_DIR/iyou-home_${VERSION}_x64-setup.exe" ]] \
+    || payload_missing+=("Windows .exe (iyou-home_${VERSION}_x64-setup.exe)")
+fi
+
+if (( ${#payload_missing[@]} > 0 )); then
+  log "Expected platform bundles missing from ${RELEASE_DIR}:"
+  printf '  [MISSING] %s\n' "${payload_missing[@]}"
+  if [[ "${FORCE_PARTIAL_TORRENT:-0}" == "1" ]]; then
+    log "FORCE_PARTIAL_TORRENT=1 — continuing with a partial payload."
+  else
+    log "A partial torrent would silently omit these platforms from the release"
+    log "and from the magnet URI verified by iyou_idp (_download_modal.html)."
+    ans=""
+    read -r -p "Proceed and generate a PARTIAL payload torrent? [y/N] " ans </dev/tty || ans=""
+    if [[ ! "$ans" =~ ^[yY]$ ]]; then
+      fail "aborted: stage the missing bundles (or set FORCE_PARTIAL_TORRENT=1) and re-run"
+    fi
+  fi
+else
+  log "All expected platform bundles present in the payload."
 fi
 
 # ---------------------------------------------------------------- checksums
@@ -262,7 +396,7 @@ torrent_path = os.path.join(release_dir, torrent_name)
 
 trackers = [
     "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
+    "udp://open.demonii.com:1337/announce",
     "udp://tracker.torrent.eu.org:451/announce"
 ]
 
@@ -271,7 +405,11 @@ if os.path.isdir(release_dir):
     for f in sorted(os.listdir(release_dir)):
         full = os.path.join(release_dir, f)
         if os.path.isfile(full):
-            # Include installer packages, exclude .torrent and .txt
+            # Include every platform installer package — macOS .dmg, Linux
+            # .deb/.AppImage/.rpm, Windows .exe (staged as
+            # iyou-home_<v>_x64-setup.exe) — and exclude the .torrent itself
+            # plus the .txt manifests, so the torrent wraps the whole release
+            # folder rather than a single archive.
             if (f.startswith(('iyou-home_', 'iyou-home-')) and not f.endswith(('.torrent', '.txt'))) or f.endswith(('.deb', '.AppImage', '.dmg', '.exe', '.rpm')):
                 files.append(f)
 
@@ -395,6 +533,7 @@ cat "$RELEASE_DIR/MIRRORS.txt"
 
 if [[ "${SKIP_UPLOAD:-0}" == "1" ]]; then
   log "SKIP_UPLOAD=1 — staged assets only; not tagging or publishing."
+  print_release_summary
   exit 0
 fi
 
@@ -473,3 +612,4 @@ fi
 
 [[ "$failed" == "0" ]] || fail "one or more assets returned a non-200/302 status"
 log "Release automation complete: https://github.com/$REPO/releases/tag/v${VERSION}"
+print_release_summary
