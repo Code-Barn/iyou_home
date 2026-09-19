@@ -606,6 +606,9 @@ describe("App", () => {
         return Promise.resolve("did:key:z6Mku...");
       }
       if (cmd === "reveal_master_seed") return Promise.resolve(SEED);
+      // RFC-004: onboarding now routes through the neutral age gate; classify
+      // the stub birth date as an adult so the seed ceremony is reachable.
+      if (cmd === "classify_age") return Promise.resolve("adult");
       return defaultMockHandler(cmd, args);
     });
 
@@ -617,6 +620,18 @@ describe("App", () => {
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Create Sovereign Identity/i }));
+    });
+
+    // The neutral age gate intercepts identity creation (RFC-004 §4.1).
+    await waitFor(() => {
+      expect(screen.getByTestId("age-gate-month")).toBeInTheDocument();
+    });
+    await act(async () => {
+      fireEvent.change(screen.getByTestId("age-gate-month"), { target: { value: "9" } });
+      fireEvent.change(screen.getByTestId("age-gate-year"), { target: { value: "2005" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("age-gate-continue"));
     });
 
     await waitFor(() => {

@@ -145,6 +145,45 @@ export interface UserPreferences {
   relay_mesh?: string[];
   /** Sovereign update preferences, policies, and channel configuration. */
   update_preferences?: UpdatePreferences;
+  /** RFC-004 neutral age gate sealed bracket record (tier only on wires). */
+  age_gate?: AgeGateRecord | null;
+  /** RFC-004 §5.2 teen default-protective policies. */
+  mutual_contacts_only_dm?: boolean;
+  restricted_feed_indexing?: boolean;
+  public_persona_broadcast?: boolean;
+}
+
+/** RFC-004 three-tier minor framework (mirror of Rust `compliance::AgeTier`). */
+export type AgeTier = "child" | "teen" | "adult";
+
+/** Privacy-sealed age bracket stored in preferences under `age_gate`.
+ *  `record_sha256` is sealed by the enclave; the component-facing
+ *  `onDecision` record (RFC-004 §4.2) omits it. */
+export interface AgeGateRecord {
+  gate_version: "neutral-v1";
+  tier: AgeTier;
+  computed_at: number;
+  record_sha256?: string;
+  month: number;
+  year: number;
+}
+
+/** Outcome of a legal disclaimer exposure (RFC-004 §6.2). */
+export type DisclaimerOutcome = "accepted" | "declined" | "dismissed";
+
+/** One row of the append-only `disclaimer_audit.json` log. */
+export interface DisclaimerAuditEntry {
+  entry_id: string;
+  disclaimer_sha256: string;
+  disclaimer_key: string;
+  version_label: string;
+  shown_at: number;
+  accepted_at: number | null;
+  locale: string;
+  device_id: string;
+  presented_did: string;
+  outcome: DisclaimerOutcome;
+  context: string;
 }
 
 export type UpdatePolicy = 'locked' | 'manual' | 'auto';
@@ -194,6 +233,10 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
     last_checked_at: null,
     ignored_version: null,
   },
+  age_gate: null,
+  mutual_contacts_only_dm: false,
+  restricted_feed_indexing: false,
+  public_persona_broadcast: true,
 };
 
 export interface KeyCustodyDiagnostic {

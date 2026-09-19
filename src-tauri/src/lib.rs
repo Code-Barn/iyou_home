@@ -37,6 +37,7 @@ mod biometrics;
 mod blossom;
 mod bridge;
 mod certs;
+mod compliance;
 mod contacts;
 mod invites;
 mod moderation;
@@ -114,6 +115,19 @@ pub struct UserPreferences {
     /// Sovereign update preferences, policies, and channel configuration.
     #[serde(default)]
     pub update_preferences: updater::UpdatePreferences,
+    /// RFC-004 neutral age gate sealed bracket record (never raw DoB over
+    /// external wires; satellites/OIDC see only the tier).
+    #[serde(default)]
+    pub age_gate: Option<compliance::AgeGateRecord>,
+    /// RFC-004 §5.2 teen default-protective policies (default-on for Teens).
+    #[serde(default)]
+    pub mutual_contacts_only_dm: bool,
+    /// Feed/public indexing restricted to mutual contacts only (Teen default).
+    #[serde(default)]
+    pub restricted_feed_indexing: bool,
+    /// Public persona publish (`kind:0`) disabled (Teen default).
+    #[serde(default)]
+    pub public_persona_broadcast: bool,
 }
 
 pub fn default_relay_mesh() -> Vec<String> {
@@ -142,6 +156,10 @@ impl Default for UserPreferences {
             last_backup_at: 0,
             relay_mesh: default_relay_mesh(),
             update_preferences: updater::UpdatePreferences::default(),
+            age_gate: None,
+            mutual_contacts_only_dm: false,
+            restricted_feed_indexing: false,
+            public_persona_broadcast: true,
         }
     }
 }
@@ -1780,6 +1798,59 @@ fn get_user_preferences(app: AppHandle) -> Result<UserPreferences, String> {
 #[tauri::command]
 fn save_user_preferences(app: AppHandle, preferences: UserPreferences) -> Result<(), String> {
     save_preferences(&app, &preferences)
+}
+
+// ---------- RFC-004 neutral age gate & compliance ----------
+
+/// Classify a birth month/year into `child | teen | adult`, persist the sealed
+/// `age_gate` bracket record into `preferences.json`, and (for Teens) apply
+/// the RFC-004 §5.2 default-protective policy flags. Fail-closed on invalid or
+/// future dates. Only the tier bracket is returned — raw month/year never
+/// leaves the local preferences vault.
+#[tauri::command]
+fn classify_age(birth_month: u8, birth_year: u16, app: AppHandle) -> Result<compliance::AgeTier, String> {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let tier = compliance::classify_age(birth_month, birth_year, now_unix)?;
+
+    // Persist the neutral gate sealed record (RFC-004 §5.1) into preferences.
+    let mut prefs = load_preferences(&app);
+    prefs.age_gate = Some(compliance::AgeGateRecord {
+        gate_version: compliance::GATE_VERSION.to_string(),
+        tier,
+        computed_at: now_unix,
+        record_sha256: compliance::seal_record_sha256(birth_month, birth_year, tier),
+        month: birth_month,
+        year: birth_year,
+    });
+
+    // Teen tier: default-protective policies default ON (RFC-004 §5.2).
+    if tier == compliance::AgeTier::Teen {
+        prefs.mutual_contacts_only_dm = true;
+        prefs.restricted_feed_indexing = true;
+        prefs.public_persona_broadcast = false;
+    }
+    save_preferences(&app, &prefs)?;
+    Ok(tier)
+}
+
+/// Append a legal disclaimer acknowledgment to the append-only
+/// `disclaimer_audit.json` log. The enclave seals entry_id, device_id, and
+/// presented_did; client-supplied identity fields are never trusted.
+#[tauri::command]
+fn record_disclaimer_audit(
+    entry: compliance::DisclaimerAuditEntry,
+    app: AppHandle,
+) -> Result<(), String> {
+    compliance::append_disclaimer_audit(&app, entry)
+}
+
+/// Read the sealed age bracket tier from preferences, if the gate was passed.
+#[tauri::command]
+fn get_age_tier(app: AppHandle) -> Result<Option<compliance::AgeTier>, String> {
+    Ok(load_preferences(&app).age_gate.map(|g| g.tier))
 }
 
 #[tauri::command]
@@ -3583,6 +3654,9 @@ pub fn run() {
             set_auto_start,
             get_user_preferences,
             save_user_preferences,
+            classify_age,
+            record_disclaimer_audit,
+            get_age_tier,
             get_service_statuses,
             sync_vote_records,
             get_vote_history,
@@ -3787,6 +3861,10 @@ mod tests {
                 last_checked_at: Some(1700000000),
                 ignored_version: Some("0.2.1".to_string()),
             },
+            age_gate: None,
+            mutual_contacts_only_dm: false,
+            restricted_feed_indexing: false,
+            public_persona_broadcast: true,
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");

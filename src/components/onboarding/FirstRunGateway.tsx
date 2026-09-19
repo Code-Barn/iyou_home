@@ -19,6 +19,8 @@ import { useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import NeutralAgeGate from "./NeutralAgeGate";
+import type { AgeGateRecord } from "../../lib/types";
 
 interface FirstRunGatewayProps {
   /** Invoked once the vault is provisioned (create, seed-restore, or
@@ -32,7 +34,9 @@ const ACK_PHRASE = "I HAVE WRITTEN THIS DOWN";
 
 type Step =
   | "landing"
+  | "age-gate"
   | "seed-ceremony"
+  | "parent-pairing"
   | "restore-choice"
   | "restore-backup"
   | "restore-seed";
@@ -108,6 +112,17 @@ export default function FirstRunGateway({ onInitialized }: FirstRunGatewayProps)
   };
 
   // ---------- Create path ----------
+
+  /** RFC-004 neutral age gate: only Adult/Teen reach the seed ceremony. */
+  const handleAgeGateDecision = (_record: AgeGateRecord) => {
+    void handleCreate();
+  };
+
+  const handleNeedsParentPairing = () => {
+    // Child (<13): seed generation is halted; only exit is parent pairing
+    // (RFC-005 supervisory delegation, pending).
+    goTo("parent-pairing");
+  };
 
   const handleCreate = async () => {
     setBusy(true);
@@ -312,7 +327,7 @@ export default function FirstRunGateway({ onInitialized }: FirstRunGatewayProps)
         {step === "landing" && (
           <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
             <button
-              onClick={handleCreate}
+              onClick={() => goTo("age-gate")}
               disabled={busy}
               data-testid="gateway-create"
               style={actionButtonStyle(true)}
@@ -349,6 +364,85 @@ export default function FirstRunGateway({ onInitialized }: FirstRunGatewayProps)
               Recover an existing identity from an encrypted{" "}
               <code>.iyoubackup</code> archive or a master seed phrase.
             </p>
+          </div>
+        )}
+
+        {step === "age-gate" && (
+          <div data-testid="gateway-age-gate">
+            <h3 style={{ margin: "0 0 0.25rem 0", color: "#fff" }}>
+              🛡️ Let&apos;s Get Started
+            </h3>
+            <p
+              style={{
+                margin: "0 0 1rem 0",
+                fontSize: "0.9rem",
+                color: "#c7d2fe",
+                lineHeight: 1.5,
+              }}
+            >
+              Confirm your birth month and year to continue.
+            </p>
+            <NeutralAgeGate
+              onDecision={handleAgeGateDecision}
+              onNeedsParentPairing={handleNeedsParentPairing}
+            />
+            <button
+              onClick={() => goTo("landing")}
+              disabled={busy}
+              style={{ ...secondaryButtonStyle, marginTop: "1rem" }}
+            >
+              ← Back
+            </button>
+          </div>
+        )}
+
+        {step === "parent-pairing" && (
+          <div data-testid="gateway-parent-pairing">
+            <h3 style={{ margin: "0 0 0.5rem 0", color: "#fff" }}>
+              🤝 Pair with Parent Enclave
+            </h3>
+            <p
+              style={{
+                margin: "0 0 1rem 0",
+                fontSize: "0.95rem",
+                color: "#c7d2fe",
+                lineHeight: 1.6,
+              }}
+            >
+              To setup an identity for an individual under 13, please pair this
+              device with a parent or guardian&apos;s iyou_home enclave.
+            </p>
+            <div
+              style={{
+                borderRadius: "10px",
+                border: "1px dashed #a5b4fc",
+                padding: "1.25rem",
+                textAlign: "center",
+                color: "#c7d2fe",
+                fontSize: "0.9rem",
+              }}
+            >
+              <p style={{ margin: "0 0 0.5rem 0" }}>
+                Waiting for a parent or guardian enclave…
+              </p>
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: "0.8rem",
+                  color: "#a5b4fc",
+                }}
+              >
+                Supervisory delegation (RFC-005) will resume here. Seed
+                generation stays blocked until a parent pair completes.
+              </p>
+            </div>
+            <button
+              onClick={() => goTo("landing")}
+              disabled={busy}
+              style={{ ...secondaryButtonStyle, marginTop: "1rem" }}
+            >
+              ← Back
+            </button>
           </div>
         )}
 
