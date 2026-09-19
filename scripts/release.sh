@@ -23,6 +23,7 @@
 #                                  # to package the already-bumped version)
 #   ./scripts/release.sh --package-only  # no bump, no rebuilds; stage existing bundles
 #                                  # (add --skip-build / --skip-bump as aliases)
+#   ./scripts/release.sh --no-seed  # skip seed-box rsync + transmission registration
 #
 # Idempotent: safe to re-run when a release tag already exists (it will
 # re-upload and clobber assets). Requires: gh CLI (authenticated), ssh dc13
@@ -40,6 +41,9 @@
 #   WINDOWS_STAGE_DIR directory scanned for a staged/downloaded Windows .exe
 #   FORCE_PARTIAL_TORRENT=1  skip the missing-bundle prompt (partial payload ok)
 #   PACKAGE_ONLY=1  no version bump and no rebuilds; stage existing bundles only
+#   SEED_HOST       ssh target of the BitTorrent seed box (default: iyou@qnap)
+#   SEED_DIR        remote directory holding release payloads (default: releases)
+#   SKIP_SEED=1     skip rsync to the seed box and transmission-remote registration
 #
 set -euo pipefail
 
@@ -90,6 +94,9 @@ print_release_summary() {
   printf '  Torrent file   : %s\n'                 "$RELEASE_DIR/$TORRENT_FILE"
   printf '  Magnet URI     : %s\n'                 "${MAGNET_LINK:-[NOT_GENERATED]}"
   printf '  Verify against : iyou_idp _download_modal.html (magnet field)\n'
+  printf '  Seed host      : %s:%s (remote payload %s/iyou_home_%s)\n' \
+         "${SEED_HOST:-iyou@qnap}" "${SEED_DIR:-releases}" "${SEED_DIR:-releases}" "${VERSION:-}"
+  printf '  Seeder status  : %s\n'                    "${SEED_STATUS:-not attempted}"
   printf '\n  Seed immediately on this machine:\n'
   printf '    transmission-cli "%s/%s" -w "%s" &\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
   printf '    # or: transmission-remote -a "%s/%s" -w "%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
@@ -102,12 +109,34 @@ print_release_summary() {
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-BUMP_ARG="${1:-${BUMP:-patch}}"
+# Seed box (QNAP NAS) distribution configuration — see the "seed box" section
+# below. Can be disabled per-run via --no-seed / --skip-seed or SKIP_SEED=1.
+SEED_HOST="${SEED_HOST:-iyou@qnap}"   # ssh target running the BitTorrent seeder
+SEED_DIR="${SEED_DIR:-releases}"      # remote payload root (relative to $SEED_HOST $HOME)
+SKIP_SEED="${SKIP_SEED:-0}"           # =1 to skip rsync to the seed box + registration
+
+# Parse auxiliary flags (may appear in any argv position).
+for arg in "$@"; do
+  case "$arg" in
+    --no-seed|--skip-seed) SKIP_SEED=1 ;;
+  esac
+done
+
+# The bump argument is the first positional that is not an auxiliary flag;
+# falls back to $BUMP, then the default "patch".
+BUMP_ARG="${BUMP:-patch}"
+for arg in "$@"; do
+  case "$arg" in
+    --no-seed|--skip-seed) continue ;;
+  esac
+  BUMP_ARG="$arg"
+  break
+done
 
 if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "iyou_home — One-Click Sovereign Release Pipeline"
   echo ""
-  echo "Usage: $0 [patch|minor|major|<version>|current|--current|--package-only]"
+  echo "Usage: $0 [patch|minor|major|<version>|current|--current|--package-only] [--no-seed]"
   echo ""
   echo "Arguments:"
   echo "  patch     Bump patch version (default, e.g. 0.2.0 -> 0.2.1)"
@@ -118,6 +147,8 @@ if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "  --current      Alias for: current (no version bump)"
   echo "  --package-only No bump, no rebuilds; stage already-built bundles only"
   echo "                 (aliases: --skip-build, --skip-bump)"
+  echo "  --no-seed      Skip rsync to the seed box and transmission registration"
+  echo "                 (alias: --skip-seed; env: SKIP_SEED=1)"
   echo ""
   echo "Environment variables:"
   echo "  BUMP          Alternative to positional argument"
@@ -131,6 +162,9 @@ if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "  WINDOWS_STAGE_DIR  Directory scanned for a staged/downloaded Windows .exe"
   echo "  FORCE_PARTIAL_TORRENT=1 Bypass the missing-bundle prompt (partial payload ok)"
   echo "  PACKAGE_ONLY=1 No bump, no rebuilds; stage already-built bundles only"
+  echo "  SEED_HOST     Seed box ssh target (default: iyou@qnap)"
+  echo "  SEED_DIR      Remote payload root (default: releases)"
+  echo "  SKIP_SEED=1   Skip seed-box rsync + transmission registration"
   exit 0
 fi
 
@@ -575,6 +609,48 @@ EOF
 
 log "MIRRORS.txt:"
 cat "$RELEASE_DIR/MIRRORS.txt"
+
+# ---------------------------------------------------------------- seed box
+# Distribute the payload to the designated BitTorrent seeder (QNAP NAS) and
+# register the .torrent with transmission-remote so it starts verifying and
+# seeding immediately — no manual SSH step. Additive: rsync or registration
+# failures WARN and continue (GitHub publish is primary); SKIP_SEED=1 (or
+# --no-seed) opts out entirely.
+if [[ "${SKIP_SEED:-0}" != "1" ]]; then
+  SEED_SYNCED=0
+  if ! command -v rsync >/dev/null 2>&1; then
+    log "[WARN] rsync not found locally; skipping seed box sync"
+    SEED_STATUS="skipped (rsync unavailable locally)"
+  else
+    log "Syncing release payload to seed host (${SEED_HOST}:${SEED_DIR})..."
+    if rsync -avP "$RELEASE_DIR" "$SEED_HOST:$SEED_DIR/"; then
+      SEED_SYNCED=1
+      SEED_STATUS="active on ${SEED_HOST}:${SEED_DIR}/iyou_home_${VERSION}"
+      log "Payload synced to ${SEED_HOST}:${SEED_DIR}/iyou_home_${VERSION}"
+    else
+      log "[WARN] rsync to ${SEED_HOST} failed; continuing without seeding"
+      SEED_STATUS="failed (rsync to ${SEED_HOST} errored)"
+    fi
+  fi
+
+  # Register the torrent with the remote daemon. The payload directory is
+  # iyou_home_<v> but the torrent's top-level name is iyou-home_<v>, so the
+  # symlink makes transmission find the already-synced files and verify/seed
+  # instantly. Tries the canonical torrent name first, then the underscore
+  # variant for torrents that predate the current naming.
+  if [[ "$SEED_SYNCED" == "1" ]]; then
+    log "Registering torrent with transmission-remote on ${SEED_HOST}..."
+    if ssh "$SEED_HOST" "ln -sf '$SEED_DIR/iyou_home_${VERSION}' '$SEED_DIR/iyou-home_${VERSION}' && (transmission-remote -a '${SEED_DIR}/iyou_home_${VERSION}/iyou-home_${VERSION}.torrent' -w '${SEED_DIR}' || transmission-remote -a '${SEED_DIR}/iyou_home_${VERSION}/iyou_home_${VERSION}.torrent' -w '${SEED_DIR}') && transmission-remote -l" 2>&1 | tail -n 16; then
+      log "Torrent registered on ${SEED_HOST} (see daemon listing above)."
+    else
+      log "[WARN] Failed to auto-register with transmission-remote on ${SEED_HOST}"
+      SEED_STATUS="failed (transmission-remote registration errored on ${SEED_HOST})"
+    fi
+  fi
+else
+  log "Skipping seed box sync (SKIP_SEED=1)"
+  SEED_STATUS="skipped (SKIP_SEED=1)"
+fi
 
 if [[ "${SKIP_UPLOAD:-0}" == "1" ]]; then
   log "SKIP_UPLOAD=1 — staged assets only; not tagging or publishing."
