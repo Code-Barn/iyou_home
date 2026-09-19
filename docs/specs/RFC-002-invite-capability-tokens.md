@@ -4,7 +4,7 @@
 **Title:** Invite Capability Tokens for Satellite Admission
 **Author:** iyou_home engineering (fed. protocol: `omni_social`)
 **Target Release:** `v0.2.1+`
-**Status:** Draft (Living Specification — supersedes un-vetted open joining)
+**Status:** Implemented (`commit 9dfcfb3`) — Living Specification
 **License Header:** GPL-3.0-or-later — Copyright (C) 2026 David Byers dba Byers Brands
 
 ---
@@ -352,3 +352,5 @@ pub fn validate_invite(
 - **2026-09-18 (v1.0.0):** Initial RFC. Token schema, tiered quotas, invite
   graph with branch pruning, 4-phase handshake gate, kind registry
   `1600–1699`, SQLite ledger, IPC/module plan.
+- **2026-09-19 (v1.1.0):** Promoted from Draft to **Implemented** (commit
+  `9dfcfb3`) for release v0.2.2; status header updated.

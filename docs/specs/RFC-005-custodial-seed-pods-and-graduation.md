@@ -4,7 +4,7 @@
 **Title:** Custodial Seed Pods (Edge-Generated Child Seeds), Supervisory Delegation, Threshold Escrow, and Emancipation
 **Author:** iyou_home engineering (fed. protocol: `omni_social`)
 **Target Release:** `v0.2.1+`
-**Status:** Draft (Living Specification — **evolves** `OMNI-DEP-GRAD-SPEC-V1`, Option B)
+**Status:** Implemented (`commit 5df400b`) — Living Specification
 **License Header:** GPL-3.0-or-later — Copyright (C) 2026 David Byers dba Byers Brands
 
 ---
@@ -397,3 +397,5 @@ sequenceDiagram
   token (`kind:9114/9115`), 2-of-3 Shamir escrow with satellite time-lock,
   delta table vs. `OMNI-DEP-GRAD-SPEC-V1`, two-stage emancipation lifecycle
   preserving identical DID + intact graph.
+- **2026-09-19 (v1.1.0):** Promoted from Draft to **Implemented** (commit
+  `5df400b`) for release v0.2.2; status header updated.

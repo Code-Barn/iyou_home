@@ -4,7 +4,7 @@
 **Title:** Neutral Age Gate, Three-Tier Minor Framework, and Legal Boundary
 **Author:** iyou_home engineering (fed. protocol: `omni_social`)
 **Target Release:** `v0.2.1+`
-**Status:** Draft (Living Specification — supersedes self-serving "I am 13" checkbox)
+**Status:** Implemented (`commit 2dacd7a`) — Living Specification
 **License Header:** GPL-3.0-or-later — Copyright (C) 2026 David Byers dba Byers Brands
 
 ---
@@ -341,3 +341,5 @@ sequenceDiagram
 - **2026-09-18 (v1.0.0):** Initial RFC. Three-tier framework, neutral gate
   design rules + flow, age-gate record schema, legal boundary architecture
   with `disclaimer_audit.json`, compliance matrix.
+- **2026-09-19 (v1.1.0):** Promoted from Draft to **Implemented** (commit
+  `2dacd7a`) for release v0.2.2; status header updated.

@@ -4,7 +4,7 @@
 **Title:** Universal Profile Metadata for the Omni-Social Federation
 **Author:** iyou_home engineering (fed. protocol: `omni_social`)
 **Target Release:** `v0.2.1+`
-**Status:** Draft (Living Specification)
+**Status:** Implemented (`commit b07f28b`) — Living Specification
 **License Header:** GPL-3.0-or-later — Copyright (C) 2026 David Byers dba Byers Brands
 
 ---
@@ -492,3 +492,5 @@ metadata fields `null`.
   `profile_sync` wire contracts; Level 0 air-gap enforcement; persona
   partitioning and active-persona re-anchoring; satellite `UserLinkDeck`
   cache migration; acceptance criteria and test matrix.
+- **2026-09-19 (v1.1.0):** Promoted from Draft to **Implemented** (commit
+  `b07f28b`) for release v0.2.2; status header updated.

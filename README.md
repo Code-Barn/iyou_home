@@ -1,4 +1,4 @@
-# iyou_home: Sovereign Local Service Hub & Identity Enclave (v0.2.0)
+# iyou_home: Sovereign Local Service Hub & Identity Enclave (v0.2.2)
 
 `iyou_home` is a zero-custody, local-first sovereign identity enclave, Personal Data Store (PDS), and P2P service switchboard built on Tauri v2 and Rust. It secures cryptographic root seeds, derives multi-tier persona keys, orchestrates local loopback microservices, and serves cryptographic signatures to satellite applications over an authenticated local WebSocket bridge (`wss://home.iyou.me:9001`).
 
@@ -39,6 +39,11 @@
 
 ## Key Capabilities
 
+- **🚪 First-Run Gateway & Vault Lifecycle (RFC-001)**: Explicit four-state vault machine (`Uninitialized` → `Provisioning` → `Ready`, `Quarantined` on damage) with a mandatory cold-seed ceremony, deterministic seed/backup restore, and daemon dormancy — no loopback daemon binds before the vault is `Ready`.
+- **🔑 Invite Capability Tokens (RFC-002)**: L1-signed admission tokens with per-tier scopes, use budgets, expiry, and fail-closed revocation — superseding un-vetted open joining.
+- **⚖️ Neutral Age Gate & Compliance (RFC-004)**: Three-tier minor framework (`child` / `teen` / `adult`) computed from month+year only — the raw dates never leave the device — plus an append-only legal disclaimer audit log.
+- **👨‍👩‍👧 Family & Delegations Enclave (RFC-005)**: Edge-generated child seeds, supervisory capability grants (`kind:9114`), **2-of-3 Shamir threshold escrow** for disaster recovery, and two-stage sovereign graduation/emancipation.
+- **🛡️ Operator Moderation Tools (RFC-003)**: Self-hosted satellite admin panel with probe, member/ban/action listings, live connection sever, ban/unban, and tombstone purge — every action append-only audited.
 - **💬 Split-Pane OMEMO Encrypted Messaging**: Local XMPP-over-WebSocket daemon (`:5222`) paired with OMEMO Double Ratchet session management for peer-to-peer end-to-end encrypted messaging.
 - **🛡️ Project Zero Enclave & 3-Tier Persona Matrix**:
   - **Level 0 (Anchor Sanctum)**: Air-gapped immutable identity for high-assurance root custody.
@@ -93,13 +98,13 @@ npm run tauri build
 ## Verification & Test Suites
 
 ```bash
-# Execute backend Rust unit and integration test suite (90 tests)
+# Execute backend Rust unit and integration test suite (176 tests)
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # Run TypeScript typechecking & Vite production build
 npx tsc --noEmit && npm run build
 
-# Run Vitest frontend test runner (74 unit tests across 10 test files)
+# Run Vitest frontend test runner (139 unit tests)
 npx vitest run
 ```
 
@@ -121,6 +126,7 @@ All local daemons bind strictly to IPv4 loopback `127.0.0.1`. No service ever li
 ## Documentation
 
 - [AGENT.md](./AGENT.md) — Root operational contract, security invariants, and complete Tauri IPC command registry.
+- [DEVELOPER_GUIDE.md](./docs/DEVELOPER_GUIDE.md) — Internal developer guide: vault lifecycle, RFC-001…RFC-006 Tauri commands, and the Port 9001 bridge wire contracts.
 - [HOME_DEVELOPER_GUIDE.md](./docs/HOME_DEVELOPER_GUIDE.md) — Comprehensive technical reference, cryptographic derivation engine, wire protocols, and pairing specifications.
 - [RELEASE_SPEC_V2.md](./docs/RELEASE_SPEC_V2.md) — V2.0 sovereign release baseline and subsystem specifications.
 - [TODO.md](./TODO.md) — Release roadmap tracking completed Phases 1 through 10.

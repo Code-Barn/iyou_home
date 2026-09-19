@@ -4,7 +4,7 @@
 **Title:** Satellite Administrator Tooling: Bans, Invite Revocation, and Local Purge
 **Author:** iyou_home engineering (fed. protocol: `omni_social`)
 **Target Release:** `v0.2.1+`
-**Status:** Draft (Living Specification)
+**Status:** Implemented (`commit a56094f`) — Living Specification
 **License Header:** GPL-3.0-or-later — Copyright (C) 2026 David Byers dba Byers Brands
 
 ---
@@ -323,3 +323,5 @@ pub fn tombstone_and_purge(req: PurgeRequest, db: &rusqlite::Connection)
 - **2026-09-18 (v1.0.0):** Initial RFC. `admin_dids` authz, `banned_identities`
   + `moderation_actions` SQLite schemas, sever/reject/tombstone-purge
   primitives, admin panel layout, IPC surface, kind `1604`/`1605`.
+- **2026-09-19 (v1.1.0):** Promoted from Draft to **Implemented** (commit
+  `a56094f`) for release v0.2.2; status header updated.
