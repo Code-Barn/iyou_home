@@ -6,9 +6,11 @@
 # builds macOS (local) and Linux (remote dc13 runner) release bundles,
 # stages any available Windows NSIS .exe and triggers its GitHub Actions
 # compilation, gathers every platform bundle under
-# dist/releases/iyou_home_${VERSION}/, computes SHA-256 sums, wraps them in a
-# BitTorrent .torrent + magnet URI (seeded via public trackers), publishes a
-# GitHub Release for tag "v${VERSION}", and self-checks the download URLs.
+# release-artifacts/iyou_home_${VERSION}/ — deliberately OUTSIDE dist/, which
+# Vite's emptyOutDir wipes during the frontend build — computes SHA-256 sums,
+# wraps them in a BitTorrent .torrent + magnet URI (seeded via public
+# trackers), publishes a GitHub Release for tag "v${VERSION}", and self-checks
+# the download URLs.
 #
 # Usage:
 #   ./scripts/release.sh           # bump patch (default: 0.2.0 -> 0.2.1)
@@ -17,6 +19,10 @@
 #   ./scripts/release.sh major     # bump major (0.2.0 -> 1.0.0)
 #   ./scripts/release.sh 0.3.5     # explicit target version
 #   ./scripts/release.sh current   # build/publish current version without bumping
+#   ./scripts/release.sh --current # alias for current (re-run after a failed release
+#                                  # to package the already-bumped version)
+#   ./scripts/release.sh --package-only  # no bump, no rebuilds; stage existing bundles
+#                                  # (add --skip-build / --skip-bump as aliases)
 #
 # Idempotent: safe to re-run when a release tag already exists (it will
 # re-upload and clobber assets). Requires: gh CLI (authenticated), ssh dc13
@@ -33,6 +39,7 @@
 #   WINDOWS_EXE     explicit path to a Windows NSIS .exe to stage into the payload
 #   WINDOWS_STAGE_DIR directory scanned for a staged/downloaded Windows .exe
 #   FORCE_PARTIAL_TORRENT=1  skip the missing-bundle prompt (partial payload ok)
+#   PACKAGE_ONLY=1  no version bump and no rebuilds; stage existing bundles only
 #
 set -euo pipefail
 
@@ -100,14 +107,17 @@ BUMP_ARG="${1:-${BUMP:-patch}}"
 if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "iyou_home — One-Click Sovereign Release Pipeline"
   echo ""
-  echo "Usage: $0 [patch|minor|major|<version>|current]"
+  echo "Usage: $0 [patch|minor|major|<version>|current|--current|--package-only]"
   echo ""
   echo "Arguments:"
   echo "  patch     Bump patch version (default, e.g. 0.2.0 -> 0.2.1)"
   echo "  minor     Bump minor version (e.g. 0.2.0 -> 0.3.0)"
   echo "  major     Bump major version (e.g. 0.2.0 -> 1.0.0)"
   echo "  X.Y.Z     Bump to explicit SemVer version"
-  echo "  current   Build & publish current version without bumping (alias: none)"
+  echo "  current        Build & publish current version without bumping (alias: none)"
+  echo "  --current      Alias for: current (no version bump)"
+  echo "  --package-only No bump, no rebuilds; stage already-built bundles only"
+  echo "                 (aliases: --skip-build, --skip-bump)"
   echo ""
   echo "Environment variables:"
   echo "  BUMP          Alternative to positional argument"
@@ -120,6 +130,7 @@ if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "  WINDOWS_EXE=path   Stage this Windows NSIS .exe into the payload"
   echo "  WINDOWS_STAGE_DIR  Directory scanned for a staged/downloaded Windows .exe"
   echo "  FORCE_PARTIAL_TORRENT=1 Bypass the missing-bundle prompt (partial payload ok)"
+  echo "  PACKAGE_ONLY=1 No bump, no rebuilds; stage already-built bundles only"
   exit 0
 fi
 
@@ -137,17 +148,21 @@ pick_release_remote() {
 REMOTE="${RELEASE_REMOTE:-$(pick_release_remote)}"
 REPO="Code-Barn/iyou_home"
 # The versioned release payload directory is computed in pre-flight once
-# VERSION is resolved — see "release payload" below. It defaults to
-# dist/releases/iyou_home_${VERSION} (under the git-ignored dist/ tree) so
-# every platform bundle for a single tag is staged in one flat folder that
-# becomes the .torrent source root.
+# VERSION is resolved — see "release payload" below. It lives under the
+# git-ignored release-artifacts/ tree (NOT dist/, which Vite's emptyOutDir
+# wipes during every frontend build) so each tag's bundles are staged in one
+# flat versioned folder that becomes the .torrent source root.
 RELEASE_DIR=""
-mkdir -p "$ROOT/dist/releases"
+mkdir -p "$ROOT/release-artifacts"
 
 # ---------------------------------------------------------------- version bump
 case "$BUMP_ARG" in
-  current|none|0)
+  current|none|0|--current|--skip-bump)
     log "Releasing currently committed version without bumping"
+    ;;
+  --package-only|--skip-build)
+    log "Package-only mode: no version bump and no rebuilds — staging existing bundles"
+    PACKAGE_ONLY=1
     ;;
   patch|minor|major|[0-9]*)
     log "Bumping version ($BUMP_ARG)..."
@@ -202,7 +217,10 @@ log "Version: ${VERSION} (tag v${VERSION})"
 
 # Release payload directory — one flat folder holding every platform bundle
 # (dmg/deb/AppImage/rpm/exe) so the torrent can wrap the whole release.
-RELEASE_DIR="$ROOT/dist/releases/iyou_home_${VERSION}"
+# Deliberately outside dist/: the Vite build inside `npm run tauri build`
+# calls emptyOutDir on dist/, which previously wiped the staged payload
+# mid-release and caused the "No such file or directory" cp failures.
+RELEASE_DIR="$ROOT/release-artifacts/iyou_home_${VERSION}"
 mkdir -p "$RELEASE_DIR"
 log "Release payload dir: ${RELEASE_DIR}"
 
@@ -220,38 +238,64 @@ fi
 
 # ---------------------------------------------------------------- stage
 log "Staging directory: ${RELEASE_DIR}"
-rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt
+# In package-only mode keep previously staged bundles (the whole point is to
+# re-assemble a payload without rebuilding); otherwise clear stale files so a
+# re-run can never blend artifacts from two releases.
+if [[ "${PACKAGE_ONLY:-0}" != "1" ]]; then
+  rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt
+fi
 
 # ---------------------------------------------------------------- Mac build
 if [[ "${SKIP_MAC:-0}" != "1" ]]; then
-  log "Building macOS bundle (local)"
-  npm run tauri build
-  dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null || true)"
-  [[ -n "$dmg" && -f "$dmg" ]] || fail "no .dmg produced under src-tauri/target/release/bundle/dmg/"
-  cp "$dmg" "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
-  log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
+  if [[ "${PACKAGE_ONLY:-0}" == "1" ]]; then
+    log "Package-only: reusing existing macOS bundle (no rebuild)"
+    staged_dmg="$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
+    if [[ -f "$staged_dmg" ]]; then
+      log "macOS bundle already staged: ${staged_dmg##*/}"
+    else
+      dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name "iyou-home_${VERSION}_x64.dmg" -print -quit 2>/dev/null || true)"
+      [[ -n "$dmg" && -f "$dmg" ]] \
+        || fail "package-only: no existing iyou-home_${VERSION}_x64.dmg to stage (run the full build once, then re-run with --package-only)"
+      mkdir -p "$RELEASE_DIR"
+      cp "$dmg" "$staged_dmg"
+      log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
+    fi
+  else
+    log "Building macOS bundle (local)"
+    npm run tauri build
+    dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null || true)"
+    [[ -n "$dmg" && -f "$dmg" ]] || fail "no .dmg produced under src-tauri/target/release/bundle/dmg/"
+    mkdir -p "$RELEASE_DIR"
+    cp "$dmg" "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
+    log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
+  fi
 else
   log "Skipping macOS build (SKIP_MAC=1)"
 fi
 
 # ---------------------------------------------------------------- Linux build
 if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
-  log "Building Linux bundles on dc13 (streaming repository, clean build)"
+  if [[ "${PACKAGE_ONLY:-0}" == "1" ]]; then
+    log "Package-only: skipping dc13 Linux build; keeping any previously staged .deb/.AppImage"
+  else
+    log "Building Linux bundles on dc13 (streaming repository, clean build)"
 
-  tar_flags=(--exclude='.git' --exclude='node_modules' --exclude='src-tauri/target' --exclude='dist')
-  if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
-    tar_flags+=(--no-xattrs)   # macOS bsdtar would otherwise stall on xattr metadata
+    tar_flags=(--exclude='.git' --exclude='node_modules' --exclude='src-tauri/target' --exclude='dist')
+    if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
+      tar_flags+=(--no-xattrs)   # macOS bsdtar would otherwise stall on xattr metadata
+    fi
+
+    remote_cmd='set -euo pipefail; export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"; rm -rf ~/build-runner; mkdir -p ~/build-runner; tar -xzf - -C ~/build-runner; cd ~/build-runner; npm ci; npm run tauri build; ls -1 src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage'
+
+    tar "${tar_flags[@]}" -czf - -C "$ROOT" . | ssh -o BatchMode=yes dc13 "$remote_cmd"
+
+    mkdir -p "$RELEASE_DIR"
+    scp "dc13:~/build-runner/src-tauri/target/release/bundle/deb/"*.deb "$RELEASE_DIR/"
+    scp "dc13:~/build-runner/src-tauri/target/release/bundle/appimage/"*.AppImage "$RELEASE_DIR/"
+    scp "dc13:~/build-runner/src-tauri/target/release/bundle/rpm/"*.rpm "$RELEASE_DIR/" 2>/dev/null || true
+
+    log "Linux bundles staged: .deb, .AppImage (+ .rpm)"
   fi
-
-  remote_cmd='set -euo pipefail; export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"; rm -rf ~/build-runner; mkdir -p ~/build-runner; tar -xzf - -C ~/build-runner; cd ~/build-runner; npm ci; npm run tauri build; ls -1 src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage'
-
-  tar "${tar_flags[@]}" -czf - -C "$ROOT" . | ssh -o BatchMode=yes dc13 "$remote_cmd"
-
-  scp "dc13:~/build-runner/src-tauri/target/release/bundle/deb/"*.deb "$RELEASE_DIR/"
-  scp "dc13:~/build-runner/src-tauri/target/release/bundle/appimage/"*.AppImage "$RELEASE_DIR/"
-  scp "dc13:~/build-runner/src-tauri/target/release/bundle/rpm/"*.rpm "$RELEASE_DIR/" 2>/dev/null || true
-
-  log "Linux bundles staged: .deb, .AppImage (+ .rpm)"
 else
   log "Skipping dc13 Linux build (SKIP_LINUX=1)"
 fi
@@ -266,6 +310,7 @@ if [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
   log "Staging Windows NSIS installer (.exe)"
   staged_exe="$(find_windows_exe || true)"
   if [[ -n "$staged_exe" ]]; then
+    mkdir -p "$RELEASE_DIR"
     cp "$staged_exe" "$RELEASE_DIR/iyou-home_${VERSION}_x64-setup.exe"
     log "Windows installer staged: iyou-home_${VERSION}_x64-setup.exe (from ${staged_exe})"
   else
