@@ -44,6 +44,8 @@
 #   SEED_HOST       ssh target of the BitTorrent seed box (default: iyou@qnap)
 #   SEED_DIR        remote directory holding release payloads (default: releases)
 #   SKIP_SEED=1     skip rsync to the seed box and transmission-remote registration
+#   REMOTE_TRANSMISSION_REMOTE=name|path  remote transmission-remote binary
+#                   (default: transmission-remote; Entware /opt/bin fallback)
 #
 set -euo pipefail
 
@@ -115,6 +117,12 @@ SEED_HOST="${SEED_HOST:-iyou@qnap}"   # ssh target running the BitTorrent seeder
 SEED_DIR="${SEED_DIR:-releases}"      # remote payload root (relative to $SEED_HOST $HOME)
 SKIP_SEED="${SKIP_SEED:-0}"           # =1 to skip rsync to the seed box + registration
 
+# Remote transmission-remote binary name (or absolute path). QNAP QTS /
+# Entware installs it under /opt/bin, which non-interactive SSH drops from
+# $PATH — the remote wrapper prepends /opt/bin + /usr/local/bin and falls back
+# to /opt/bin/transmission-remote directly.
+REMOTE_TRANSMISSION_REMOTE="${REMOTE_TRANSMISSION_REMOTE:-transmission-remote}"
+
 # Parse auxiliary flags (may appear in any argv position).
 for arg in "$@"; do
   case "$arg" in
@@ -165,6 +173,9 @@ if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "  SEED_HOST     Seed box ssh target (default: iyou@qnap)"
   echo "  SEED_DIR      Remote payload root (default: releases)"
   echo "  SKIP_SEED=1   Skip seed-box rsync + transmission registration"
+  echo "  REMOTE_TRANSMISSION_REMOTE  Remote transmission-remote binary name or"
+  echo "                 absolute path (default: transmission-remote; /opt/bin"
+  echo "                 Entware path used as automatic fallback)"
   exit 0
 fi
 
@@ -638,9 +649,27 @@ if [[ "${SKIP_SEED:-0}" != "1" ]]; then
   # symlink makes transmission find the already-synced files and verify/seed
   # instantly. Tries the canonical torrent name first, then the underscore
   # variant for torrents that predate the current naming.
+  #
+  # QNAP QTS / Entware installs transmission-remote under /opt/bin, which is
+  # missing from the non-interactive SSH $PATH. The remote wrapper therefore
+  # prepends /opt/bin + /usr/local/bin, resolves TR_BIN via command -v, and
+  # falls back to /opt/bin/transmission-remote directly. If TR_BIN is still
+  # not executable the remote exits non-zero with a clear error, which trips
+  # the WARN path below — never a silent partial registration.
   if [[ "$SEED_SYNCED" == "1" ]]; then
     log "Registering torrent with transmission-remote on ${SEED_HOST}..."
-    if ssh "$SEED_HOST" "ln -sf '$SEED_DIR/iyou_home_${VERSION}' '$SEED_DIR/iyou-home_${VERSION}' && (transmission-remote -a '${SEED_DIR}/iyou_home_${VERSION}/iyou-home_${VERSION}.torrent' -w '${SEED_DIR}' || transmission-remote -a '${SEED_DIR}/iyou_home_${VERSION}/iyou_home_${VERSION}.torrent' -w '${SEED_DIR}') && transmission-remote -l" 2>&1 | tail -n 16; then
+    if ssh "$SEED_HOST" "
+      export PATH=\"/opt/bin:/usr/local/bin:\$PATH\"
+      TR_BIN=\$(command -v '${REMOTE_TRANSMISSION_REMOTE:-transmission-remote}' || echo '/opt/bin/transmission-remote')
+      if [ ! -x \"\$TR_BIN\" ]; then
+        echo \"[ERROR] transmission-remote not found on ${SEED_HOST}: \$TR_BIN is not executable\" >&2
+        exit 1
+      fi
+      ln -sf '$SEED_DIR/iyou_home_${VERSION}' '$SEED_DIR/iyou-home_${VERSION}' &&
+      ( \"\$TR_BIN\" -a '$SEED_DIR/iyou_home_${VERSION}/iyou-home_${VERSION}.torrent' -w '$SEED_DIR' ||
+        \"\$TR_BIN\" -a '$SEED_DIR/iyou_home_${VERSION}/iyou_home_${VERSION}.torrent' -w '$SEED_DIR' ) &&
+      \"\$TR_BIN\" -l
+    " 2>&1 | tail -n 16; then
       log "Torrent registered on ${SEED_HOST} (see daemon listing above)."
     else
       log "[WARN] Failed to auto-register with transmission-remote on ${SEED_HOST}"
