@@ -167,6 +167,13 @@ impl Default for UserPreferences {
 
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
+    /// Multi-client fan-out registry for `profile_sync` broadcasts (RFC-006
+    /// §6.3). Every active Port 9001 connection registers its response sender
+    /// here under a monotonic connection id; broadcasts are best-effort to
+    /// each live satellite tab, and dead entries are pruned on send failure.
+    pub broadcast_clients: Mutex<Vec<(u64, mpsc::UnboundedSender<Message>)>>,
+    /// Monotonic connection id allocator backing `broadcast_clients`.
+    pub next_conn_id: std::sync::atomic::AtomicU64,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
     pub pending_messages: Mutex<Vec<String>>,
     pub popup_active: Mutex<bool>,
@@ -232,6 +239,8 @@ impl Default for WsState {
     fn default() -> Self {
         Self {
             response_sender: Mutex::new(None),
+            broadcast_clients: Mutex::new(Vec::new()),
+            next_conn_id: std::sync::atomic::AtomicU64::new(0),
             challenge_channel: Mutex::new(None),
             pending_messages: Mutex::new(Vec::new()),
             popup_active: Mutex::new(false),
@@ -743,6 +752,14 @@ fn set_active_profile(
     // Emit event to all windows
     let _ = app.emit("profile://changed", &active_persona);
 
+    // RFC-006 §9: re-anchor open satellite sessions to the newly active
+    // persona by broadcasting `profile_sync` across Port 9001.
+    let sync_payload = serde_json::json!({
+        "type": "profile_sync",
+        "profile": vault::PublicProfileProjection::from(&active_persona)
+    });
+    crate::bridge::broadcast_profile_sync(&app, &sync_payload);
+
     Ok(active_persona)
 }
 
@@ -753,6 +770,53 @@ fn activate_persona(
     profile_id: String,
 ) -> Result<vault::Profile, String> {
     set_active_profile(app, state, profile_id)
+}
+
+/// RFC-006 universal profile metadata update, accessible from the iyou_home
+/// frontend directly. Missing/empty/`"primary"` `profile_id` resolves to the
+/// active Level 1 Public Persona; any other id must resolve in the vault. The
+/// atomic vault write is guarded by the Level 0 Air-Gap Invariant
+/// (`ERR_AIR_GAP_VIOLATION`), and the updated public projection is broadcast
+/// to every Port 9001 satellite client as a `profile_sync` frame.
+#[tauri::command]
+fn set_profile_metadata(
+    app: AppHandle,
+    profile_id: Option<String>,
+    handle: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    banner_url: Option<String>,
+    bio: Option<String>,
+) -> Result<vault::Profile, String> {
+    // Enclave lock gate: metadata mutation is a scoped write — fail closed.
+    if crate::enclave_is_locked(&app) {
+        return Err(crate::enclave_locked_error().to_string());
+    }
+
+    let mut vault = vault::load_vault(&app)?;
+    let target = vault::resolve_metadata_target(&vault, profile_id.as_deref().unwrap_or(""))?;
+    let target_id = target.profile_id.clone();
+
+    let updated = vault::update_profile_metadata(
+        &mut vault,
+        &target_id,
+        handle,
+        display_name,
+        avatar_url,
+        banner_url,
+        bio,
+    )?;
+    vault::save_vault(&app, &vault)?;
+
+    // Fan the updated profile out to every connected satellite.
+    let sync_payload = serde_json::json!({
+        "type": "profile_sync",
+        "profile": vault::PublicProfileProjection::from(&updated)
+    });
+    crate::bridge::broadcast_profile_sync(&app, &sync_payload);
+    let _ = app.emit("profile://changed", &updated);
+
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -3860,6 +3924,7 @@ pub fn run() {
             add_profile,
             set_active_profile,
             activate_persona,
+            set_profile_metadata,
             remove_profile,
             sign_auth_challenge,
             get_public_did_document,

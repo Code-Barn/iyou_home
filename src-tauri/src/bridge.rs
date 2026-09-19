@@ -119,6 +119,19 @@ fn pipe_or_queue(app: &AppHandle, msg_json: serde_json::Value) {
     }
 }
 
+/// Best-effort fan-out of a `profile_sync` frame to every active Port 9001
+/// client (every open satellite tab), per RFC-006 §6.3. The requester is one
+/// of the registered clients, so this also serves as its echo/ack. Dead
+/// connections are pruned on send failure.
+pub(crate) fn broadcast_profile_sync(app: &AppHandle, payload: &serde_json::Value) {
+    let state = app.state::<WsState>();
+    let serialized = payload.to_string();
+    let mut clients = state.broadcast_clients.lock().unwrap();
+    clients.retain(|(_conn_id, sender)| {
+        sender.send(Message::Text(serialized.clone().into())).is_ok()
+    });
+}
+
 /// Fail-closed access evaluation for external bridge frames. Returns the
 /// denial reason when the request must not proceed. A vault that cannot be
 /// loaded blocks ALL signing traffic — never fail open.
@@ -211,9 +224,23 @@ where
 
     let (response_tx, response_rx) = mpsc::unbounded_channel::<Message>();
 
+    let conn_id;
     {
         let ws_state = app_handle.state::<WsState>();
         *ws_state.response_sender.lock().unwrap() = Some(response_tx.clone());
+
+        // Register this connection in the `profile_sync` broadcast fan-out
+        // registry (RFC-006 §6.3). Every open satellite tab joins here; the
+        // monotonic id lets the forwarder task prune exactly this entry on
+        // teardown without requiring channel equality.
+        conn_id = ws_state
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ws_state
+            .broadcast_clients
+            .lock()
+            .unwrap()
+            .push((conn_id, response_tx.clone()));
     }
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -257,6 +284,11 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let ws_state = app_clone.state::<WsState>();
         *ws_state.response_sender.lock().unwrap() = None;
+        ws_state
+            .broadcast_clients
+            .lock()
+            .unwrap()
+            .retain(|(candidate, _)| *candidate != conn_id);
         println!("DEBUG: Forwarder Task Exited — response_sender cleared");
     });
 
@@ -285,11 +317,12 @@ where
                         Ok(vault) => {
                             // Un-scoped sync only ever exposes the public
                             // persona (Level 1). The Level 0 anchor is
-                            // air-gapped from external bridge callers.
+                            // air-gapped from external bridge callers, and the
+                            // projection strips credentials + imported keys.
                             let response = match vault.public_persona() {
                                 Some(profile) => serde_json::json!({
                                     "type": "profile_sync",
-                                    "profile": profile
+                                    "profile": crate::vault::PublicProfileProjection::from(profile)
                                 }),
                                 None => serde_json::json!({
                                     "type": "error",
@@ -305,6 +338,145 @@ where
                                     "type": "error",
                                     "message": format!("Failed to load vault: {}", e)
                                 }).to_string().into()
+                            ));
+                        }
+                    }
+                    continue;
+                } else if json["type"] == "set_profile_metadata"
+                    || json["type"] == "SET_PROFILE_METADATA"
+                {
+                    println!("DEBUG: SET_PROFILE_METADATA received");
+                    let profile_id = json
+                        .get("profile_id")
+                        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let handle = json
+                        .get("handle")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let display_name = json
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let avatar_url = json
+                        .get("avatar_url")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let banner_url = json
+                        .get("banner_url")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let bio = json
+                        .get("bio")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+
+                    // Enclave lock gate: metadata mutation is a scoped write —
+                    // fail closed while the app-lock screen is active.
+                    if crate::enclave_is_locked(&app_handle) {
+                        println!("DEBUG: Rejected SET_PROFILE_METADATA — enclave locked");
+                        crate::focus_main_window(&app_handle);
+                        let _ = response_tx.send(Message::Text(
+                            crate::enclave_locked_error().to_string().into(),
+                        ));
+                        continue;
+                    }
+
+                    match crate::vault::load_vault(&app_handle) {
+                        Ok(mut vault) => {
+                            // Missing/empty/"primary" → active L1 Public
+                            // Persona; explicit ids must resolve.
+                            let target =
+                                match crate::vault::resolve_metadata_target(&vault, &profile_id) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        let _ = response_tx.send(Message::Text(
+                                            serde_json::json!({
+                                                "type": "error",
+                                                "code": "ERR_PROFILE_NOT_FOUND",
+                                                "message": e
+                                            })
+                                            .to_string()
+                                            .into(),
+                                        ));
+                                        continue;
+                                    }
+                                };
+                            let target_id = target.profile_id.clone();
+
+                            let updated = match crate::vault::update_profile_metadata(
+                                &mut vault,
+                                &target_id,
+                                handle,
+                                display_name,
+                                avatar_url,
+                                banner_url,
+                                bio,
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    // Fail-closed policy errors (air-gap,
+                                    // invalid handle) never mutate the vault.
+                                    let code = if e.contains("ERR_AIR_GAP_VIOLATION") {
+                                        "ERR_AIR_GAP_VIOLATION"
+                                    } else if e.contains("ERR_INVALID_HANDLE") {
+                                        "ERR_INVALID_HANDLE"
+                                    } else {
+                                        "ERR_INVALID_FRAME"
+                                    };
+                                    let _ = response_tx.send(Message::Text(
+                                        serde_json::json!({
+                                            "type": "error",
+                                            "code": code,
+                                            "message": e
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ));
+                                    continue;
+                                }
+                            };
+
+                            // Atomic persistence: staging file + rename. The
+                            // vault is only written after every validation
+                            // gate above has passed.
+                            if let Err(e) = crate::vault::save_vault(&app_handle, &vault) {
+                                eprintln!(
+                                    "DEBUG: SET_PROFILE_METADATA failed to persist vault: {}",
+                                    e
+                                );
+                                let _ = response_tx.send(Message::Text(
+                                    serde_json::json!({
+                                        "type": "error",
+                                        "message": format!("Failed to persist vault: {}", e)
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ));
+                                continue;
+                            }
+
+                            // Broadcast to every satellite (requester included,
+                            // which doubles as the echo/ack per RFC-006 §6.1)
+                            // and surface the change to the iyou_home UI.
+                            let sync_payload = serde_json::json!({
+                                "type": "profile_sync",
+                                "profile": crate::vault::PublicProfileProjection::from(&updated)
+                            });
+                            broadcast_profile_sync(&app_handle, &sync_payload);
+                            let _ = app_handle.emit("profile://changed", &updated);
+                        }
+                        Err(e) => {
+                            eprintln!("DEBUG: SET_PROFILE_METADATA failed to load vault: {}", e);
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("Failed to load vault: {}", e)
+                                })
+                                .to_string()
+                                .into(),
                             ));
                         }
                     }
@@ -481,21 +653,15 @@ where
                     let _ = crate::save_preferences(&app_handle, &prefs);
                     let _ = app_handle.emit("profile://changed", &active_profile);
 
-                    let _ = response_tx.send(Message::Text(
-                        serde_json::json!({
-                            "type": "profile_sync",
-                            "profile": {
-                                "profile_id": active_profile.profile_id,
-                                "profile_name": active_profile.profile_name,
-                                "derivation_index": active_profile.derivation_index,
-                                "did": active_profile.did,
-                                "nostr_pubkey_hex": active_profile.nostr_pubkey_hex,
-                                "level": active_profile.level,
-                                "is_system_reserved": active_profile.is_system_reserved,
-                                "active": true
-                            }
-                        }).to_string().into(),
-                    ));
+                    // Re-anchor open satellite sessions (RFC-006 §9): fan the
+                    // newly active persona out to every Port 9001 client,
+                    // including the requester (echo/ack). The projection
+                    // carries RFC-006 metadata fields and never private keys.
+                    let sync_payload = serde_json::json!({
+                        "type": "profile_sync",
+                        "profile": crate::vault::PublicProfileProjection::from(&active_profile)
+                    });
+                    broadcast_profile_sync(&app_handle, &sync_payload);
                     continue;
                 }
 
@@ -1093,6 +1259,12 @@ mod tests {
             active,
             imported_seed_b58: None,
             imported_nostr_sk_hex: None,
+            handle: None,
+            display_name: None,
+            avatar_url: None,
+            banner_url: None,
+            bio: None,
+            nip05: None,
         }
     }
 

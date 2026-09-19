@@ -65,6 +65,23 @@ pub struct Profile {
     /// Optional companion nostr secret key (hex) for graduated sovereign personas
     #[serde(default)]
     pub imported_nostr_sk_hex: Option<String>,
+
+    // RFC-006 Universal Identity Metadata. Serde-defaulted and omitted-when-None
+    // so legacy vaults (pre-RFC-006) load cleanly and reserialize identically.
+    // Metadata NEVER participates in key derivation: DIDs, pubkeys, and
+    // derivation indices are unchanged by these writes (RFC-006 §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>, // canonical handle, e.g. "dcbyers13" (no leading @)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>, // e.g. "Dan Byers"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>, // content-addressed Blossom URL or HTTPS
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nip05: Option<String>, // canonical "handle@iyou.me" — always derived, never client-supplied
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +167,57 @@ pub struct BusinessProfile {
 impl Profile {
     pub fn is_anchor(&self) -> bool {
         self.level == 0 || self.derivation_index == 0
+    }
+}
+
+/// Wire-safe public projection of a `Profile` for bridge `profile_sync` /
+/// `get_profile` frames (RFC-006 §6.3). Deliberately excludes `credentials`
+/// (raw W3C payloads) and the imported private-key leaves
+/// (`imported_seed_b58`, `imported_nostr_sk_hex`) so no secret material can
+/// ever cross the Port 9001 signature bridge. Unset metadata fields serialize
+/// as omitted (`skip_serializing_if`), which satellites treat as "unset".
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicProfileProjection {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub derivation_index: u32,
+    pub did: String,
+    pub nostr_pubkey_hex: String,
+    pub level: u8,
+    pub is_system_reserved: bool,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banner_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nip05: Option<String>,
+}
+
+impl From<&Profile> for PublicProfileProjection {
+    fn from(p: &Profile) -> Self {
+        PublicProfileProjection {
+            profile_id: p.profile_id.clone(),
+            profile_name: p.profile_name.clone(),
+            derivation_index: p.derivation_index,
+            did: p.did.clone(),
+            nostr_pubkey_hex: p.nostr_pubkey_hex.clone(),
+            level: p.level,
+            is_system_reserved: p.is_system_reserved,
+            active: p.active,
+            handle: p.handle.clone(),
+            display_name: p.display_name.clone(),
+            avatar_url: p.avatar_url.clone(),
+            banner_url: p.banner_url.clone(),
+            bio: p.bio.clone(),
+            nip05: p.nip05.clone(),
+        }
     }
 }
 
@@ -948,6 +1016,12 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             active: false,
             imported_seed_b58: None,
             imported_nostr_sk_hex: None,
+            handle: None,
+            display_name: None,
+            avatar_url: None,
+            banner_url: None,
+            bio: None,
+            nip05: None,
         },
         Profile {
             profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
@@ -961,6 +1035,12 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             active: true,
             imported_seed_b58: None,
             imported_nostr_sk_hex: None,
+            handle: None,
+            display_name: None,
+            avatar_url: None,
+            banner_url: None,
+            bio: None,
+            nip05: None,
         },
     ]
 }
@@ -1214,6 +1294,12 @@ pub fn heal_reserved_profiles(vault: &mut VaultStore) -> Result<bool, String> {
             active: true,
             imported_seed_b58: None,
             imported_nostr_sk_hex: None,
+            handle: None,
+            display_name: None,
+            avatar_url: None,
+            banner_url: None,
+            bio: None,
+            nip05: None,
         });
         changed = true;
     }
@@ -1363,6 +1449,12 @@ pub fn add_profile(
         active: false,
         imported_seed_b58: None,
         imported_nostr_sk_hex: None,
+        handle: None,
+        display_name: None,
+        avatar_url: None,
+        banner_url: None,
+        bio: None,
+        nip05: None,
     };
 
     vault.profiles.push(profile.clone());
@@ -1427,6 +1519,117 @@ pub fn activate_persona(vault: &mut VaultStore, profile_id: &str) -> Result<Prof
         .ok_or_else(|| format!("Profile not found: '{}'", profile_id))
 }
 
+// ---------- RFC-006 Universal Profile Metadata ----------
+
+/// Canonical handle pattern: alphanumeric (ASCII), `-`, `_`, 3–30 chars
+/// (RFC-006 §6.1 normalization). No external regex dependency — the pattern is
+/// small enough to evaluate character-wise.
+pub fn is_valid_handle_shape(handle: &str) -> bool {
+    (3..=30).contains(&handle.len())
+        && handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Normalize a raw handle: trim ASCII whitespace and strip a single leading
+/// `@`. Returns `ERR_INVALID_HANDLE` when the result violates the canonical
+/// pattern `^[a-zA-Z0-9_-]{3,30}$`.
+pub fn normalize_profile_handle(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let stripped = if let Some(rest) = trimmed.strip_prefix('@') {
+        rest.trim()
+    } else {
+        trimmed
+    };
+    if !is_valid_handle_shape(stripped) {
+        return Err(
+            "ERR_INVALID_HANDLE: handle must match ^[a-zA-Z0-9_-]{3,30}$ (3-30 chars)".to_string(),
+        );
+    }
+    Ok(stripped.to_string())
+}
+
+/// Resolve the profile targeted by an RFC-006 metadata write.
+///
+/// Missing / empty `profile_id` resolves to the active Level 1 Public Persona
+/// (mirrors `get_profile_keypair("")`); the literal `"primary"` id always
+/// targets the canonical Level 1 Primary Identity directly; any other
+/// non-empty id must resolve in the vault or `ERR_PROFILE_NOT_FOUND`.
+pub fn resolve_metadata_target(vault: &VaultStore, profile_id: &str) -> Result<Profile, String> {
+    let pid = profile_id.trim();
+    if pid.is_empty() {
+        return get_active_profile(vault)
+            .map_err(|e| format!("ERR_PROFILE_NOT_FOUND: {}", e));
+    }
+    if pid == DEFAULT_PERSONA_PROFILE_ID {
+        return vault
+            .get_profile_by_id(DEFAULT_PERSONA_PROFILE_ID)
+            .cloned()
+            .ok_or_else(|| format!("ERR_PROFILE_NOT_FOUND: profile '{}'", pid));
+    }
+    vault
+        .get_profile_by_id(pid)
+        .cloned()
+        .ok_or_else(|| format!("ERR_PROFILE_NOT_FOUND: profile '{}'", pid))
+}
+
+/// Update RFC-006 universal profile metadata (handle, display name, avatar,
+/// banner, bio) on a scoped persona and persist `vault.json` atomically.
+///
+/// Fail-closed Level 0 Air-Gap Invariant: the Anchor
+/// (`derivation_index == 0 || level == 0 || is_system_reserved`) can never
+/// receive public handles, avatars, or NIP-05 identifiers.
+///
+/// Normalization: leading `@` is stripped and whitespace trimmed; on a valid
+/// `handle` the canonical `nip05 = "handle@iyou.me"` is derived (never
+/// client-supplied). Partial-update semantics: every `None` input leaves the
+/// existing field untouched, so a display-name-only write preserves the
+/// existing handle/avatar/banner/bio/nip05 (RFC-006 AC-3).
+pub fn update_profile_metadata(
+    vault: &mut VaultStore,
+    profile_id: &str,
+    handle: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    banner_url: Option<String>,
+    bio: Option<String>,
+) -> Result<Profile, String> {
+    let target = vault
+        .profiles
+        .iter_mut()
+        .find(|p| p.profile_id == profile_id)
+        .ok_or_else(|| format!("ERR_PROFILE_NOT_FOUND: profile '{}'", profile_id))?;
+
+    // Level 0 Air-Gap Invariant — fail closed before any mutation.
+    if target.derivation_index == 0 || target.level == 0 || target.is_system_reserved {
+        return Err(
+            "ERR_AIR_GAP_VIOLATION: Level 0 identity is air-gapped from public profile metadata"
+                .to_string(),
+        );
+    }
+
+    if let Some(handle) = handle {
+        let normalized = normalize_profile_handle(&handle)?;
+        target.handle = Some(normalized.clone());
+        // NIP-05 is always derived, never client-supplied (RFC-006 §6.1).
+        target.nip05 = Some(format!("{}@iyou.me", normalized));
+    }
+    if let Some(display_name) = display_name {
+        target.display_name = Some(display_name.trim().to_string());
+    }
+    if let Some(avatar_url) = avatar_url {
+        target.avatar_url = Some(avatar_url.trim().to_string());
+    }
+    if let Some(banner_url) = banner_url {
+        target.banner_url = Some(banner_url.trim().to_string());
+    }
+    if let Some(bio) = bio {
+        target.bio = Some(bio.trim().to_string());
+    }
+
+    Ok(target.clone())
+}
+
 /// Break-Glass Emergency Rotation: burn the active Level 1 Public Persona
 /// and mint a fresh one at the next available derivation index. The Level 0
 /// Anchor and all other profiles remain untouched.
@@ -1477,6 +1680,12 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
         active: true,
         imported_seed_b58: None,
         imported_nostr_sk_hex: None,
+        handle: None,
+        display_name: None,
+        avatar_url: None,
+        banner_url: None,
+        bio: None,
+        nip05: None,
     };
 
     vault.profiles.push(new_persona.clone());
@@ -1545,6 +1754,12 @@ pub fn import_graduated_dependent(
         active: false,
         imported_seed_b58: None,
         imported_nostr_sk_hex: None,
+        handle: None,
+        display_name: None,
+        avatar_url: None,
+        banner_url: None,
+        bio: None,
+        nip05: None,
     };
 
     // 3. Ingest leaf keypair directly into L1 Primary slot, preserving DID/pubkey continuity
@@ -1564,6 +1779,12 @@ pub fn import_graduated_dependent(
         active: true,
         imported_seed_b58: Some(bundle.ed25519_private_key_b58.clone()),
         imported_nostr_sk_hex: Some(bundle.nostr_private_key_hex.clone()),
+        handle: None,
+        display_name: None,
+        avatar_url: None,
+        banner_url: None,
+        bio: None,
+        nip05: None,
     };
 
     let sovereign_record = SovereignIdentity {
@@ -2827,6 +3048,12 @@ mod tests {
                 active: false,
                 imported_seed_b58: None,
                 imported_nostr_sk_hex: None,
+                handle: None,
+                display_name: None,
+                avatar_url: None,
+                banner_url: None,
+                bio: None,
+                nip05: None,
             }],
             sovereign_identities: Vec::new(),
             dependents: Vec::new(),
@@ -3908,6 +4135,12 @@ mod tests {
                 active: true,
                 imported_seed_b58: None,
                 imported_nostr_sk_hex: None,
+                handle: None,
+                display_name: None,
+                avatar_url: None,
+                banner_url: None,
+                bio: None,
+                nip05: None,
             }],
             sovereign_identities: vec![],
             dependents: vec![],
@@ -4512,5 +4745,347 @@ mod tests {
         let _ = fs::remove_file(&path4);
         assert!(bootstrap_vault_from_seed_at_path(&path4, "garbage input").is_err());
         assert!(!path4.exists());
+    }
+
+    // ---------- RFC-006 Universal Profile Metadata ----------
+
+    /// Build a test vault with the reserved anchor/primary pair plus an L2
+    /// burner, using deterministic seeds (no filesystem access).
+    fn rfc006_test_vault() -> VaultStore {
+        let mut vault = VaultStore {
+            root_seed_base58: bs58::encode(vec![0x60u8; 32]).into_string(),
+            profiles: initial_profiles(&[0x60u8; 32]),
+            sovereign_identities: Vec::new(),
+            dependents: Vec::new(),
+            roles: Vec::new(),
+            businesses: Vec::new(),
+            child_pods: Vec::new(),
+        };
+        vault.profiles.push(Profile {
+            profile_id: "burner_ab".to_string(),
+            profile_name: "Burner AB".to_string(),
+            derivation_index: 2,
+            did: "did:key:z6MkBurnerAb".to_string(),
+            credentials: vec![],
+            nostr_pubkey_hex: "cd".repeat(32),
+            level: 2,
+            is_system_reserved: false,
+            active: false,
+            imported_seed_b58: None,
+            imported_nostr_sk_hex: None,
+            handle: None,
+            display_name: None,
+            avatar_url: None,
+            banner_url: None,
+            bio: None,
+            nip05: None,
+        });
+        vault
+    }
+
+    #[test]
+    fn rfc006_rejects_level0_metadata_write() {
+        let mut vault = rfc006_test_vault();
+        let err = update_profile_metadata(
+            &mut vault,
+            ANCHOR_PROFILE_ID,
+            Some("dcbyers13".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("ERR_AIR_GAP_VIOLATION"),
+            "anchor write must fail closed, got: {}",
+            err
+        );
+        // AC-1: writes nothing — the anchor profile is untouched.
+        let anchor = vault.get_profile_by_id(ANCHOR_PROFILE_ID).unwrap();
+        assert_eq!(anchor.handle, None);
+        assert_eq!(anchor.nip05, None);
+        // Same guard triggers via derivation_index / level checks too.
+        let err2 = update_profile_metadata(
+            &mut vault,
+            ANCHOR_PROFILE_ID,
+            None,
+            Some("Ghost".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err2.contains("ERR_AIR_GAP_VIOLATION"));
+    }
+
+    #[test]
+    fn rfc006_updates_l1_normalizes_handle_and_derives_nip05() {
+        let mut vault = rfc006_test_vault();
+        let updated = update_profile_metadata(
+            &mut vault,
+            DEFAULT_PERSONA_PROFILE_ID,
+            Some("@dcbyers13".to_string()),
+            Some("  Dan Byers  ".to_string()),
+            Some("http://127.0.0.1:9002/av.jpg".to_string()),
+            None,
+            Some("Independent systems researcher.".to_string()),
+        )
+        .expect("L1 metadata write succeeds");
+        // AC-5/AC-6: leading @ stripped, whitespace trimmed, nip05 derived.
+        assert_eq!(updated.handle.as_deref(), Some("dcbyers13"));
+        assert_eq!(updated.display_name.as_deref(), Some("Dan Byers"));
+        assert_eq!(updated.nip05.as_deref(), Some("dcbyers13@iyou.me"));
+        assert_eq!(
+            updated.avatar_url.as_deref(),
+            Some("http://127.0.0.1:9002/av.jpg")
+        );
+        assert_eq!(updated.bio.as_deref(), Some("Independent systems researcher."));
+        assert_eq!(updated.banner_url, None);
+        // The vault copy carries the same deltas; L0 anchor untouched.
+        let primary = vault.get_profile_by_id(DEFAULT_PERSONA_PROFILE_ID).unwrap();
+        assert_eq!(primary.handle.as_deref(), Some("dcbyers13"));
+        assert_eq!(primary.nip05.as_deref(), Some("dcbyers13@iyou.me"));
+        assert_eq!(vault.get_profile_by_id(ANCHOR_PROFILE_ID).unwrap().handle, None);
+        // DID / key material is immutable under metadata writes (RFC-006 §5).
+        assert_eq!(vault.get_profile_by_id(DEFAULT_PERSONA_PROFILE_ID).unwrap().did, updated.did);
+    }
+
+    #[test]
+    fn rfc006_partial_update_preserves_existing_fields() {
+        let mut vault = rfc006_test_vault();
+        // Prime the profile with a full metadata set.
+        update_profile_metadata(
+            &mut vault,
+            DEFAULT_PERSONA_PROFILE_ID,
+            Some("dcbyers13".to_string()),
+            Some("Dan Byers".to_string()),
+            Some("http://127.0.0.1:9002/av.jpg".to_string()),
+            Some("https://cdn.iyou.me/banners/b.png".to_string()),
+            Some("bio one".to_string()),
+        )
+        .expect("prime succeeds");
+
+        // AC-3: display_name-only write leaves the other fields untouched.
+        let updated = update_profile_metadata(
+            &mut vault,
+            DEFAULT_PERSONA_PROFILE_ID,
+            None,
+            Some("Daniel B.".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("partial update succeeds");
+        assert_eq!(updated.display_name.as_deref(), Some("Daniel B."));
+        assert_eq!(updated.handle.as_deref(), Some("dcbyers13"));
+        assert_eq!(updated.avatar_url.as_deref(), Some("http://127.0.0.1:9002/av.jpg"));
+        assert_eq!(updated.banner_url.as_deref(), Some("https://cdn.iyou.me/banners/b.png"));
+        assert_eq!(updated.bio.as_deref(), Some("bio one"));
+        assert_eq!(updated.nip05.as_deref(), Some("dcbyers13@iyou.me"));
+    }
+
+    #[test]
+    fn rfc006_resolve_metadata_target_defaults() {
+        let vault = rfc006_test_vault();
+        // Empty id routes to the active persona (L1 primary in the steady state).
+        let resolved_empty = resolve_metadata_target(&vault, "").expect("empty resolves");
+        assert_eq!(resolved_empty.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        // Literal "primary" always targets the L1 Primary identity.
+        let resolved_primary = resolve_metadata_target(&vault, "primary").expect("primary resolves");
+        assert_eq!(resolved_primary.profile_id, DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(resolved_primary.derivation_index, 1);
+        // Explicit ids resolve; unknown ids fail with ERR_PROFILE_NOT_FOUND.
+        let resolved_burner = resolve_metadata_target(&vault, "burner_ab").expect("burner resolves");
+        assert_eq!(resolved_burner.profile_id, "burner_ab");
+        let err = resolve_metadata_target(&vault, "nope").unwrap_err();
+        assert!(err.contains("ERR_PROFILE_NOT_FOUND"));
+        // The anchor itself resolves (so the update layer can fail it closed).
+        let anchor = resolve_metadata_target(&vault, ANCHOR_PROFILE_ID).expect("anchor resolves");
+        assert_eq!(anchor.derivation_index, 0);
+    }
+
+    #[test]
+    fn rfc006_handle_normalization_and_validation() {
+        assert_eq!(
+            normalize_profile_handle("@dcbyers13").unwrap(),
+            "dcbyers13"
+        );
+        assert_eq!(
+            normalize_profile_handle("  dcbyers13  ").unwrap(),
+            "dcbyers13"
+        );
+        assert_eq!(
+            normalize_profile_handle("  @dcbyers13 ").unwrap(),
+            "dcbyers13"
+        );
+        // AC-5: out-of-pattern handles are rejected.
+        assert!(normalize_profile_handle("a").is_err()); // too short
+        assert!(normalize_profile_handle("has space").is_err());
+        assert!(normalize_profile_handle(&"a".repeat(31)).is_err());
+        assert!(normalize_profile_handle("no!chars").is_err());
+        assert!(normalize_profile_handle("").is_err());
+    }
+
+    #[test]
+    fn rfc006_metadata_round_trips_through_atomic_persistence() {
+        let mut path = temp_dir();
+        path.push("iyou_test_rfc006_metadata.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = rfc006_test_vault();
+        update_profile_metadata(
+            &mut vault,
+            DEFAULT_PERSONA_PROFILE_ID,
+            Some("dcbyers13".to_string()),
+            Some("Dan Byers".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("write succeeds");
+        // AC-7-style persistence: staging file + fsync + atomic rename.
+        save_vault_inner(&path, &vault).expect("atomic persist succeeds");
+        let reloaded = load_vault_from_path(&path).expect("reload succeeds");
+        let primary = reloaded
+            .get_profile_by_id(DEFAULT_PERSONA_PROFILE_ID)
+            .expect("primary survives round trip");
+        assert_eq!(primary.handle.as_deref(), Some("dcbyers13"));
+        assert_eq!(primary.nip05.as_deref(), Some("dcbyers13@iyou.me"));
+        assert_eq!(primary.banner_url, None);
+        // Unset metadata fields do not leak into the serialized vault.
+        let json = serde_json::to_string(&reloaded).unwrap();
+        assert!(!json.contains("\"banner_url\""));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rfc006_legacy_vault_without_metadata_loads_cleanly() {
+        let mut path = temp_dir();
+        path.push("iyou_test_rfc006_legacy.json");
+        let _ = fs::remove_file(&path);
+
+        // A pre-RFC-006 vault: profiles carry none of the new metadata keys.
+        let legacy_json = serde_json::json!({
+            "root_seed_base58": bs58::encode(vec![0x61u8; 32]).into_string(),
+            "profiles": [
+                {
+                    "profile_id": "anchor",
+                    "profile_name": "Anchor Identity",
+                    "derivation_index": 0,
+                    "did": "did:key:z6MkLegacyAnchor",
+                    "credentials": [],
+                    "nostr_pubkey_hex": "aa".repeat(32),
+                    "level": 0,
+                    "is_system_reserved": true,
+                    "active": false
+                },
+                {
+                    "profile_id": "primary",
+                    "profile_name": "Primary Identity",
+                    "derivation_index": 1,
+                    "did": "did:key:z6MkLegacyPrimary",
+                    "credentials": [],
+                    "nostr_pubkey_hex": "bb".repeat(32),
+                    "level": 1,
+                    "is_system_reserved": false,
+                    "active": true
+                }
+            ]
+        });
+        fs::write(&path, base64.encode(legacy_json.to_string())).unwrap();
+
+        // AC-4: deserializes cleanly, new fields default to None.
+        let vault = load_vault_from_path(&path).expect("legacy vault loads");
+        let primary = vault.get_profile_by_id(DEFAULT_PERSONA_PROFILE_ID).unwrap();
+        assert_eq!(primary.handle, None);
+        assert_eq!(primary.display_name, None);
+        assert_eq!(primary.avatar_url, None);
+        assert_eq!(primary.banner_url, None);
+        assert_eq!(primary.bio, None);
+        assert_eq!(primary.nip05, None);
+        // Semantically unchanged: the legacy identity survives intact.
+        assert_eq!(primary.did, "did:key:z6MkLegacyPrimary");
+
+        // Reserialization omits the unset keys (skip_serializing_if), so the
+        // legacy payload stays byte-stable modulo serde_json key ordering.
+        let reserialized = serde_json::to_string(&vault).unwrap();
+        assert!(!reserialized.contains("\"handle\""));
+        assert!(!reserialized.contains("\"nip05\""));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rfc006_persona_isolation_between_l1_and_l2() {
+        let mut vault = rfc006_test_vault();
+        update_profile_metadata(
+            &mut vault,
+            "primary",
+            Some("dcbyers13".to_string()),
+            Some("Dan Byers".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("L1 write succeeds");
+        update_profile_metadata(
+            &mut vault,
+            "burner_ab",
+            Some("quiet_otter_12".to_string()),
+            Some("Burner AB".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("L2 write succeeds");
+
+        // AC-10: writing L2 never mutates L1 and vice versa.
+        let primary = vault.get_profile_by_id("primary").unwrap();
+        assert_eq!(primary.handle.as_deref(), Some("dcbyers13"));
+        assert_eq!(primary.nip05.as_deref(), Some("dcbyers13@iyou.me"));
+        let burner = vault.get_profile_by_id("burner_ab").unwrap();
+        assert_eq!(burner.handle.as_deref(), Some("quiet_otter_12"));
+        assert_eq!(burner.nip05.as_deref(), Some("quiet_otter_12@iyou.me"));
+        assert_eq!(burner.display_name.as_deref(), Some("Burner AB"));
+    }
+
+    #[test]
+    fn rfc006_public_projection_strips_secrets_and_carries_metadata() {
+        let mut vault = rfc006_test_vault();
+        update_profile_metadata(
+            &mut vault,
+            DEFAULT_PERSONA_PROFILE_ID,
+            Some("dcbyers13".to_string()),
+            Some("Dan Byers".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("write succeeds");
+        // Simulate a graduated sovereign persona carrying imported key leaves:
+        // the projection MUST NOT leak them over the bridge.
+        let primary = vault
+            .profiles
+            .iter_mut()
+            .find(|p| p.profile_id == DEFAULT_PERSONA_PROFILE_ID)
+            .unwrap();
+        primary.imported_seed_b58 = Some("secretSeedMaterialBase58".to_string());
+        primary.imported_nostr_sk_hex = Some("deadbeef".to_string());
+
+        let projection = serde_json::to_value(PublicProfileProjection::from(&*primary)).unwrap();
+        assert_eq!(projection["handle"], "dcbyers13");
+        assert_eq!(projection["nip05"], "dcbyers13@iyou.me");
+        assert_eq!(projection["display_name"], "Dan Byers");
+        assert!(
+            projection.get("imported_seed_b58").is_none(),
+            "projection must never serialize imported seeds"
+        );
+        assert!(
+            projection.get("imported_nostr_sk_hex").is_none(),
+            "projection must never serialize imported nostr secret keys"
+        );
+        assert!(projection.get("credentials").is_none());
+        assert_eq!(projection["did"], primary.did);
+        assert_eq!(projection["nostr_pubkey_hex"], primary.nostr_pubkey_hex);
     }
 }

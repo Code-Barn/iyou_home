@@ -35,6 +35,13 @@ export interface Profile {
   active?: boolean;
   nostr_pubkey_hex?: string;
   credentials?: any[];
+  // RFC-006 Universal Profile Metadata (all optional; absent = unset)
+  handle?: string; // canonical handle, e.g. "dcbyers13" (no leading @)
+  display_name?: string; // e.g. "Dan Byers"
+  avatar_url?: string; // content-addressed Blossom URL or HTTPS
+  banner_url?: string;
+  bio?: string;
+  nip05?: string; // canonical "handle@iyou.me" — derived by the enclave
 }
 
 export interface RoleProfile {
