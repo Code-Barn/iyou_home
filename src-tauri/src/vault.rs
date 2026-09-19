@@ -179,6 +179,12 @@ pub struct VaultStore {
     pub roles: Vec<RoleProfile>,
     #[serde(default)]
     pub businesses: Vec<BusinessProfile>,
+    /// RFC-005 custodial seed pod metadata (children with their OWN device).
+    /// Holds public DIDs and custody metadata ONLY — never child seeds or
+    /// private keys. The child's root seed lives on the child's device plus
+    /// one Shamir escrow share in `escrow_store.json`.
+    #[serde(default)]
+    pub child_pods: Vec<ChildPodEntry>,
 }
 
 impl VaultStore {
@@ -237,6 +243,68 @@ pub struct SovereignIdentity {
 
 fn default_true() -> bool {
     true
+}
+
+// ---------- RFC-005 custodial seed pods ----------
+
+/// RFC-005 custodial seed pod: metadata-only record of a dependent child who
+/// runs their OWN edge device. The child's root seed is generated inside the
+/// child's hardware enclave and the parent NEVER holds it — the parent vault
+/// stores only public DIDs, custody metadata, and grant references.
+///
+/// **Hard post-serialize invariant:** serializing a `VaultStore` must never
+/// produce child private-key or seed bytes; `ChildPodEntry` carries public
+/// fields only (mirrors the DEP export-time invariant, RFC-005 §10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildPodEntry {
+    /// Unique pod id, e.g. `pod_a1b2c3` (links to escrow_store.json and
+    /// supervisory grant events).
+    pub pod_id: String,
+    /// Child L1 public DID (`did:key:z6Mk…`). Public only.
+    pub child_did: String,
+    /// Child L1 Nostr secp256k1 public key (hex). Public only.
+    pub child_nostr_pubkey_hex: String,
+    /// Child device anon handle (anon-8-hex). Non-PII.
+    pub child_device_id: String,
+    /// Unix seconds when the pod was bound.
+    pub bound_at: u64,
+    /// 1: Supervised (<13), 2: Teen (13-17), 3: Emancipated (18+). Monotonic:
+    /// transitions only ever increase (RFC-005 §8).
+    pub custody_stage: u8,
+    /// Outstanding grant ids (`9114:nonce…`) issued to this pod.
+    #[serde(default)]
+    pub active_grants: Vec<String>,
+    /// Reference to the escrow ledger row, e.g.
+    /// `escrow_store.json#pod_a1b2c3`.
+    pub escrow_ref: String,
+    /// Unix seconds of emancipation, or null while supervised.
+    pub emancipated_at: Option<u64>,
+}
+
+impl ChildPodEntry {
+    pub fn is_emancipated(&self) -> bool {
+        self.custody_stage == CUSTODY_STAGE_EMANCIPATED
+    }
+}
+
+/// Custody stages (RFC-005 §9). Values are monotonic: 1 → 2 → 3.
+pub const CUSTODY_STAGE_SUPERVISED: u8 = 1;
+pub const CUSTODY_STAGE_TEEN: u8 = 2;
+pub const CUSTODY_STAGE_EMANCIPATED: u8 = 3;
+
+/// RFC-005 hard post-serialize invariant: a serialized parent `VaultStore`
+/// must never contain a dependent's private seed or private-key material —
+/// only child public DIDs and metadata. Returns `true` if `probe` (a hex or
+/// base58 encoding of a child secret) appears anywhere in the serialized
+/// vault JSON. The parent's OWN root seed is the only key material that is
+/// legitimately stored (as `root_seed_base58`), so child-seed probes are what
+/// this guard scans for. Invoked by the RFC-005 §6.2 post-serialize scan test.
+#[allow(dead_code)]
+pub fn vault_json_scan_for_secret(vault: &VaultStore, probe: &str) -> bool {
+    let Ok(json) = serde_json::to_string(vault) else {
+        return true; // fail closed: a vault we can't even serialize is unsafe
+    };
+    !probe.is_empty() && json.contains(probe)
 }
 
 impl Default for SovereignIdentity {
@@ -781,6 +849,7 @@ pub fn vault_from_seed(seed: &[u8; 32]) -> VaultStore {
         dependents: Vec::new(),
         roles: Vec::new(),
         businesses: Vec::new(),
+        child_pods: vec![],
     }
 }
 
@@ -1517,6 +1586,7 @@ pub fn import_graduated_dependent(
         dependents: Vec::new(),
         roles: Vec::new(),
         businesses: Vec::new(),
+        child_pods: vec![],
     })
 }
 
@@ -2681,6 +2751,7 @@ mod tests {
             dependents: Vec::new(),
             roles: Vec::new(),
             businesses: Vec::new(),
+            child_pods: vec![],
         };
         save_vault_inner(path, &legacy).expect("Should persist legacy vault");
         let seed = bs58::decode(&legacy.root_seed_base58)
@@ -2761,6 +2832,7 @@ mod tests {
             dependents: Vec::new(),
             roles: Vec::new(),
             businesses: Vec::new(),
+            child_pods: vec![],
         };
         save_vault_inner(&path, &squatting).expect("Should persist squatting vault");
         let anchor_did = squatting.profiles[0].did.clone();
@@ -3589,6 +3661,7 @@ mod tests {
             dependents: vec![],
             roles: vec![],
             businesses: vec![],
+            child_pods: vec![],
         };
 
         let hex = reveal_root_seed_hex(&vault).expect("Should reveal seed");
@@ -3614,6 +3687,7 @@ mod tests {
             dependents: vec![],
             roles: vec![],
             businesses: vec![],
+            child_pods: vec![],
         };
         vault.profiles = initial_profiles(&seed);
 
@@ -3711,6 +3785,7 @@ mod tests {
             dependents: vec![],
             roles: vec![],
             businesses: vec![],
+            child_pods: vec![],
         };
         fs::write(tmp.join("vault.json"), serde_json::to_string_pretty(&vault).unwrap()).unwrap();
 
@@ -3838,6 +3913,7 @@ mod tests {
             dependents: vec![],
             roles: vec![],
             businesses: vec![],
+            child_pods: vec![],
         };
 
         let backup_bytes = export_vault_backup(&vault, &tmp, "safe-password")
@@ -3873,6 +3949,7 @@ mod tests {
             dependents: vec![],
             roles: vec![],
             businesses: vec![],
+            child_pods: vec![],
         };
 
         let backup_bytes = export_vault_backup(&vault, &tmp, "correct-password")

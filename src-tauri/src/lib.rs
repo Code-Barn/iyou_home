@@ -44,6 +44,7 @@ mod moderation;
 mod nostr_relay;
 mod omemo;
 mod pairing;
+mod pods;
 mod prosody;
 mod tray;
 mod updater;
@@ -609,6 +610,7 @@ fn import_did(
                 dependents: Vec::new(),
                 roles: Vec::new(),
                 businesses: Vec::new(),
+                child_pods: vec![],
             }
         }
         Err(e) => return Err(e.to_string()),
@@ -1851,6 +1853,237 @@ fn record_disclaimer_audit(
 #[tauri::command]
 fn get_age_tier(app: AppHandle) -> Result<Option<compliance::AgeTier>, String> {
     Ok(load_preferences(&app).age_gate.map(|g| g.tier))
+}
+
+// ---------- RFC-005 Custodial Seed Pods ----------
+
+/// Bind a dependent child pod into the parent vault. Stores metadata and
+/// public DIDs ONLY (RFC-005 §4.1/§6.2): never a child seed or private key.
+/// If an escrow ceremony already exists for this `child_did`, its pod_id is
+/// reused so the pod entry and escrow row stay linked.
+#[tauri::command]
+fn bind_child_pod(
+    child_did: String,
+    child_pubkey: String,
+    child_device_id: String,
+    custody_stage: u8,
+    app: AppHandle,
+) -> Result<vault::ChildPodEntry, String> {
+    if child_did.trim().is_empty() {
+        return Err("child_did must not be empty".to_string());
+    }
+    if custody_stage != vault::CUSTODY_STAGE_SUPERVISED
+        && custody_stage != vault::CUSTODY_STAGE_TEEN
+        && custody_stage != vault::CUSTODY_STAGE_EMANCIPATED
+    {
+        return Err(format!("invalid custody_stage: {}", custody_stage));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    let mut vault = vault::load_vault(&app)?;
+    if vault.child_pods.iter().any(|p| p.child_did == child_did) {
+        return Err("child_did is already bound to a pod".to_string());
+    }
+
+    // Reuse the ceremony pod_id if an escrow row already exists for this DID.
+    let escrow_file = pods::load_escrow_store(&app)?;
+    let existing_pod_id = escrow_file
+        .pods
+        .values()
+        .find(|row| row.child_did == child_did)
+        .map(|row| row.pod_id.clone());
+
+    let pod_id = existing_pod_id.unwrap_or_else(|| format!("pod_{}", uuid::Uuid::new_v4().simple()));
+    let entry = vault::ChildPodEntry {
+        pod_id: pod_id.clone(),
+        child_did: child_did.clone(),
+        child_nostr_pubkey_hex: child_pubkey,
+        child_device_id,
+        bound_at: now,
+        custody_stage,
+        active_grants: Vec::new(),
+        escrow_ref: format!("escrow_store.json#{}", pod_id),
+        emancipated_at: None,
+    };
+
+    vault.child_pods.push(entry.clone());
+    vault::save_vault(&app, &vault)?;
+    Ok(entry)
+}
+
+/// RFC-005 §4.1 edge binding ceremony: mints the child's root seed inside the
+/// enclave, splits it into the 3 Shamir escrow shares, persists share x=1
+/// into the parent's `escrow_store.json`, and zeroizes the seed. Returns the
+/// satellite (x=2) and cold-sheet (x=3) payloads for distribution; the seed
+/// itself never leaves the ceremony and is never persisted.
+#[tauri::command]
+fn generate_pod_escrow_shares(
+    pod_id: String,
+    custody_stage: u8,
+    app: AppHandle,
+) -> Result<pods::PodEscrowCeremony, String> {
+    if pod_id.trim().is_empty() {
+        return Err("pod_id must not be empty".to_string());
+    }
+    if custody_stage != vault::CUSTODY_STAGE_SUPERVISED
+        && custody_stage != vault::CUSTODY_STAGE_TEEN
+        && custody_stage != vault::CUSTODY_STAGE_EMANCIPATED
+    {
+        return Err(format!("invalid custody_stage: {}", custody_stage));
+    }
+    pods::generate_escrow_ceremony(&app, &pod_id, custody_stage)
+}
+
+/// Issue an expiring supervisory capability grant (kind:9114) signed with the
+/// parent's active L1 Ed25519 key over the canonical JCS payload.
+#[tauri::command]
+fn create_supervisory_grant(
+    pod_id: String,
+    capabilities: Vec<pods::GrantCapability>,
+    valid_days: u64,
+    app: AppHandle,
+) -> Result<pods::SupervisoryGrant, String> {
+    if valid_days == 0 {
+        return Err("valid_days must be > 0".to_string());
+    }
+    if capabilities.is_empty() {
+        return Err("at least one capability is required".to_string());
+    }
+
+    let vault = vault::load_vault(&app)?;
+    let persona = vault
+        .public_persona()
+        .ok_or_else(|| "no active L1 persona for grant signing".to_string())?;
+    let issuer_kp = vault::get_profile_keypair(&vault, &persona.profile_id)?;
+
+    let (child_did, is_emancipated) = vault
+        .child_pods
+        .iter()
+        .find(|p| p.pod_id == pod_id)
+        .map(|p| (p.child_did.clone(), p.is_emancipated()))
+        .ok_or_else(|| format!("pod not found: {}", pod_id))?;
+    if is_emancipated {
+        return Err("cannot grant to an emancipated pod".to_string());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    let mut grant = pods::SupervisoryGrant {
+        v: 1,
+        issuer_did: issuer_kp.did.clone(),
+        subject_did: child_did,
+        pod_id: pod_id.clone(),
+        nonce: format!("{}", uuid::Uuid::new_v4().simple()),
+        capabilities,
+        valid_from: now,
+        expires_at: now + valid_days.saturating_mul(86_400),
+        revocable: true,
+        signature: String::new(),
+    };
+    pods::sign_supervisory_grant(&mut grant, &issuer_kp.signing_key)?;
+
+    // Fail closed: self-verify the freshly minted signature before any grant
+    // id is recorded on the pod.
+    if !pods::verify_supervisory_grant(&grant, &issuer_kp.verifying_key)? {
+        return Err("grant signature failed self-verification".to_string());
+    }
+
+    let mut vault = vault;
+    let pod = vault
+        .child_pods
+        .iter_mut()
+        .find(|p| p.pod_id == pod_id)
+        .ok_or_else(|| format!("pod not found: {}", pod_id))?;
+    pod.active_grants.push(pods::grant_id(&grant));
+    vault::save_vault(&app, &vault)?;
+    Ok(grant)
+}
+
+/// Revoke all outstanding supervisory grants for a pod: constructs a Nostr
+/// kind:9115 event targeting the pod (signed through the enclave Nostr path)
+/// and clears `active_grants` on the pod record.
+#[tauri::command]
+fn revoke_supervisory_grant(pod_id: String, app: AppHandle) -> Result<(), String> {
+    let vault = vault::load_vault(&app)?;
+    let persona_pubkey = vault
+        .public_persona()
+        .map(|p| p.nostr_pubkey_hex.clone())
+        .ok_or_else(|| "no active L1 persona for revocation".to_string())?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    // Construct + sign the kind:9115 revocation event (NIP-01 secp256k1 path).
+    let mut event =
+        pods::build_supervisory_revoke_event(&persona_pubkey, &pod_id, now);
+    let _signed = sign_event_with_vault(&app, &mut event)?;
+
+    let mut vault = vault;
+    let pod = vault
+        .child_pods
+        .iter_mut()
+        .find(|p| p.pod_id == pod_id)
+        .ok_or_else(|| format!("pod not found: {}", pod_id))?;
+    pod.active_grants.clear();
+    vault::save_vault(&app, &vault)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_child_pods(app: AppHandle) -> Result<Vec<vault::ChildPodEntry>, String> {
+    Ok(vault::load_vault(&app)?.child_pods)
+}
+
+/// Emancipate a pod: monotonic custody_stage → 3 (Emancipated), void active
+/// grants, stamp `emancipated_at`, and destroy the parent escrow share.
+#[tauri::command]
+fn emancipate_child_pod(pod_id: String, app: AppHandle) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    let mut vault = vault::load_vault(&app)?;
+    let pod = vault
+        .child_pods
+        .iter_mut()
+        .find(|p| p.pod_id == pod_id)
+        .ok_or_else(|| format!("pod not found: {}", pod_id))?;
+    pods::apply_emancipation(pod, now)?;
+    vault::save_vault(&app, &vault)?;
+
+    // Archive the escrow row: destroy the parent share.
+    if let Ok(mut file) = pods::load_escrow_store(&app) {
+        if let Some(row) = file.pods.get_mut(&pod_id) {
+            pods::destroy_parent_share(row, now);
+            let path = pods::escrow_store_path(&app);
+            pods::save_escrow_store_at(&path, &file)?;
+        }
+    }
+    Ok(())
+}
+
+/// Disaster-recovery reconstruction: combine the parent-held share with one
+/// caller-supplied share (satellite or cold sheet), enforce the RFC-005 §6.2
+/// DID mismatch invariant, and return the recovered seed hex to the recovery
+/// ceremony UI only. Never persisted.
+#[tauri::command]
+fn verify_and_reconstruct_escrow(
+    pod_id: String,
+    share_bytes_b64: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let path = pods::escrow_store_path(&app);
+    pods::verify_and_reconstruct_at(&path, &pod_id, &share_bytes_b64)
 }
 
 #[tauri::command]
@@ -3657,6 +3890,13 @@ pub fn run() {
             classify_age,
             record_disclaimer_audit,
             get_age_tier,
+            bind_child_pod,
+            generate_pod_escrow_shares,
+            create_supervisory_grant,
+            revoke_supervisory_grant,
+            list_child_pods,
+            emancipate_child_pod,
+            verify_and_reconstruct_escrow,
             get_service_statuses,
             sync_vote_records,
             get_vote_history,

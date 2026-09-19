@@ -442,3 +442,126 @@ export interface PurgeReport {
   /** Event ids tombstoned by this run (kind:1605 refs). */
   tombstoned_ids: string[];
 }
+
+// ---------- RFC-005 Custodial Seed Pods ----------
+
+/** RFC-005 custody stage (mirror of Rust custody constants). */
+export type CustodyStage = 1 | 2 | 3;
+
+/** 1: Supervised (<13), 2: Teen (13–17), 3: Emancipated (18+). */
+export const CUSTODY_STAGE = {
+  Supervised: 1 as CustodyStage,
+  Teen: 2 as CustodyStage,
+  Emancipated: 3 as CustodyStage,
+} as const;
+
+/** Status label + pill styling for a custody stage. */
+export function custodyLabel(stage: CustodyStage): string {
+  switch (stage) {
+    case CUSTODY_STAGE.Supervised:
+      return "Supervised";
+    case CUSTODY_STAGE.Teen:
+      return "Teen";
+    case CUSTODY_STAGE.Emancipated:
+      return "Emancipated";
+    default:
+      return "Unknown";
+  }
+}
+
+/**
+ * RFC-005 custodial seed pod entry. Metadata + public DIDs ONLY — the parent
+ * vault never stores a child's seed or private key (vault post-serialize
+ * invariant). Mirror of Rust `vault::ChildPodEntry`.
+ */
+export interface ChildPodEntry {
+  pod_id: string;
+  child_did: string;
+  child_nostr_pubkey_hex: string;
+  child_device_id: string;
+  bound_at: number;
+  custody_stage: CustodyStage;
+  active_grants: string[];
+  escrow_ref: string;
+  emancipated_at: number | null;
+}
+
+/** Scope of a supervisory capability (mirror of `pods::GrantScope`). */
+export type GrantScope = "relay" | "contact_approval" | "platform_boundary";
+
+/** Effect of a supervisory capability (mirror of `pods::GrantEffect`). */
+export type GrantEffect = "allow" | "deny" | "co_sign_required" | "enforce";
+
+/** One delegable capability inside a `SupervisoryGrant`. */
+export interface GrantCapability {
+  scope: GrantScope;
+  effect: GrantEffect;
+  relay_id?: string | null;
+  boundary?: string | null;
+  threshold?: number | null;
+}
+
+/** Canonical display tag mirroring `pods::GrantCapability::display_tag`. */
+export function capabilityTag(cap: GrantCapability): string {
+  const scopeName =
+    cap.scope === "relay"
+      ? "Relay"
+      : cap.scope === "contact_approval"
+        ? "Contact"
+        : "Platform";
+  switch (cap.effect) {
+    case "deny":
+      return cap.scope === "relay" ? "Safe Relays Only" : `${scopeName} Restriction`;
+    case "co_sign_required":
+      return "Co-Sign Required";
+    case "enforce":
+      return `Enforce ${scopeName} Rules`;
+    default:
+      return `${scopeName} Access`;
+  }
+}
+
+/**
+ * Expiring supervisory capability grant (kind:9114), Ed25519-signed by the
+ * parent's active L1. Mirror of Rust `pods::SupervisoryGrant`.
+ */
+export interface SupervisoryGrant {
+  v: number;
+  issuer_did: string;
+  subject_did: string;
+  pod_id: string;
+  nonce: string;
+  capabilities: GrantCapability[];
+  valid_from: number;
+  expires_at: number;
+  revocable: boolean;
+  signature: string;
+}
+
+/** Escrow share holder (mirror of `pods::ShareHolder`). */
+export type ShareHolder = "parent" | "satellite" | "sheet";
+
+/**
+ * One Shamir escrow share: evaluation point + 33-byte payload
+ * (1 byte x ‖ 32 bytes y), base64. A single share reveals nothing.
+ */
+export interface ShareEnvelope {
+  share_index: number;
+  payload_b64: string;
+  holder: ShareHolder;
+}
+
+/**
+ * Result of the RFC-005 edge binding ceremony. Share x=1 is already stored in
+ * the parent's `escrow_store.json`; x=2 (satellite) and x=3 (cold sheet) are
+ * returned for distribution. No seed material ever crosses the wire.
+ */
+export interface PodEscrowCeremony {
+  pod_id: string;
+  child_did: string;
+  child_nostr_pubkey_hex: string;
+  parent_share_b64: string;
+  satellite_payload_b64: string;
+  sheet_payload_b64: string;
+  unlock_at: number;
+}

@@ -1111,6 +1111,7 @@ mod tests {
             dependents: vec![],
             roles: vec![],
             businesses: vec![],
+            child_pods: vec![],
         }
     }
 

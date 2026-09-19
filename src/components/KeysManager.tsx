@@ -31,6 +31,7 @@ import {
 } from "../lib/appLock";
 import DevicePairing from "./DevicePairing";
 import UpdateVettingModal from "./updater/UpdateVettingModal";
+import FamilyEnclave from "./family/FamilyEnclave";
 
 function levelLabel(level: number): string {
   if (level === 0) return "L0 Anchor";
@@ -658,6 +659,9 @@ export default function KeysManager({
           <p className="muted">No active identity found.</p>
         )}
       </div>
+
+      {/* RFC-005 Family & Delegations (below Primary Identity) */}
+      <FamilyEnclave />
 
       {/* Sovereign Data Redundancy Callout */}
       <div
