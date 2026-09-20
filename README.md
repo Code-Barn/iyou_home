@@ -126,7 +126,6 @@ All local daemons bind strictly to IPv4 loopback `127.0.0.1`. No service ever li
 ## Documentation
 
 - [AGENT.md](./AGENT.md) — Root operational contract, security invariants, and complete Tauri IPC command registry.
-- [DEVELOPER_GUIDE.md](./docs/DEVELOPER_GUIDE.md) — Internal developer guide: vault lifecycle, RFC-001…RFC-006 Tauri commands, and the Port 9001 bridge wire contracts.
-- [HOME_DEVELOPER_GUIDE.md](./docs/HOME_DEVELOPER_GUIDE.md) — Comprehensive technical reference, cryptographic derivation engine, wire protocols, and pairing specifications.
+- [HOME_DEVELOPER_GUIDE.md](./docs/HOME_DEVELOPER_GUIDE.md) — Comprehensive technical reference: cryptographic derivation engine, vault lifecycle (RFC-001), Tauri IPC commands (RFC-001…RFC-006), wire protocols, Port 9001 contracts, and pairing specifications.
 - [RELEASE_SPEC_V2.md](./docs/RELEASE_SPEC_V2.md) — V2.0 sovereign release baseline and subsystem specifications.
 - [TODO.md](./TODO.md) — Release roadmap tracking completed Phases 1 through 10.

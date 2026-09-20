@@ -22,6 +22,7 @@ import QuickDispatchModal from "../components/QuickDispatchModal";
 import SovereignFootprint from "../components/SovereignFootprint";
 import GlobalStatusBar from "../components/GlobalStatusBar";
 import type { Profile } from "../lib/types";
+import pkg from "../../package.json";
 
 const mockInvoke = vi.hoisted(() =>
   vi.fn((cmd: string, args?: Record<string, unknown>) => {
@@ -299,7 +300,7 @@ describe("GlobalStatusBar Phase 10", () => {
   it("renders dynamic version badge matching package.json", async () => {
     const onNavigate = vi.fn();
     render(<GlobalStatusBar onNavigateEnclave={onNavigate} />);
-    expect(screen.getByText("v0.2.1 · Enclave Active")).toBeInTheDocument();
+    expect(screen.getByText(`v${pkg.version} · Enclave Active`)).toBeInTheDocument();
   });
 
   it("renders active persona pill dynamically from props", async () => {
