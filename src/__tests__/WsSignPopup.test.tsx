@@ -346,7 +346,7 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
       });
     });
 
-    it("auto-signs pending request upon unlock when grace period is active", async () => {
+    it("does not auto-sign pending request upon unlock even when grace period is active, forcing manual review", async () => {
       const futureSessionTime = Date.now() + 3600 * 1000;
       const { rerender } = render(<WsSignPopup isAppLocked={true} authSessionValidUntil={0} />);
 
@@ -373,10 +373,49 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
         rerender(<WsSignPopup isAppLocked={false} authSessionValidUntil={futureSessionTime} />);
       });
 
-      // Resolves smoothly via auto-approval without displaying popup
+      // Must NOT auto-approve: modal must appear with Approve/Deny buttons!
+      await waitFor(() => {
+        expect(screen.getByText("Nostr Event Signing Request")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Approve & Sign/i })).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Deny/i })).toBeInTheDocument();
+      });
+      expect(mockInvoke).not.toHaveBeenCalledWith("submit_ws_event_response", expect.anything());
+
+      // User manually approves
+      const approveBtn = screen.getByRole("button", { name: /Approve & Sign/i });
+      await act(async () => {
+        fireEvent.click(approveBtn);
+      });
+
       await waitFor(() => {
         expect(mockInvoke).toHaveBeenCalledWith("submit_ws_event_response", {
           eventJson: JSON.stringify(noteEvent),
+          approved: true,
+          profileId: "burner_alpha",
+        });
+        expect(screen.queryByText("Nostr Event Signing Request")).not.toBeInTheDocument();
+      });
+
+      // Subsequent incoming request while unlocked with active grace period auto-signs normally
+      mockInvoke.mockClear();
+      const subsequentEvent = {
+        kind: 1,
+        content: "Subsequent note while unlocked",
+        tags: [],
+      };
+
+      await act(async () => {
+        channelCallback?.(
+          JSON.stringify({
+            __type__: "sign_event",
+            event: subsequentEvent,
+          }),
+        );
+      });
+
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("submit_ws_event_response", {
+          eventJson: JSON.stringify(subsequentEvent),
           approved: true,
           profileId: "burner_alpha",
         });
@@ -411,6 +450,21 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
           publicProfile,
         ),
       ).toBe(true);
+    });
+
+    it("rejects requests flagged with wasQueued: true", () => {
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign_event", event: { kind: 1, content: "hello" }, wasQueued: true },
+          publicProfile,
+        ),
+      ).toBe(false);
+      expect(
+        isEligibleForGraceAutoSign(
+          { type: "sign", challenge: "random-nonce-12345", wasQueued: true },
+          publicProfile,
+        ),
+      ).toBe(false);
     });
 
     it("rejects non-kind-1 Nostr events (e.g. kind 0, 3, 1063)", () => {

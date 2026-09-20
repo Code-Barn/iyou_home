@@ -21,19 +21,21 @@ import { Profile } from "../lib/types";
 import { isAnchor } from "../lib/enclaveFilters";
 
 export type SignRequest =
-  | { type: "sign"; challenge: string; profile_id?: string }
-  | { type: "sign_event"; event: any; profile_id?: string }
+  | { type: "sign"; challenge: string; profile_id?: string; wasQueued?: boolean }
+  | { type: "sign_event"; event: any; profile_id?: string; wasQueued?: boolean }
   | {
       type: "sign_credential";
       credential: any;
       holder_did: string;
       profile_id?: string;
+      wasQueued?: boolean;
     }
   | {
       type: "POLY_CREDENTIAL_REQUEST";
       required_credential_type: string;
       challenge: string;
       profile_id?: string;
+      wasQueued?: boolean;
     };
 
 export function isEligibleForGraceAutoSign(
@@ -41,6 +43,8 @@ export function isEligibleForGraceAutoSign(
   profile?: Profile | null,
 ): boolean {
   if (!req) return false;
+  // Requests stashed while the app was locked must never be auto-signed
+  if (req.wasQueued) return false;
   // Level 0 Anchor is strictly air-gapped and excluded from grace auto-signing
   if (!profile || isAnchor(profile) || profile.level === 0 || profile.derivation_index === 0) {
     return false;
@@ -166,6 +170,9 @@ export default function WsSignPopup({
   ) => {
     const activeReq = targetReqArg || request;
     if (!activeReq) return;
+    if (activeReq.wasQueued) {
+      activeReq.wasQueued = false;
+    }
     setIsProcessing(true);
 
     const effectiveProfileId =
@@ -301,8 +308,9 @@ export default function WsSignPopup({
       if (isAppLockedRef.current) {
         if (import.meta.env.DEV)
           console.log("REACT: App is locked; stashing incoming challenge in pendingRequest");
-        pendingRequestRef.current = incomingReq;
-        setPendingRequest(incomingReq);
+        const queuedReq: SignRequest = { ...incomingReq, wasQueued: true };
+        pendingRequestRef.current = queuedReq;
+        setPendingRequest(queuedReq);
         return;
       }
 
@@ -347,8 +355,9 @@ export default function WsSignPopup({
     // If transitioning from unlocked to locked: stash active request
     if (!prevIsAppLockedRef.current && isAppLocked) {
       if (request) {
-        pendingRequestRef.current = request;
-        setPendingRequest(request);
+        const queuedReq: SignRequest = { ...request, wasQueued: true };
+        pendingRequestRef.current = queuedReq;
+        setPendingRequest(queuedReq);
         setRequest(null);
       }
     }
@@ -366,6 +375,14 @@ export default function WsSignPopup({
             }
             await loadProfilesPromiseRef.current;
           }
+
+          if (pending.wasQueued) {
+            if (import.meta.env.DEV)
+              console.log("REACT: Enclave unlocked; request was queued while locked, forcing manual review");
+            setRequest(pending);
+            return;
+          }
+
           const targetProfile = resolveProfileForRequest(pending.profile_id);
           const now = Date.now();
           if (
