@@ -1156,10 +1156,29 @@ async fn listen_on(addrs: &str, app: AppHandle) {
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
-    let listener = TcpListener::bind(addrs)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to bind WSS on {}: {}", addrs, e));
-    println!("Signature Bridge listening on wss://home.iyou.me:9001 (dual-stack bound on {})", addrs);
+    let listener = match TcpListener::bind(addrs).await {
+        Ok(l) => {
+            println!("Signature Bridge listening on wss://home.iyou.me:9001 (dual-stack bound on {})", addrs);
+            l
+        }
+        Err(e) => {
+            if addrs == "[::]:9001" {
+                match TcpListener::bind("127.0.0.1:9001").await {
+                    Ok(l) => {
+                        println!("Signature Bridge listening on wss://home.iyou.me:9001 (IPv4 fallback on 127.0.0.1:9001)");
+                        l
+                    }
+                    Err(e_fallback) => {
+                        eprintln!("[WARN] Signature Bridge failed to bind on {} ({}) and fallback 127.0.0.1:9001 ({}). Bridge will not be available.", addrs, e, e_fallback);
+                        return;
+                    }
+                }
+            } else {
+                eprintln!("[WARN] Signature Bridge failed to bind on {}: {}. Bridge will not be available.", addrs, e);
+                return;
+            }
+        }
+    };
 
     while let Ok((stream, peer)) = listener.accept().await {
         println!("TCP Connection received from: {:?}", peer);

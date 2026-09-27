@@ -60,9 +60,10 @@ struct BlossomState {
 }
 
 pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Receiver<bool>) {
-    fs::create_dir_all(&blobs_dir)
-        .await
-        .expect("Failed to create blobs directory");
+    if let Err(e) = fs::create_dir_all(&blobs_dir).await {
+        eprintln!("[WARN] Failed to create blobs directory {:?}: {}", blobs_dir, e);
+        return;
+    }
 
     let state = BlossomState { blobs_dir };
 
@@ -106,19 +107,25 @@ pub async fn start_blossom_server(blobs_dir: PathBuf, mut shutdown_rx: watch::Re
         .layer(pna_layer)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:9002")
-        .await
-        .expect("Failed to bind Blossom server on 127.0.0.1:9002");
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:9002").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[WARN] Failed to bind Blossom server on 127.0.0.1:9002: {}. Blossom server will not be available.", e);
+            return;
+        }
+    };
 
     println!("Blossom server listening on http://127.0.0.1:9002");
 
-    axum::serve(listener, app.into_make_service())
+    if let Err(e) = axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.changed().await;
             println!("Blossom server shutting down");
         })
         .await
-        .expect("Blossom server failed");
+    {
+        eprintln!("[WARN] Blossom server exited with error: {}", e);
+    }
 }
 
 async fn handle_health(State(state): State<BlossomState>) -> impl IntoResponse {
