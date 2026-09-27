@@ -193,6 +193,48 @@ fn is_websocket_upgrade_request(data: &[u8]) -> bool {
     has_upgrade && has_connection_upgrade && has_ws_key
 }
 
+pub fn is_allowed_origin(origin: &str) -> bool {
+    let origin_clean = origin.trim();
+    if origin_clean.is_empty() {
+        return false;
+    }
+    let lower = origin_clean.to_lowercase();
+    if lower == "https://wun.iyou.me" || lower == "https://iyou.me" {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("https://") {
+        let host = rest.split(':').next().unwrap_or(rest);
+        if host == "iyou.me" || host.ends_with(".iyou.me") {
+            return true;
+        }
+    }
+    if lower.starts_with("http://localhost")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://[::1]")
+        || lower.starts_with("tauri://localhost")
+        || lower.starts_with("https://tauri.localhost")
+    {
+        return true;
+    }
+    false
+}
+
+fn extract_header(http_request: &str, header_name: &str) -> Option<String> {
+    let target = format!("{}:", header_name.to_lowercase());
+    for line in http_request.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_lowercase().starts_with(&target) {
+            if let Some((_, val)) = trimmed.split_once(':') {
+                return Some(val.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 async fn handle_ws_connection<S>(stream: S, app_handle: AppHandle)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -200,8 +242,23 @@ where
     let cors_callback = |req: &tauri::http::Request<()>, mut res: tauri::http::Response<()>| {
         println!("DEBUG: Handshake callback triggered");
         println!("DEBUG: Request method: {:?}", req.method());
+        let origin_header = req
+            .headers()
+            .get("Origin")
+            .and_then(|v| v.to_str().ok());
+        let allow_origin = match origin_header {
+            Some(o) if is_allowed_origin(o) => o,
+            _ => "https://wun.iyou.me",
+        };
+        if let Ok(val) = tauri::http::HeaderValue::from_str(allow_origin) {
+            res.headers_mut().insert("Access-Control-Allow-Origin", val);
+        }
         res.headers_mut().insert(
-            "Access-Control-Allow-Origin",
+            "Access-Control-Allow-Methods",
+            tauri::http::HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        res.headers_mut().insert(
+            "Access-Control-Allow-Headers",
             tauri::http::HeaderValue::from_static("*"),
         );
         res.headers_mut().insert(
@@ -261,6 +318,15 @@ where
                         }
                     };
                     println!("Sending response over WebSocket: {:?}", msg);
+                    let is_critical_frame = match &msg {
+                        Message::Text(t) => {
+                            t.contains("\"signed_event\"")
+                                || t.contains("\"profile_sync\"")
+                                || t.contains("\"signature\"")
+                                || t.contains("\"OMNI_SIGN_RESPONSE\"")
+                        }
+                        _ => false,
+                    };
                     if let Err(e) = ws_sender.send(msg).await {
                         eprintln!("DEBUG: Forwarder exit — ws_sender.send failed: {}", e);
                         break;
@@ -269,16 +335,28 @@ where
                         eprintln!("DEBUG: Forwarder exit — ws_sender.flush failed: {}", e);
                         break;
                     }
+                    if is_critical_frame {
+                        // Explicitly flush outgoing frames over the TLS stream before closing any frame cycle
+                        let _ = ws_sender.flush().await;
+                        tokio::task::yield_now().await;
+                    }
                 }
                 _ = heartbeat.tick() => {
                     if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
                         eprintln!("DEBUG: Forwarder exit — heartbeat ping failed: {}", e);
                         break;
                     }
+                    let _ = ws_sender.flush().await;
                 }
             }
         }
-        // Force TCP buffer flush before clearing sender
+        // Drain any pending messages before closing the forwarder
+        while let Ok(msg) = response_rx.try_recv() {
+            println!("Flushing pending message before forwarder exit: {:?}", msg);
+            let _ = ws_sender.send(msg).await;
+            let _ = ws_sender.flush().await;
+        }
+        // Force TLS & TCP buffer flush before clearing sender
         let _ = ws_sender.flush().await;
         // Add a generous buffer for the OS kernel to hand off the bytes
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -949,10 +1027,15 @@ where
             }
         } else if msg.is_pong() {
             println!("Heartbeat Pong received");
+        } else if msg.is_close() {
+            println!("DEBUG: WebSocket Close frame received from peer");
+            break;
         }
     }
     println!("DEBUG: WebSocket Read Loop Exited");
 
+    // Allow in-flight responses and popup unmounting frame cycles to flush cleanly over TLS
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let ws_state = app_handle.state::<WsState>();
     *ws_state.response_sender.lock().unwrap() = None;
 }
@@ -961,27 +1044,80 @@ async fn handle_connection<S>(mut stream: S, app_handle: AppHandle)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut head = vec![0u8; 4096];
-    let n = match stream.read(&mut head).await {
-        Ok(0) | Err(_) => return,
-        Ok(n) => n,
-    };
+    loop {
+        let mut head = vec![0u8; 4096];
+        let n = match stream.read(&mut head).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
 
-    let data = &head[..n];
+        let data = &head[..n];
 
-    if data.starts_with(b"OPTIONS") {
-        println!("OPTIONS pre-flight received (TLS)");
-        let response = b"HTTP/1.1 200 OK\r\n\
-            Access-Control-Allow-Origin: *\r\n\
-            Access-Control-Allow-Private-Network: true\r\n\
-            Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS\r\n\
-            Access-Control-Allow-Headers: *\r\n\
-            Content-Length: 0\r\n\
-            Connection: keep-alive\r\n\r\n";
-        let _ = stream.write_all(response).await;
-    } else if is_websocket_upgrade_request(data) {
-        let buffered = ReadBuffered::new(stream, head[..n].to_vec());
-        handle_ws_connection(buffered, app_handle).await;
+        if data.starts_with(b"OPTIONS") {
+            println!("OPTIONS pre-flight received (TLS)");
+            let text = String::from_utf8_lossy(data);
+            let origin = extract_header(&text, "origin");
+            let allow_origin = match origin {
+                Some(ref o) if is_allowed_origin(o) => o.as_str(),
+                _ => "https://wun.iyou.me",
+            };
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+Access-Control-Allow-Origin: {}\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: *\r\n\
+Access-Control-Allow-Private-Network: true\r\n\
+Content-Length: 0\r\n\
+Connection: keep-alive\r\n\r\n",
+                allow_origin
+            );
+
+            if let Err(e) = stream.write_all(response.as_bytes()).await {
+                eprintln!("Failed to write OPTIONS response: {}", e);
+                return;
+            }
+            if let Err(e) = stream.flush().await {
+                eprintln!("Failed to flush OPTIONS response: {}", e);
+                return;
+            }
+
+            let connection_hdr = extract_header(&text, "connection");
+            if connection_hdr
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case("close"))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            // Keep connection alive for subsequent requests (e.g. WebSocket handshake)
+        } else if is_websocket_upgrade_request(data) {
+            let buffered = ReadBuffered::new(stream, head[..n].to_vec());
+            handle_ws_connection(buffered, app_handle).await;
+            return;
+        } else {
+            // General HTTP fallback (probe / diagnostics)
+            let text = String::from_utf8_lossy(data);
+            let origin = extract_header(&text, "origin");
+            let allow_origin = match origin {
+                Some(ref o) if is_allowed_origin(o) => o.as_str(),
+                _ => "https://wun.iyou.me",
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+Access-Control-Allow-Origin: {}\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: *\r\n\
+Access-Control-Allow-Private-Network: true\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 2\r\n\
+Connection: close\r\n\r\nOK",
+                allow_origin
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+            return;
+        }
     }
 }
 
@@ -1023,7 +1159,7 @@ async fn listen_on(addrs: &str, app: AppHandle) {
     let listener = TcpListener::bind(addrs)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind WSS on {}: {}", addrs, e));
-    println!("Signature Bridge listening on wss://home.iyou.me:9001");
+    println!("Signature Bridge listening on wss://home.iyou.me:9001 (dual-stack bound on {})", addrs);
 
     while let Ok((stream, peer)) = listener.accept().await {
         println!("TCP Connection received from: {:?}", peer);
@@ -1110,7 +1246,7 @@ async fn handle_omni_sign_request(
 }
 
 pub async fn start_ws_server(app: AppHandle) {
-    listen_on("127.0.0.1:9001", app).await;
+    listen_on("[::]:9001", app).await;
 }
 
 /// Build enclave diagnostics for loopback diagnostic probing without exposing private keys.
@@ -1424,4 +1560,30 @@ mod tests {
         assert!(resolve_target_profile(&vault, "dep_alice_12345678", "").is_none());
         assert!(resolve_target_profile(&vault, "", "did:key:z6MkAliceDependent").is_none());
     }
+
+    #[test]
+    fn test_is_allowed_origin() {
+        assert!(is_allowed_origin("https://wun.iyou.me"));
+        assert!(is_allowed_origin("https://relay.iyou.me"));
+        assert!(is_allowed_origin("https://home.iyou.me:9001"));
+        assert!(is_allowed_origin("https://iyou.me"));
+        assert!(is_allowed_origin("http://localhost:5173"));
+        assert!(is_allowed_origin("http://127.0.0.1:9001"));
+        assert!(is_allowed_origin("http://[::1]:9001"));
+        assert!(is_allowed_origin("tauri://localhost"));
+
+        assert!(!is_allowed_origin("https://attacker.com"));
+        assert!(!is_allowed_origin("https://evil-iyou.me"));
+        assert!(!is_allowed_origin("http://insecure.iyou.me"));
+        assert!(!is_allowed_origin(""));
+    }
+
+    #[test]
+    fn test_extract_header() {
+        let req = "OPTIONS / HTTP/1.1\r\nHost: home.iyou.me:9001\r\nOrigin: https://wun.iyou.me\r\nAccess-Control-Request-Method: GET\r\n\r\n";
+        assert_eq!(extract_header(req, "origin"), Some("https://wun.iyou.me".to_string()));
+        assert_eq!(extract_header(req, "host"), Some("home.iyou.me:9001".to_string()));
+        assert_eq!(extract_header(req, "non-existent"), None);
+    }
 }
+

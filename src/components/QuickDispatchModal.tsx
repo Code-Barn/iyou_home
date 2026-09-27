@@ -27,11 +27,13 @@ interface QuickDispatchModalProps {
 
 type DispatchTab = "note" | "media" | "poll";
 
-const RELAY_ENDPOINTS = [
+export const OUTBOX_RELAY_ENDPOINTS = [
   "ws://127.0.0.1:9003",
   "wss://relay.iyou.me",
   "wss://nos.lol",
-];
+] as const;
+
+export const RELAY_ENDPOINTS = OUTBOX_RELAY_ENDPOINTS;
 
 async function computeSha256Hex(buffer: ArrayBuffer): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
@@ -39,27 +41,101 @@ async function computeSha256Hex(buffer: ArrayBuffer): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function broadcastToRelays(event: any): void {
-  for (const relayUrl of RELAY_ENDPOINTS) {
+export async function publishToRelay(relayUrl: string, event: any, timeoutMs = 3000): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     try {
-      const ws = new WebSocket(relayUrl);
-      ws.onopen = () => {
-        ws.send(JSON.stringify(["EVENT", event]));
-        setTimeout(() => {
+      if (typeof WebSocket === "undefined") {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      let ws: WebSocket | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (ws) {
           try {
+            ws.onopen = null;
+            ws.onerror = null;
+            ws.onmessage = null;
+            ws.onclose = null;
             ws.close();
           } catch {
             // ignore
           }
-        }, 1500);
+          ws = null;
+        }
       };
+
+      const finish = (result: boolean) => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          resolve(result);
+        }
+      };
+
+      timer = setTimeout(() => {
+        finish(false);
+      }, timeoutMs);
+
+      ws = new WebSocket(relayUrl);
+
+      ws.onopen = () => {
+        try {
+          ws?.send(JSON.stringify(["EVENT", event]));
+          // Wait briefly for potential NIP-01 OK confirmation before closing
+          setTimeout(() => {
+            finish(true);
+          }, 600);
+        } catch {
+          finish(false);
+        }
+      };
+
+      ws.onmessage = (msg) => {
+        try {
+          const parsed = JSON.parse(msg.data);
+          if (Array.isArray(parsed) && parsed[0] === "OK" && parsed[1] === event?.id) {
+            finish(parsed[2] === true);
+          }
+        } catch {
+          // ignore
+        }
+      };
+
       ws.onerror = () => {
-        // Best-effort external relay delivery
+        finish(false);
+      };
+
+      ws.onclose = () => {
+        finish(false);
       };
     } catch {
-      // Best-effort
+      resolve(false);
     }
-  }
+  });
+}
+
+export function broadcastToRelays(
+  event: any,
+  customRelays?: string[],
+): Promise<PromiseSettledResult<boolean>[]> {
+  // Always include both local enclave relay (:9003) and ecosystem mesh relay (relay.iyou.me)
+  const relays = Array.from(
+    new Set([
+      "ws://127.0.0.1:9003",
+      "wss://relay.iyou.me",
+      ...(customRelays || RELAY_ENDPOINTS),
+    ]),
+  );
+
+  // Parallel dual-broadcast so delay or network timeout on one endpoint does not prevent delivery to the other
+  return Promise.allSettled(relays.map((url) => publishToRelay(url, event)));
 }
 
 export default function QuickDispatchModal({
