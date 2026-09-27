@@ -24,7 +24,9 @@
 #   ./scripts/release.sh --package-only  # no bump, no rebuilds; stage existing bundles
 #                                  # (add --skip-build / --skip-bump as aliases)
 #   ./scripts/release.sh --dry-run # test/evaluate commit alignment & preview modal updates
-#   ./scripts/release.sh --sync-windows # download & verify Windows binary from GitHub CI
+#   ./scripts/release.sh --sync-windows # download & verify Windows binary from GitHub CI,
+#                                  # regenerate checksums/torrent, upload, and seed
+#   ./scripts/release.sh --seed-qnap # seed release payload to QNAP NAS via SSH
 #   ./scripts/release.sh --patch-idp    # compute SHA-256 sums and patch iyou_idp download modal
 #   ./scripts/release.sh --no-wait-windows # trigger/skip waiting for Windows CI
 #   ./scripts/release.sh --no-seed # skip seed-box rsync + transmission registration
@@ -48,8 +50,10 @@
 #   IDP_PATH=DIR    path to iyou_idp repository (default: ../iyou_idp)
 #   FORCE_PARTIAL_TORRENT=1  skip the missing-bundle prompt (partial payload ok)
 #   PACKAGE_ONLY=1  no version bump and no rebuilds; stage existing bundles only
-#   SEED_HOST       ssh target of the BitTorrent seed box (default: iyou@qnap)
-#   SEED_DIR        remote directory holding release payloads (default: releases)
+#   SEED_HOST       ssh target of the BitTorrent seed box (default: qnap)
+#   SEED_DIR        remote directory holding release payloads (default: auto-detected or releases)
+#   QNAP_TORRENT_DATA_DIR override target payload data directory on QNAP
+#   QNAP_TORRENT_WATCH_DIR override target .torrent watch directory on QNAP
 #   SKIP_SEED=1     skip rsync to the seed box and transmission-remote registration
 #   REMOTE_TRANSMISSION_REMOTE=name|path  remote transmission-remote binary
 #                   (default: transmission-remote; Entware /opt/bin fallback)
@@ -628,359 +632,9 @@ find_windows_exe() {
   return 1
 }
 
-# Print summary
-print_release_summary() {
-  if [[ -z "${TORRENT_FILE:-}" || -z "${RELEASE_DIR:-}" ]]; then
-    return 0
-  fi
-  log "Release payload ready — ${RELEASE_DIR}"
-  printf '\n═══════════════════════════════════════════════════════════════════\n'
-  printf '  Release folder : %s\n'                 "$RELEASE_DIR"
-  printf '  Torrent file   : %s\n'                 "$RELEASE_DIR/$TORRENT_FILE"
-  printf '  Magnet URI     : %s\n'                 "${MAGNET_LINK:-[NOT_GENERATED]}"
-  printf '  Verify against : iyou_idp _download_modal.html\n'
-  printf '  Seed host      : %s:%s (remote payload %s/iyou_home_%s)\n' \
-         "${SEED_HOST:-iyou@qnap}" "${SEED_DIR:-releases}" "${SEED_DIR:-releases}" "${VERSION:-}"
-  printf '  Seeder status  : %s\n'                    "${SEED_STATUS:-not attempted}"
-  printf '\n  SHA-256 Verification Table (matches iyou_idp modal):\n'
-  printf '    Windows (.exe) : %s\n' "${PRIMARY_WIN_SHA:-[NOT_RESOLVED]}"
-  printf '    macOS (.dmg)    : %s\n' "${PRIMARY_MAC_SHA:-[NOT_RESOLVED]}"
-  printf '    Debian (.deb)   : %s\n' "${PRIMARY_DEB_SHA:-[NOT_RESOLVED]}"
-  printf '    AppImage        : %s\n' "${PRIMARY_APP_SHA:-[NOT_RESOLVED]}"
-  printf '\n  Seed immediately on this machine:\n'
-  printf '    transmission-cli "%s/%s" -w "%s" &\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
-  printf '    # or: transmission-remote -a "%s/%s" -w "%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
-  printf '    # or: aria2c --follow-torrent=mem "%s/%s" --dir="%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
-  printf '\n  Mirror manifest (magnet + IPFS URIs, matches the release notes):\n'
-  printf '    cat "%s/MIRRORS.txt"\n'              "$RELEASE_DIR"
-  printf '═══════════════════════════════════════════════════════════════════\n'
-}
-
-# ---------------------------------------------------------------- configuration
-SEED_HOST="${SEED_HOST:-iyou@qnap}"
-SEED_DIR="${SEED_DIR:-releases}"
-SKIP_SEED="${SKIP_SEED:-0}"
-REMOTE_TRANSMISSION_REMOTE="${REMOTE_TRANSMISSION_REMOTE:-transmission-remote}"
-DRY_RUN="${DRY_RUN:-0}"
-NO_WAIT_WINDOWS="${NO_WAIT_WINDOWS:-0}"
-SYNC_WINDOWS_ONLY="${SYNC_WINDOWS:-0}"
-PATCH_IDP_ONLY="${PATCH_IDP:-0}"
-IDP_PATH="${IDP_PATH:-}"
-
-# Parse auxiliary flags
-prev=""
-for arg in "$@"; do
-  if [[ "$prev" == "--idp-path" ]]; then
-    IDP_PATH="$arg"
-    prev=""
-    continue
-  fi
-  case "$arg" in
-    --no-seed|--skip-seed) SKIP_SEED=1 ;;
-    --dry-run) DRY_RUN=1; SKIP_UPLOAD=1; SKIP_SEED=1 ;;
-    --no-wait-windows) NO_WAIT_WINDOWS=1 ;;
-    --sync-windows) SYNC_WINDOWS_ONLY=1 ;;
-    --patch-idp) PATCH_IDP_ONLY=1 ;;
-    --package-only|--skip-build) PACKAGE_ONLY=1 ;;
-    --skip-mac) SKIP_MAC=1 ;;
-    --skip-linux) SKIP_LINUX=1 ;;
-    --skip-windows) SKIP_WINDOWS=1 ;;
-    --skip-upload) SKIP_UPLOAD=1 ;;
-    --idp-path) prev="--idp-path" ;;
-    --idp-path=*) IDP_PATH="${arg#*=}" ;;
-  esac
-done
-
-# Resolve first positional argument that is not an auxiliary flag
-BUMP_ARG="${BUMP:-patch}"
-if [[ "${SYNC_WINDOWS_ONLY:-0}" == "1" || "${PATCH_IDP_ONLY:-0}" == "1" || "${DRY_RUN:-0}" == "1" ]]; then
-  BUMP_ARG="${BUMP:-current}"
-fi
-prev=""
-for arg in "$@"; do
-  if [[ "$prev" == "--idp-path" ]]; then
-    prev=""
-    continue
-  fi
-  case "$arg" in
-    --no-seed|--skip-seed|--dry-run|--no-wait-windows|--sync-windows|--patch-idp|--package-only|--skip-build|--skip-bump|--skip-mac|--skip-linux|--skip-windows|--skip-upload)
-      continue
-      ;;
-    --idp-path)
-      prev="--idp-path"
-      continue
-      ;;
-    --idp-path=*)
-      continue
-      ;;
-  esac
-  BUMP_ARG="$arg"
-  break
-done
-
-if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
-  echo "iyou_home — One-Click Sovereign Release Pipeline"
-  echo ""
-  echo "Usage: $0 [patch|minor|major|<version>|current|--current|--package-only] [options]"
-  echo ""
-  echo "Arguments:"
-  echo "  patch          Bump patch version (default, e.g. 0.2.0 -> 0.2.1)"
-  echo "  minor          Bump minor version (e.g. 0.2.0 -> 0.3.0)"
-  echo "  major          Bump major version (e.g. 0.2.0 -> 1.0.0)"
-  echo "  X.Y.Z          Bump to explicit SemVer version"
-  echo "  current        Build & publish current version without bumping (alias: none)"
-  echo "  --current      Alias for: current (no version bump)"
-  echo "  --package-only No bump, no rebuilds; stage already-built bundles only"
-  echo ""
-  echo "Options:"
-  echo "  --dry-run      Evaluate tag/commit alignment and preview modal updates without mutations"
-  echo "  --sync-windows Download & verify Windows binary from GitHub CI into staging"
-  echo "  --patch-idp    Compute SHA-256 sums and patch iyou_idp download modal directly"
-  echo "  --no-wait-windows  Dispatch Windows build without blocking on completion"
-  echo "  --no-seed      Skip rsync to the seed box and transmission registration"
-  echo "  --idp-path DIR Explicit path to iyou_idp repository"
-  echo ""
-  echo "Environment variables:"
-  echo "  BUMP          Alternative to positional argument"
-  echo "  SKIP_MAC=1    Skip local macOS build"
-  echo "  SKIP_LINUX=1  Skip remote dc13 Linux build"
-  echo "  SKIP_WINDOWS=1 Skip Windows NSIS GitHub Actions build dispatch / sync"
-  echo "  SKIP_UPLOAD=1 Stage and checksum only (no tag, no push, no publish)"
-  echo "  DRY_RUN=1     Dry-run mode (no remote modifications, no file overwrites)"
-  echo "  NO_WAIT_WINDOWS=1 Asynchronous Windows CI dispatch"
-  echo "  IDP_PATH=DIR  Custom directory path to iyou_idp"
-  echo "  WINDOWS_EXE=path   Stage this Windows NSIS .exe into the payload"
-  exit 0
-fi
-
-# Remote resolution
-pick_release_remote() {
-  for r in pushall origin gh; do
-    if url="$(git config --get "remote.$r.url")"; then
-      case "$url" in
-        *github.com*Code-Barn/iyou_home*) echo "$r"; return 0 ;;
-      esac
-    fi
-  done
-  fail "no git remote points at github.com/Code-Barn/iyou_home (set RELEASE_REMOTE)"
-}
-REMOTE="${RELEASE_REMOTE:-$(pick_release_remote)}"
-REPO="Code-Barn/iyou_home"
-RELEASE_DIR=""
-mkdir -p "$ROOT/release-artifacts"
-
-# ---------------------------------------------------------------- version bump
-case "$BUMP_ARG" in
-  current|none|0|--current|--skip-bump)
-    log "Releasing currently committed version without bumping"
-    ;;
-  --package-only|--skip-build)
-    log "Package-only mode: no version bump and no rebuilds — staging existing bundles"
-    PACKAGE_ONLY=1
-    ;;
-  --sync-windows)
-    log "Windows synchronization mode: fetching fresh Windows binary from GitHub CI"
-    SYNC_WINDOWS_ONLY=1
-    ;;
-  --patch-idp)
-    log "IdP patch mode: updating SHA-256 table in iyou_idp _download_modal.html"
-    PATCH_IDP_ONLY=1
-    ;;
-  patch|minor|major|[0-9]*)
-    if [[ "${DRY_RUN:-0}" == "1" ]]; then
-      log "[DRY-RUN] Skipping version bump commit."
-    else
-      log "Bumping version ($BUMP_ARG)..."
-      [[ -z "$(git status --porcelain)" ]] || fail "git working tree is dirty; commit or stash before bumping version"
-
-      CURRENT_VERSION="$(node -p "require('./package.json').version")"
-      log "Current version: ${CURRENT_VERSION}"
-
-      # 1. Update package.json & package-lock.json
-      npm version "$BUMP_ARG" --no-git-tag-version >/dev/null
-      NEW_VERSION="$(node -p "require('./package.json').version")"
-      [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "non-SemVer version '$NEW_VERSION' produced by npm version"
-      log "New version: ${NEW_VERSION}"
-
-      # 2. Update src-tauri/tauri.conf.json
-      node -e '
-        const fs = require("fs");
-        const p = "src-tauri/tauri.conf.json";
-        const conf = JSON.parse(fs.readFileSync(p, "utf8"));
-        conf.version = process.argv[1];
-        fs.writeFileSync(p, JSON.stringify(conf, null, 4) + "\n");
-      ' "$NEW_VERSION"
-
-      # 3. Update src-tauri/Cargo.toml
-      node -e '
-        const fs = require("fs");
-        const p = "src-tauri/Cargo.toml";
-        let content = fs.readFileSync(p, "utf8");
-        content = content.replace(/(\[package\][\s\S]*?version\s*=\s*")[^"]+(")/, `$1${process.argv[1]}$2`);
-        fs.writeFileSync(p, content);
-      ' "$NEW_VERSION"
-
-      # 4. Update src-tauri/Cargo.lock
-      cargo check --manifest-path src-tauri/Cargo.toml --quiet
-
-      # 5. Commit the 5 manifests
-      git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-      git commit -m "chore(release): bump version to v${NEW_VERSION}"
-      log "Committed version bump to v${NEW_VERSION}"
-    fi
-    ;;
-  *)
-    fail "unrecognized bump argument '$BUMP_ARG' (expected: patch, minor, major, explicit X.Y.Z, current, or flag)"
-    ;;
-esac
-
-# ---------------------------------------------------------------- pre-flight
-log "Pre-flight checks"
-
-VERSION="$(node -p "require('./package.json').version")"
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "non-SemVer version '$VERSION' in package.json"
-log "Version: ${VERSION} (tag v${VERSION})"
-
-RELEASE_DIR="$ROOT/release-artifacts/iyou_home_${VERSION}"
-mkdir -p "$RELEASE_DIR"
-log "Release payload dir: ${RELEASE_DIR}"
-
-if [[ "${DRY_RUN:-0}" != "1" && "${PATCH_IDP_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
-  [[ -z "$(git status --porcelain)" ]] || fail "git working tree is dirty; commit or stash before releasing"
-fi
-git rev-parse --git-dir >/dev/null
-
-command -v gh >/dev/null || fail "gh CLI not found"
-gh auth status >/dev/null 2>&1 || fail "gh not authenticated"
-command -v node >/dev/null || fail "node not found"
-
-if [[ "${DRY_RUN:-0}" != "1" && "${PATCH_IDP_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
-  command -v cargo >/dev/null || fail "cargo not found"
-  if [[ "${SKIP_LINUX:-0}" != "1" && "${PACKAGE_ONLY:-0}" != "1" ]]; then
-    ssh -o BatchMode=yes -o ConnectTimeout=15 dc13 "true" || fail "ssh dc13 unreachable"
-  fi
-fi
-
-# If user invoked specifically with --patch-idp
-if [[ "${PATCH_IDP_ONLY:-0}" == "1" ]]; then
-  auto_patch_idp
-  log "IdP download modal patched successfully."
-  exit 0
-fi
-
-# If user invoked with --dry-run
-if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  log "DRY RUN MODE: Evaluating alignment, Windows status, checksums, and modal updates"
-  check_remote_windows_status
-  auto_patch_idp
-  print_release_summary
-  log "Dry run complete. No mutations performed."
-  exit 0
-fi
-
-# ---------------------------------------------------------------- stage
-log "Staging directory: ${RELEASE_DIR}"
-if [[ "${PACKAGE_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
-  rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt
-fi
-
-# ---------------------------------------------------------------- Mac build
-if [[ "${SKIP_MAC:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
-  if [[ "${PACKAGE_ONLY:-0}" == "1" ]]; then
-    log "Package-only: reusing existing macOS bundle (no rebuild)"
-    staged_dmg="$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
-    if [[ -f "$staged_dmg" ]]; then
-      log "macOS bundle already staged: ${staged_dmg##*/}"
-    else
-      dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name "iyou-home_${VERSION}_x64.dmg" -print -quit 2>/dev/null || true)"
-      [[ -n "$dmg" && -f "$dmg" ]] \
-        || fail "package-only: no existing iyou-home_${VERSION}_x64.dmg to stage"
-      mkdir -p "$RELEASE_DIR"
-      cp "$dmg" "$staged_dmg"
-      log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
-    fi
-  else
-    log "Building macOS bundle (local)"
-    npm run tauri build
-    dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null || true)"
-    [[ -n "$dmg" && -f "$dmg" ]] || fail "no .dmg produced under src-tauri/target/release/bundle/dmg/"
-    mkdir -p "$RELEASE_DIR"
-    cp "$dmg" "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
-    log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
-  fi
-else
-  log "Skipping macOS build"
-fi
-
-# ---------------------------------------------------------------- Linux build
-if [[ "${SKIP_LINUX:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
-  if [[ "${PACKAGE_ONLY:-0}" == "1" ]]; then
-    log "Package-only: skipping dc13 Linux build; keeping any previously staged .deb/.AppImage"
-  else
-    log "Building Linux bundles on dc13 (streaming repository, clean build)"
-
-    tar_flags=(--exclude='.git' --exclude='node_modules' --exclude='src-tauri/target' --exclude='dist')
-    if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
-      tar_flags+=(--no-xattrs)
-    fi
-
-    remote_cmd='set -euo pipefail; export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"; rm -rf ~/build-runner; mkdir -p ~/build-runner; tar -xzf - -C ~/build-runner; cd ~/build-runner; npm ci; npm run tauri build; ls -1 src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage'
-
-    tar "${tar_flags[@]}" -czf - -C "$ROOT" . | ssh -o BatchMode=yes dc13 "$remote_cmd"
-
-    mkdir -p "$RELEASE_DIR"
-    scp "dc13:~/build-runner/src-tauri/target/release/bundle/deb/"*.deb "$RELEASE_DIR/"
-    scp "dc13:~/build-runner/src-tauri/target/release/bundle/appimage/"*.AppImage "$RELEASE_DIR/"
-    scp "dc13:~/build-runner/src-tauri/target/release/bundle/rpm/"*.rpm "$RELEASE_DIR/" 2>/dev/null || true
-
-    log "Linux bundles staged: .deb, .AppImage (+ .rpm)"
-  fi
-else
-  log "Skipping dc13 Linux build"
-fi
-
-# ---------------------------------------------------------------- Initial tag & release
-# Windows CI requires the GitHub Release to exist so it can upload the .exe.
-# Ensure the tag and release exist on remote before dispatching/synchronizing Windows CI.
-if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
-  log "Checking remote release status for v${VERSION} on ${REPO} (remote '${REMOTE}')"
-  git push "$REMOTE" HEAD
-  if ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
-    git tag "v${VERSION}"
-    log "Created tag v${VERSION}"
-  fi
-  git push "$REMOTE" "refs/tags/v${VERSION}:refs/tags/v${VERSION}" || log "tag already present on remote"
-
-  notes="${RELEASE_NOTES:-Automated Sovereign Desktop Build}"
-  initial_assets=(
-    "$RELEASE_DIR/iyou-home_${VERSION}_amd64.deb"
-    "$RELEASE_DIR/iyou-home_${VERSION}_amd64.AppImage"
-    "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
-    "$RELEASE_DIR"/iyou-home-*.rpm
-  )
-  initial_args=()
-  for a in "${initial_assets[@]}"; do
-    [[ -f "$a" ]] && initial_args+=("$a")
-  done
-
-  if ! gh release view "v${VERSION}" --repo "$REPO" >/dev/null 2>&1; then
-    log "Creating initial release v${VERSION} with available macOS & Linux assets..."
-    gh release create "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --title "iyou_home v${VERSION}" --notes "$notes"
-  elif (( ${#initial_args[@]} > 0 )); then
-    gh release upload "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --clobber
-  fi
-fi
-
-# ---------------------------------------------------------------- Windows CI Sync
-# Synchronize with the GitHub Actions windows-latest runner and download the fresh .exe
-if [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
-  sync_windows_exe
-else
-  log "Skipping Windows CI synchronization (SKIP_WINDOWS=1)"
-fi
-
-# If specifically invoked with --sync-windows, finalize checksums and IdP update then exit
-if [[ "${SYNC_WINDOWS_ONLY:-0}" == "1" ]]; then
+# Generate master SHA256SUMS.txt from staged files in $RELEASE_DIR
+generate_checksums() {
+  log "Generating master SHA256SUMS.txt"
   (
     cd "$RELEASE_DIR"
     shopt -s nullglob
@@ -992,79 +646,24 @@ if [[ "${SYNC_WINDOWS_ONLY:-0}" == "1" ]]; then
     done
     if (( ${#hash_targets[@]} > 0 )); then
       ${HASH_TOOL} "${hash_targets[@]}" > SHA256SUMS.txt
+      log "SHA256SUMS.txt generated:"
+      cat "$RELEASE_DIR/SHA256SUMS.txt"
+    else
+      warn "No staged bundles found under ${RELEASE_DIR}."
     fi
   )
-  auto_patch_idp
-  print_release_summary
-  exit 0
-fi
+  compute_primary_hashes
+}
 
-# ---------------------------------------------------------------- payload check
-log "Validating release payload completeness"
-payload_missing=()
-if [[ "${SKIP_MAC:-0}" != "1" ]]; then
-  [[ -f "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg" ]] \
-    || payload_missing+=("macOS .dmg (iyou-home_${VERSION}_x64.dmg)")
-fi
-if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
-  [[ -n "$(find "$RELEASE_DIR" -maxdepth 1 -name "*.deb" 2>/dev/null | head -n1)" ]] \
-    || payload_missing+=("Linux .deb")
-  [[ -n "$(find "$RELEASE_DIR" -maxdepth 1 -name "*.AppImage" 2>/dev/null | head -n1)" ]] \
-    || payload_missing+=("Linux .AppImage")
-fi
-if [[ "${SKIP_WINDOWS:-0}" != "1" && "${NO_WAIT_WINDOWS:-0}" != "1" ]]; then
-  [[ -f "$RELEASE_DIR/iyou-home_${VERSION}_x64-setup.exe" ]] \
-    || payload_missing+=("Windows .exe (iyou-home_${VERSION}_x64-setup.exe)")
-fi
+# Generate BitTorrent metainfo (.torrent) and IPFS mirror manifests (MIRRORS.txt)
+generate_bittorrent_and_mirrors() {
+  log "Generating BitTorrent metainfo and IPFS mirror manifests"
+  TORRENT_FILE="iyou-home_${VERSION}.torrent"
+  TORRENT_PATH="$RELEASE_DIR/$TORRENT_FILE"
 
-if (( ${#payload_missing[@]} > 0 )); then
-  log "Expected platform bundles missing from ${RELEASE_DIR}:"
-  printf '  [MISSING] %s\n' "${payload_missing[@]}"
-  if [[ "${FORCE_PARTIAL_TORRENT:-0}" == "1" ]]; then
-    log "FORCE_PARTIAL_TORRENT=1 — continuing with a partial payload."
-  else
-    log "A partial torrent would silently omit these platforms from the release"
-    log "and from the magnet URI verified by iyou_idp (_download_modal.html)."
-    ans=""
-    read -r -p "Proceed and generate a PARTIAL payload torrent? [y/N] " ans </dev/tty || ans=""
-    if [[ ! "$ans" =~ ^[yY]$ ]]; then
-      fail "aborted: stage the missing bundles (or set FORCE_PARTIAL_TORRENT=1) and re-run"
-    fi
-  fi
-else
-  log "All expected platform bundles present in the payload."
-fi
-
-# ---------------------------------------------------------------- checksums
-log "Generating checksums"
-
-(
-  cd "$RELEASE_DIR"
-  shopt -s nullglob
-  staged_files=(iyou-home_* iyou-home-*)
-  hash_targets=()
-  for f in "${staged_files[@]}"; do
-    [[ "$f" == *.torrent || "$f" == *.txt ]] && continue
-    [[ -f "$f" ]] && hash_targets+=("$f")
-  done
-  if (( ${#hash_targets[@]} > 0 )); then
-    ${HASH_TOOL} "${hash_targets[@]}" > SHA256SUMS.txt
-    log "SHA256SUMS.txt:"
-    cat "$RELEASE_DIR/SHA256SUMS.txt"
-  else
-    log "No staged bundles found under ${RELEASE_DIR}."
-  fi
-)
-
-# ---------------------------------------------------------------- mirrors
-log "Generating BitTorrent metainfo and IPFS mirror manifests"
-
-TORRENT_FILE="iyou-home_${VERSION}.torrent"
-TORRENT_PATH="$RELEASE_DIR/$TORRENT_FILE"
-
-if [[ -n "$PYTHON_BIN" ]]; then
-  log "Generating BitTorrent metainfo using $PYTHON_BIN (bencode engine)..."
-  eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" << 'PYEOF'
+  if [[ -n "$PYTHON_BIN" ]]; then
+    log "Generating BitTorrent metainfo using $PYTHON_BIN (bencode engine)..."
+    eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" << 'PYEOF'
 import os
 import sys
 import hashlib
@@ -1175,50 +774,50 @@ print(f"BTIH={btih}")
 print(f"MAGNET_LINK='{magnet}'")
 PYEOF
 )"
-  log "BitTorrent Info Hash (BTIH): ${BTIH}"
-  log "Magnet URI: ${MAGNET_LINK}"
-else
-  warn "Python interpreter not found; skipping BitTorrent generation"
-  BTIH="[NOT_GENERATED]"
-  MAGNET_LINK="[NOT_GENERATED]"
-fi
-
-# IPFS Root CID & Gateways
-IPFS_ROOT_CID=""
-if command -v ipfs >/dev/null 2>&1; then
-  log "Computing deterministic IPFS root CID via local ipfs CLI..."
-  IPFS_ROOT_CID="$(ipfs add -r -Q --only-hash "$RELEASE_DIR" 2>/dev/null || true)"
-elif ssh -o BatchMode=yes -o ConnectTimeout=5 dc13 'export PATH="$PATH:/usr/local/bin"; which ipfs' >/dev/null 2>&1; then
-  log "Computing deterministic IPFS root CID via runner dc13..."
-  tar_flags=(--exclude='.DS_Store' --exclude='MIRRORS.txt')
-  if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
-    tar_flags+=(--no-xattrs)
+    log "BitTorrent Info Hash (BTIH): ${BTIH}"
+    log "Magnet URI: ${MAGNET_LINK}"
+  else
+    warn "Python interpreter not found; skipping BitTorrent generation"
+    BTIH="[NOT_GENERATED]"
+    MAGNET_LINK="[NOT_GENERATED]"
   fi
-  IPFS_ROOT_CID="$(tar "${tar_flags[@]}" -czf - -C "$RELEASE_DIR" . | ssh -o BatchMode=yes dc13 '
-    export PATH="$PATH:/usr/local/bin"
-    TMPDIR=$(mktemp -d)
-    tar -xzf - -C "$TMPDIR"
-    ipfs add -r -Q --only-hash "$TMPDIR" 2>/dev/null || true
-    rm -rf "$TMPDIR"
-  ')"
-fi
 
-if [[ -n "$IPFS_ROOT_CID" && "$IPFS_ROOT_CID" =~ ^Qm[1-9A-HJ-NP-Za-km-z]{44}|^bafy[a-z0-9]+ ]]; then
-  IPFS_GATEWAY_URL="https://ipfs.io/ipfs/${IPFS_ROOT_CID}/"
-  IPFS_ALT_GATEWAY_URL="https://dweb.link/ipfs/${IPFS_ROOT_CID}/"
-  IPFS_NATIVE_URI="ipfs://${IPFS_ROOT_CID}/"
-  log "IPFS Root CID: ${IPFS_ROOT_CID}"
-  log "IPFS Gateway URL: ${IPFS_GATEWAY_URL}"
-else
-  IPFS_ROOT_CID="[PENDING_CLUSTER_PIN]"
-  IPFS_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
-  IPFS_ALT_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
-  IPFS_NATIVE_URI="[PENDING_CLUSTER_PIN]"
-  log "IPFS CLI not available locally or on runner dc13; marked [PENDING_CLUSTER_PIN]"
-fi
+  # IPFS Root CID & Gateways
+  IPFS_ROOT_CID=""
+  if command -v ipfs >/dev/null 2>&1; then
+    log "Computing deterministic IPFS root CID via local ipfs CLI..."
+    IPFS_ROOT_CID="$(ipfs add -r -Q --only-hash "$RELEASE_DIR" 2>/dev/null || true)"
+  elif ssh -o BatchMode=yes -o ConnectTimeout=5 dc13 'export PATH="$PATH:/usr/local/bin"; which ipfs' >/dev/null 2>&1; then
+    log "Computing deterministic IPFS root CID via runner dc13..."
+    local tar_flags=(--exclude='.DS_Store' --exclude='MIRRORS.txt')
+    if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
+      tar_flags+=(--no-xattrs)
+    fi
+    IPFS_ROOT_CID="$(tar "${tar_flags[@]}" -czf - -C "$RELEASE_DIR" . | ssh -o BatchMode=yes dc13 '
+      export PATH="$PATH:/usr/local/bin"
+      TMPDIR=$(mktemp -d)
+      tar -xzf - -C "$TMPDIR"
+      ipfs add -r -Q --only-hash "$TMPDIR" 2>/dev/null || true
+      rm -rf "$TMPDIR"
+    ')"
+  fi
 
-# Assemble MIRRORS.txt
-cat << EOF > "$RELEASE_DIR/MIRRORS.txt"
+  if [[ -n "$IPFS_ROOT_CID" && "$IPFS_ROOT_CID" =~ ^Qm[1-9A-HJ-NP-Za-km-z]{44}|^bafy[a-z0-9]+ ]]; then
+    IPFS_GATEWAY_URL="https://ipfs.io/ipfs/${IPFS_ROOT_CID}/"
+    IPFS_ALT_GATEWAY_URL="https://dweb.link/ipfs/${IPFS_ROOT_CID}/"
+    IPFS_NATIVE_URI="ipfs://${IPFS_ROOT_CID}/"
+    log "IPFS Root CID: ${IPFS_ROOT_CID}"
+    log "IPFS Gateway URL: ${IPFS_GATEWAY_URL}"
+  else
+    IPFS_ROOT_CID="[PENDING_CLUSTER_PIN]"
+    IPFS_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
+    IPFS_ALT_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
+    IPFS_NATIVE_URI="[PENDING_CLUSTER_PIN]"
+    log "IPFS CLI not available locally or on runner dc13; marked [PENDING_CLUSTER_PIN]"
+  fi
+
+  # Assemble MIRRORS.txt
+  cat << EOF > "$RELEASE_DIR/MIRRORS.txt"
 RELEASE_VERSION=v${VERSION}
 MAGNET_LINK=${MAGNET_LINK}
 TORRENT_FILE=${TORRENT_FILE}
@@ -1228,58 +827,14 @@ IPFS_ALT_GATEWAY_URL=${IPFS_ALT_GATEWAY_URL}
 IPFS_NATIVE_URI=${IPFS_NATIVE_URI}
 EOF
 
-log "MIRRORS.txt:"
-cat "$RELEASE_DIR/MIRRORS.txt"
+  log "MIRRORS.txt:"
+  cat "$RELEASE_DIR/MIRRORS.txt"
+}
 
-# ---------------------------------------------------------------- seed box
-if [[ "${SKIP_SEED:-0}" != "1" ]]; then
-  SEED_SYNCED=0
-  if ! command -v rsync >/dev/null 2>&1; then
-    warn "rsync not found locally; skipping seed box sync"
-    SEED_STATUS="skipped (rsync unavailable locally)"
-  else
-    log "Syncing release payload to seed host (${SEED_HOST}:${SEED_DIR})..."
-    if rsync -avP "$RELEASE_DIR" "$SEED_HOST:$SEED_DIR/"; then
-      SEED_SYNCED=1
-      SEED_STATUS="active on ${SEED_HOST}:${SEED_DIR}/iyou_home_${VERSION}"
-      log "Payload synced to ${SEED_HOST}:${SEED_DIR}/iyou_home_${VERSION}"
-    else
-      warn "rsync to ${SEED_HOST} failed; continuing without seeding"
-      SEED_STATUS="failed (rsync to ${SEED_HOST} errored)"
-    fi
-  fi
-
-  if [[ "$SEED_SYNCED" == "1" ]]; then
-    log "Registering torrent with transmission-remote on ${SEED_HOST}..."
-    if ssh "$SEED_HOST" "
-      export PATH=\"/opt/bin:/usr/local/bin:\$PATH\"
-      TR_BIN=\$(command -v '${REMOTE_TRANSMISSION_REMOTE:-transmission-remote}' || echo '/opt/bin/transmission-remote')
-      if [ ! -x \"\$TR_BIN\" ]; then
-        echo \"[ERROR] transmission-remote not found on ${SEED_HOST}: \$TR_BIN is not executable\" >&2
-        exit 1
-      fi
-      ln -sf '$SEED_DIR/iyou_home_${VERSION}' '$SEED_DIR/iyou-home_${VERSION}' &&
-      ( \"\$TR_BIN\" -a '$SEED_DIR/iyou_home_${VERSION}/iyou-home_${VERSION}.torrent' -w '$SEED_DIR' ||
-        \"\$TR_BIN\" -a '$SEED_DIR/iyou_home_${VERSION}/iyou_home_${VERSION}.torrent' -w '$SEED_DIR' ) &&
-      \"\$TR_BIN\" -l
-    " 2>&1 | tail -n 16; then
-      log "Torrent registered on ${SEED_HOST}."
-    else
-      warn "Failed to auto-register with transmission-remote on ${SEED_HOST}"
-      SEED_STATUS="failed (transmission-remote registration errored on ${SEED_HOST})"
-    fi
-  fi
-else
-  log "Skipping seed box sync (SKIP_SEED=1)"
-  SEED_STATUS="skipped (SKIP_SEED=1)"
-fi
-
-# ---------------------------------------------------------------- publish & update
-if [[ "${SKIP_UPLOAD:-0}" == "1" ]]; then
-  log "SKIP_UPLOAD=1 — staged assets only; not tagging or uploading final assets."
-else
-  log "Uploading final verified assets to release v${VERSION} on ${REPO}"
-  final_assets=(
+# Upload final verified release assets to GitHub Release
+FINAL_RELEASE_ASSETS=()
+publish_release_assets() {
+  local final_candidates=(
     "$RELEASE_DIR/iyou-home_${VERSION}_amd64.deb"
     "$RELEASE_DIR/iyou-home_${VERSION}_amd64.AppImage"
     "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
@@ -1290,22 +845,718 @@ else
     "$RELEASE_DIR/iyou-home_${VERSION}.torrent"
     "$RELEASE_DIR/MIRRORS.txt"
   )
-  final_args=()
-  for a in "${final_assets[@]}"; do
-    [[ -f "$a" ]] && final_args+=("$a")
+  FINAL_RELEASE_ASSETS=()
+  for a in "${final_candidates[@]}"; do
+    [[ -f "$a" ]] && FINAL_RELEASE_ASSETS+=("$a")
   done
 
-  gh release upload "v${VERSION}" "${final_args[@]}" --repo "$REPO" --clobber
+  if [[ "${SKIP_UPLOAD:-0}" == "1" ]]; then
+    log "SKIP_UPLOAD=1 — staged assets only; not tagging or uploading final assets."
+    return 0
+  fi
+  log "Uploading final verified assets to release v${VERSION} on ${REPO}"
+  gh release upload "v${VERSION}" "${FINAL_RELEASE_ASSETS[@]}" --repo "$REPO" --clobber
+}
+
+# Automate BitTorrent seeding on QNAP NAS
+seed_qnap_torrent() {
+  log "Automating BitTorrent seeding on QNAP NAS (${SEED_HOST})"
+
+  if [[ "${SKIP_SEED:-0}" == "1" ]]; then
+    log "Skipping QNAP torrent seeding (SKIP_SEED=1 / --no-seed)."
+    SEED_STATUS="skipped (SKIP_SEED=1)"
+    return 0
+  fi
+
+  # Check SSH connectivity to QNAP in batch mode with short timeout
+  if ! ssh -q -o ConnectTimeout=3 -o BatchMode=yes "$SEED_HOST" exit 2>/dev/null; then
+    warn "Cannot connect via SSH to '$SEED_HOST' (BatchMode failed or host unreachable)."
+    warn "Skipping QNAP seeding. To debug: ssh $SEED_HOST"
+    SEED_STATUS="skipped (SSH to $SEED_HOST unreachable)"
+    return 0
+  fi
+
+  log "Connected to $SEED_HOST via SSH. Detecting active torrent client and directories..."
+
+  # Run remote client detection on QNAP
+  local detect_script='
+export PATH="/opt/bin:/opt/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+OVERRIDE_DATA="'"${QNAP_TORRENT_DATA_DIR:-}"'"
+OVERRIDE_WATCH="'"${QNAP_TORRENT_WATCH_DIR:-}"'"
+
+ENGINE=""
+DATA_DIR=""
+WATCH_DIR=""
+TR_REMOTE=""
+QBT_CLI=""
+
+# 1. Inspect Transmission Daemon
+if ps | grep -v grep | grep -q "transmission-daemon"; then
+  ENGINE="transmission"
+  TR_REMOTE=$(command -v transmission-remote 2>/dev/null || echo "/opt/bin/transmission-remote")
+  ps_cmd=$(ps | grep -v grep | grep "transmission-daemon" | head -n1)
+  if echo "$ps_cmd" | grep -q -- "-w "; then
+    DATA_DIR=$(echo "$ps_cmd" | sed -n "s/.*-w \([^ ]*\).*/\1/p")
+  fi
+  if echo "$ps_cmd" | grep -q -- "-c "; then
+    WATCH_DIR=$(echo "$ps_cmd" | sed -n "s/.*-c \([^ ]*\).*/\1/p")
+  fi
+  if [ -z "$DATA_DIR" ] && [ -x "$TR_REMOTE" ]; then
+    DATA_DIR=$("$TR_REMOTE" -si 2>/dev/null | grep -i "Download directory:" | awk -F": " "{print \$2}" | xargs)
+  fi
+  if [ -z "$WATCH_DIR" ] && [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR/watch" ]; then
+    WATCH_DIR="$DATA_DIR/watch"
+  fi
 fi
+
+# 2. Inspect qBittorrent
+if [ -z "$ENGINE" ] && ps | grep -v grep | grep -q "qbittorrent"; then
+  ENGINE="qbittorrent"
+  QBT_CLI=$(command -v qbittorrent-cli 2>/dev/null || true)
+  for q_data in "/share/Download/qbittorrent" "/share/CACHEDEV1_DATA/Download/qbittorrent"; do
+    if [ -d "$q_data" ]; then DATA_DIR="$q_data"; break; fi
+  done
+  for q_watch in "/share/Download/watch" "/share/Download/qbittorrent/watch"; do
+    if [ -d "$q_watch" ]; then WATCH_DIR="$q_watch"; break; fi
+  done
+fi
+
+# 3. Inspect rTorrent
+if [ -z "$ENGINE" ] && ps | grep -v grep | grep -q "rtorrent"; then
+  ENGINE="rtorrent"
+  for r_data in "/share/Download/rtorrent" "/share/Download"; do
+    if [ -d "$r_data" ]; then DATA_DIR="$r_data"; break; fi
+  done
+  for r_watch in "/share/Download/rtorrent/watch" "/share/Download/watch"; do
+    if [ -d "$r_watch" ]; then WATCH_DIR="$r_watch"; break; fi
+  done
+fi
+
+# 4. Inspect Download Station
+if [ -z "$ENGINE" ]; then
+  if [ -d "/share/Download" ] || [ -d "/share/CACHEDEV1_DATA/Download" ]; then
+    ENGINE="download_station"
+    DATA_DIR="/share/Download"
+    if [ -d "/share/Download/watch" ]; then
+      WATCH_DIR="/share/Download/watch"
+    else
+      WATCH_DIR="/share/Download"
+    fi
+  fi
+fi
+
+# 5. Fallback standard paths
+if [ -z "$DATA_DIR" ]; then
+  for d in "/share/homes/iyou/releases" "/share/Download" "/share/Public" "releases"; do
+    if [ -d "$d" ]; then DATA_DIR="$d"; break; fi
+  done
+fi
+if [ -z "$DATA_DIR" ]; then
+  DATA_DIR="releases"
+fi
+
+if [ -z "$WATCH_DIR" ] && [ -d "$DATA_DIR/watch" ]; then
+  WATCH_DIR="$DATA_DIR/watch"
+fi
+if [ -z "$WATCH_DIR" ]; then
+  WATCH_DIR="$DATA_DIR"
+fi
+
+[ -n "$OVERRIDE_DATA" ] && DATA_DIR="$OVERRIDE_DATA"
+[ -n "$OVERRIDE_WATCH" ] && WATCH_DIR="$OVERRIDE_WATCH"
+
+echo "ENGINE=$ENGINE"
+echo "DATA_DIR=$DATA_DIR"
+echo "WATCH_DIR=$WATCH_DIR"
+echo "TR_REMOTE=$TR_REMOTE"
+'
+
+  local detect_output
+  detect_output="$(ssh "$SEED_HOST" "sh -s" <<< "$detect_script")"
+
+  local remote_engine="" remote_data_dir="" remote_watch_dir="" remote_tr_remote=""
+  while IFS='=' read -r k v; do
+    case "$k" in
+      ENGINE) remote_engine="$v" ;;
+      DATA_DIR) remote_data_dir="$v" ;;
+      WATCH_DIR) remote_watch_dir="$v" ;;
+      TR_REMOTE) remote_tr_remote="$v" ;;
+    esac
+  done <<< "$detect_output"
+
+  log "QNAP Torrent Client Resolution:"
+  printf '  Target Host       : %s\n' "$SEED_HOST"
+  printf '  Engine            : %s\n' "${remote_engine:-generic / watch-folder}"
+  printf '  Data Directory    : %s\n' "$remote_data_dir"
+  printf '  Watch Directory   : %s\n' "$remote_watch_dir"
+  [[ -n "$remote_tr_remote" ]] && printf '  Client CLI        : %s\n' "$remote_tr_remote"
+
+  local target_payload_dir="$remote_data_dir/iyou_home_${VERSION}"
+  local target_symlink_dir="$remote_data_dir/iyou-home_${VERSION}"
+
+  ssh "$SEED_HOST" "mkdir -p '$target_payload_dir' '$remote_watch_dir'"
+
+  local payload_human="" payload_bytes=""
+  if command -v du >/dev/null 2>&1; then
+    payload_human="$(du -sh "$RELEASE_DIR" 2>/dev/null | awk '{print $1}' || echo "unknown")"
+  fi
+  if [[ -d "$RELEASE_DIR" ]]; then
+    payload_bytes="$(find "$RELEASE_DIR" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1} END {print s}' || true)"
+  fi
+
+  log "Syncing release payload to ${SEED_HOST}:${target_payload_dir} (Payload size: ${payload_human:-~116MB})..."
+
+  local sync_success=0
+  if command -v rsync >/dev/null 2>&1; then
+    if rsync -avP --delete "$RELEASE_DIR/" "$SEED_HOST:$target_payload_dir/"; then
+      sync_success=1
+    else
+      warn "rsync failed, falling back to scp..."
+    fi
+  fi
+
+  if [[ "$sync_success" != "1" ]]; then
+    if scp -r "$RELEASE_DIR/"* "$SEED_HOST:$target_payload_dir/"; then
+      sync_success=1
+    else
+      warn "Failed to transfer payload to $SEED_HOST:$target_payload_dir"
+      SEED_STATUS="failed (transfer failed to $SEED_HOST)"
+      return 0
+    fi
+  fi
+
+  # Ensure symlink iyou-home_${VERSION} -> iyou_home_${VERSION} for torrent client match
+  ssh "$SEED_HOST" "ln -sfn '$target_payload_dir' '$target_symlink_dir'"
+  log "[OK] Verified data symlink: ${target_symlink_dir} -> ${target_payload_dir}"
+
+  # Stage .torrent into watch directory if distinct
+  if [[ "$remote_watch_dir" != "$target_payload_dir" && "$remote_watch_dir" != "$remote_data_dir" ]]; then
+    ssh "$SEED_HOST" "cp '$target_payload_dir/iyou-home_${VERSION}.torrent' '$remote_watch_dir/' 2>/dev/null || true"
+    log "[OK] Staged .torrent into watch directory: $remote_watch_dir/iyou-home_${VERSION}.torrent"
+  fi
+
+  # Activate and verify seeding
+  local seed_active=0
+  if [[ "$remote_engine" == "transmission" || -n "$remote_tr_remote" ]]; then
+    local tr_bin="${remote_tr_remote:-/opt/bin/transmission-remote}"
+    log "Registering and verifying torrent in Transmission via ${tr_bin}..."
+
+    local activation_output
+    activation_output="$(ssh "$SEED_HOST" "sh -s -- '$tr_bin' '$remote_data_dir' '$target_payload_dir' '$target_payload_dir/iyou-home_${VERSION}.torrent' '$VERSION' '${BTIH:-}'" << 'EOF'
+export PATH="/opt/bin:/opt/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+TR_BIN="$1"
+DATA_DIR="$2"
+PAYLOAD_DIR="$3"
+TORRENT_FILE="$4"
+VERSION="$5"
+EXPECTED_BTIH="$6"
+
+# 1. Clean up obsolete torrents matching this version with mismatched hash
+existing_ids=$("$TR_BIN" 9091 -l 2>/dev/null | grep -E "iyou[-_]home_${VERSION}" | awk '{print $1}' || true)
+for tid in $existing_ids; do
+  t_hash=$("$TR_BIN" 9091 -t "$tid" -i 2>/dev/null | grep -i "^  Hash:" | awk '{print $2}')
+  if [ -n "$EXPECTED_BTIH" ] && [ "$t_hash" != "$EXPECTED_BTIH" ]; then
+    echo "  [CLEANUP] Removing obsolete torrent ID $tid (hash $t_hash != $EXPECTED_BTIH)"
+    "$TR_BIN" 9091 -t "$tid" -r >/dev/null 2>&1 || true
+  fi
+done
+
+# 2. Add torrent with target download directory
+"$TR_BIN" 9091 -a "$TORRENT_FILE" -w "$DATA_DIR" 2>&1
+
+# 3. Locate active torrent ID and request piece verification
+active_id=$("$TR_BIN" 9091 -l 2>/dev/null | grep -E "iyou[-_]home_${VERSION}" | awk '{print $1}' | tail -n1)
+if [ -n "$active_id" ]; then
+  "$TR_BIN" 9091 -t "$active_id" --verify >/dev/null 2>&1 || true
+  sleep 2
+  "$TR_BIN" 9091 -t "$active_id" --start >/dev/null 2>&1 || true
+  "$TR_BIN" 9091 -t "$active_id" -i
+else
+  echo "[WARN] Could not find registered torrent ID for iyou-home_${VERSION}"
+fi
+EOF
+)"
+    printf '%s\n' "$activation_output"
+
+    if echo "$activation_output" | grep -q -E "Percent Done: 100%|Have:.*verified|State: Seeding|State: Idle"; then
+      seed_active=1
+      SEED_STATUS="seeding on ${SEED_HOST} (${remote_engine}, 100% verified)"
+      log "[OK] Transmission verified payload pieces at 100% and is actively seeding."
+    else
+      SEED_STATUS="registered on ${SEED_HOST} (${remote_engine})"
+    fi
+  else
+    log "Torrent staged in watch directory: $remote_watch_dir"
+    SEED_STATUS="queued in watch directory (${remote_watch_dir})"
+    seed_active=1
+  fi
+
+  log "QNAP Seeding Summary:"
+  printf '  Host          : %s\n' "$SEED_HOST"
+  printf '  Engine        : %s\n' "${remote_engine:-watch directory}"
+  printf '  Data Folder   : %s\n' "$target_payload_dir"
+  printf '  Watch Folder  : %s\n' "$remote_watch_dir"
+  printf '  Payload Size  : %s (%s bytes)\n' "${payload_human:-unknown}" "${payload_bytes:-unknown}"
+  printf '  Torrent File  : %s\n' "$target_payload_dir/iyou-home_${VERSION}.torrent"
+  printf '  BTIH          : %s\n' "${BTIH:-unknown}"
+  printf '  Seeder Status : %s\n' "$SEED_STATUS"
+}
+
+# Print summary
+print_release_summary() {
+  if [[ -z "${TORRENT_FILE:-}" || -z "${RELEASE_DIR:-}" ]]; then
+    return 0
+  fi
+  log "Release payload ready — ${RELEASE_DIR}"
+  printf '\n═══════════════════════════════════════════════════════════════════\n'
+  printf '  Release folder : %s\n'                 "$RELEASE_DIR"
+  printf '  Torrent file   : %s\n'                 "$RELEASE_DIR/$TORRENT_FILE"
+  printf '  Magnet URI     : %s\n'                 "${MAGNET_LINK:-[NOT_GENERATED]}"
+  printf '  Verify against : iyou_idp _download_modal.html\n'
+  printf '  Seed host      : %s:%s (remote payload %s/iyou_home_%s)\n' \
+         "${SEED_HOST:-qnap}" "${SEED_DIR:-releases}" "${SEED_DIR:-releases}" "${VERSION:-}"
+  printf '  Seeder status  : %s\n'                    "${SEED_STATUS:-not attempted}"
+  printf '\n  SHA-256 Verification Table (matches iyou_idp modal):\n'
+  printf '    Windows (.exe) : %s\n' "${PRIMARY_WIN_SHA:-[NOT_RESOLVED]}"
+  printf '    macOS (.dmg)    : %s\n' "${PRIMARY_MAC_SHA:-[NOT_RESOLVED]}"
+  printf '    Debian (.deb)   : %s\n' "${PRIMARY_DEB_SHA:-[NOT_RESOLVED]}"
+  printf '    AppImage        : %s\n' "${PRIMARY_APP_SHA:-[NOT_RESOLVED]}"
+  printf '\n  Seed immediately on this machine:\n'
+  printf '    transmission-cli "%s/%s" -w "%s" &\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
+  printf '    # or: transmission-remote -a "%s/%s" -w "%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
+  printf '    # or: aria2c --follow-torrent=mem "%s/%s" --dir="%s"\n' "$RELEASE_DIR" "$TORRENT_FILE" "$RELEASE_DIR"
+  printf '\n  Mirror manifest (magnet + IPFS URIs, matches the release notes):\n'
+  printf '    cat "%s/MIRRORS.txt"\n'              "$RELEASE_DIR"
+  printf '═══════════════════════════════════════════════════════════════════\n'
+}
+
+# ---------------------------------------------------------------- configuration
+SEED_HOST="${SEED_HOST:-qnap}"
+SEED_DIR="${SEED_DIR:-releases}"
+QNAP_TORRENT_DATA_DIR="${QNAP_TORRENT_DATA_DIR:-}"
+QNAP_TORRENT_WATCH_DIR="${QNAP_TORRENT_WATCH_DIR:-}"
+SKIP_SEED="${SKIP_SEED:-0}"
+REMOTE_TRANSMISSION_REMOTE="${REMOTE_TRANSMISSION_REMOTE:-transmission-remote}"
+DRY_RUN="${DRY_RUN:-0}"
+NO_WAIT_WINDOWS="${NO_WAIT_WINDOWS:-0}"
+SYNC_WINDOWS_ONLY="${SYNC_WINDOWS:-0}"
+PATCH_IDP_ONLY="${PATCH_IDP:-0}"
+SEED_QNAP_ONLY="${SEED_QNAP:-0}"
+IDP_PATH="${IDP_PATH:-}"
+
+# Parse auxiliary flags
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--idp-path" ]]; then
+    IDP_PATH="$arg"
+    prev=""
+    continue
+  fi
+  case "$arg" in
+    --no-seed|--skip-seed) SKIP_SEED=1 ;;
+    --seed-qnap|--seed) SEED_QNAP_ONLY=1 ;;
+    --dry-run) DRY_RUN=1; SKIP_UPLOAD=1; SKIP_SEED=1 ;;
+    --no-wait-windows) NO_WAIT_WINDOWS=1 ;;
+    --sync-windows) SYNC_WINDOWS_ONLY=1 ;;
+    --patch-idp) PATCH_IDP_ONLY=1 ;;
+    --package-only|--skip-build) PACKAGE_ONLY=1 ;;
+    --skip-mac) SKIP_MAC=1 ;;
+    --skip-linux) SKIP_LINUX=1 ;;
+    --skip-windows) SKIP_WINDOWS=1 ;;
+    --skip-upload) SKIP_UPLOAD=1 ;;
+    --idp-path) prev="--idp-path" ;;
+    --idp-path=*) IDP_PATH="${arg#*=}" ;;
+  esac
+done
+
+# Resolve first positional argument that is not an auxiliary flag
+BUMP_ARG="${BUMP:-patch}"
+if [[ "${SYNC_WINDOWS_ONLY:-0}" == "1" || "${PATCH_IDP_ONLY:-0}" == "1" || "${SEED_QNAP_ONLY:-0}" == "1" || "${DRY_RUN:-0}" == "1" ]]; then
+  BUMP_ARG="${BUMP:-current}"
+fi
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--idp-path" ]]; then
+    prev=""
+    continue
+  fi
+  case "$arg" in
+    --no-seed|--skip-seed|--seed-qnap|--seed|--dry-run|--no-wait-windows|--sync-windows|--patch-idp|--package-only|--skip-build|--skip-bump|--skip-mac|--skip-linux|--skip-windows|--skip-upload)
+      continue
+      ;;
+    --idp-path)
+      prev="--idp-path"
+      continue
+      ;;
+    --idp-path=*)
+      continue
+      ;;
+  esac
+  BUMP_ARG="$arg"
+  break
+done
+
+if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
+  echo "iyou_home — One-Click Sovereign Release Pipeline"
+  echo ""
+  echo "Usage: $0 [patch|minor|major|<version>|current|--current|--package-only] [options]"
+  echo ""
+  echo "Arguments:"
+  echo "  patch          Bump patch version (default, e.g. 0.2.0 -> 0.2.1)"
+  echo "  minor          Bump minor version (e.g. 0.2.0 -> 0.3.0)"
+  echo "  major          Bump major version (e.g. 0.2.0 -> 1.0.0)"
+  echo "  X.Y.Z          Bump to explicit SemVer version"
+  echo "  current        Build & publish current version without bumping (alias: none)"
+  echo "  --current      Alias for: current (no version bump)"
+  echo "  --package-only No bump, no rebuilds; stage already-built bundles only"
+  echo ""
+  echo "Options:"
+  echo "  --dry-run      Evaluate tag/commit alignment and preview modal updates without mutations"
+  echo "  --sync-windows Download & verify Windows binary from GitHub CI, regenerate checksums/torrent, upload, and seed"
+  echo "  --seed-qnap    Seed release payload to QNAP NAS via SSH"
+  echo "  --patch-idp    Compute SHA-256 sums and patch iyou_idp download modal directly"
+  echo "  --no-wait-windows  Dispatch Windows build without blocking on completion"
+  echo "  --no-seed      Skip rsync to the seed box and transmission registration"
+  echo "  --idp-path DIR Explicit path to iyou_idp repository"
+  echo ""
+  echo "Environment variables:"
+  echo "  BUMP          Alternative to positional argument"
+  echo "  SKIP_MAC=1    Skip local macOS build"
+  echo "  SKIP_LINUX=1  Skip remote dc13 Linux build"
+  echo "  SKIP_WINDOWS=1 Skip Windows NSIS GitHub Actions build dispatch / sync"
+  echo "  SKIP_UPLOAD=1 Stage and checksum only (no tag, no push, no publish)"
+  echo "  DRY_RUN=1     Dry-run mode (no remote modifications, no file overwrites)"
+  echo "  NO_WAIT_WINDOWS=1 Asynchronous Windows CI dispatch"
+  echo "  IDP_PATH=DIR  Custom directory path to iyou_idp"
+  echo "  WINDOWS_EXE=path   Stage this Windows NSIS .exe into the payload"
+  echo "  SEED_HOST=target   SSH alias/host of seed box (default: qnap)"
+  echo "  SEED_DIR=dir       Target directory holding release payloads (default: releases)"
+  echo "  QNAP_TORRENT_DATA_DIR=dir  Override payload data directory on QNAP"
+  echo "  QNAP_TORRENT_WATCH_DIR=dir Override .torrent watch directory on QNAP"
+  echo "  SKIP_SEED=1   Skip seeding entirely"
+  exit 0
+fi
+
+# Remote resolution
+pick_release_remote() {
+  for r in pushall origin gh; do
+    if url="$(git config --get "remote.$r.url")"; then
+      case "$url" in
+        *github.com*Code-Barn/iyou_home*) echo "$r"; return 0 ;;
+      esac
+    fi
+  done
+  fail "no git remote points at github.com/Code-Barn/iyou_home (set RELEASE_REMOTE)"
+}
+REMOTE="${RELEASE_REMOTE:-$(pick_release_remote)}"
+REPO="Code-Barn/iyou_home"
+RELEASE_DIR=""
+mkdir -p "$ROOT/release-artifacts"
+
+# ---------------------------------------------------------------- version bump
+case "$BUMP_ARG" in
+  current|none|0|--current|--skip-bump)
+    log "Releasing currently committed version without bumping"
+    ;;
+  --package-only|--skip-build)
+    log "Package-only mode: no version bump and no rebuilds — staging existing bundles"
+    PACKAGE_ONLY=1
+    ;;
+  --sync-windows)
+    log "Windows synchronization mode: fetching fresh Windows binary from GitHub CI"
+    SYNC_WINDOWS_ONLY=1
+    ;;
+  --patch-idp)
+    log "IdP patch mode: updating SHA-256 table in iyou_idp _download_modal.html"
+    PATCH_IDP_ONLY=1
+    ;;
+  patch|minor|major|[0-9]*)
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+      log "[DRY-RUN] Skipping version bump commit."
+    else
+      log "Bumping version ($BUMP_ARG)..."
+      [[ -z "$(git status --porcelain)" ]] || fail "git working tree is dirty; commit or stash before bumping version"
+
+      CURRENT_VERSION="$(node -p "require('./package.json').version")"
+      log "Current version: ${CURRENT_VERSION}"
+
+      # 1. Update package.json & package-lock.json
+      npm version "$BUMP_ARG" --no-git-tag-version >/dev/null
+      NEW_VERSION="$(node -p "require('./package.json').version")"
+      [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "non-SemVer version '$NEW_VERSION' produced by npm version"
+      log "New version: ${NEW_VERSION}"
+
+      # 2. Update src-tauri/tauri.conf.json
+      node -e '
+        const fs = require("fs");
+        const p = "src-tauri/tauri.conf.json";
+        const conf = JSON.parse(fs.readFileSync(p, "utf8"));
+        conf.version = process.argv[1];
+        fs.writeFileSync(p, JSON.stringify(conf, null, 4) + "\n");
+      ' "$NEW_VERSION"
+
+      # 3. Update src-tauri/Cargo.toml
+      node -e '
+        const fs = require("fs");
+        const p = "src-tauri/Cargo.toml";
+        let content = fs.readFileSync(p, "utf8");
+        content = content.replace(/(\[package\][\s\S]*?version\s*=\s*")[^"]+(")/, `$1${process.argv[1]}$2`);
+        fs.writeFileSync(p, content);
+      ' "$NEW_VERSION"
+
+      # 4. Update src-tauri/Cargo.lock
+      cargo check --manifest-path src-tauri/Cargo.toml --quiet
+
+      # 5. Commit the 5 manifests
+      git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+      git commit -m "chore(release): bump version to v${NEW_VERSION}"
+      log "Committed version bump to v${NEW_VERSION}"
+    fi
+    ;;
+  *)
+    fail "unrecognized bump argument '$BUMP_ARG' (expected: patch, minor, major, explicit X.Y.Z, current, or flag)"
+    ;;
+esac
+
+# ---------------------------------------------------------------- pre-flight
+log "Pre-flight checks"
+
+VERSION="$(node -p "require('./package.json').version")"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "non-SemVer version '$VERSION' in package.json"
+log "Version: ${VERSION} (tag v${VERSION})"
+
+RELEASE_DIR="$ROOT/release-artifacts/iyou_home_${VERSION}"
+mkdir -p "$RELEASE_DIR"
+log "Release payload dir: ${RELEASE_DIR}"
+
+if [[ "${DRY_RUN:-0}" != "1" && "${PATCH_IDP_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" && "${SEED_QNAP_ONLY:-0}" != "1" ]]; then
+  [[ -z "$(git status --porcelain)" ]] || fail "git working tree is dirty; commit or stash before releasing"
+fi
+git rev-parse --git-dir >/dev/null
+
+command -v gh >/dev/null || fail "gh CLI not found"
+gh auth status >/dev/null 2>&1 || fail "gh not authenticated"
+command -v node >/dev/null || fail "node not found"
+
+if [[ "${DRY_RUN:-0}" != "1" && "${PATCH_IDP_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" && "${SEED_QNAP_ONLY:-0}" != "1" ]]; then
+  command -v cargo >/dev/null || fail "cargo not found"
+  if [[ "${SKIP_LINUX:-0}" != "1" && "${PACKAGE_ONLY:-0}" != "1" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=15 dc13 "true" || fail "ssh dc13 unreachable"
+  fi
+fi
+
+# If user invoked specifically with --patch-idp
+if [[ "${PATCH_IDP_ONLY:-0}" == "1" ]]; then
+  auto_patch_idp
+  log "IdP download modal patched successfully."
+  exit 0
+fi
+
+# If user invoked specifically with --seed-qnap
+if [[ "${SEED_QNAP_ONLY:-0}" == "1" ]]; then
+  log "QNAP Seeding Mode: Validating release payload and seeding to QNAP"
+  generate_checksums
+  generate_bittorrent_and_mirrors
+  seed_qnap_torrent
+  print_release_summary
+  exit 0
+fi
+
+# If user invoked with --dry-run
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  log "DRY RUN MODE: Evaluating alignment, Windows status, checksums, and modal updates"
+  check_remote_windows_status
+  auto_patch_idp
+  if ssh -q -o ConnectTimeout=3 -o BatchMode=yes "$SEED_HOST" exit 2>/dev/null; then
+    log "[DRY-RUN] SSH to $SEED_HOST succeeded. QNAP seeding would be active."
+  else
+    warn "[DRY-RUN] SSH to $SEED_HOST unreachable in BatchMode."
+  fi
+  print_release_summary
+  log "Dry run complete. No mutations performed."
+  exit 0
+fi
+
+# ---------------------------------------------------------------- stage
+log "Staging directory: ${RELEASE_DIR}"
+if [[ "${PACKAGE_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
+  rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt
+fi
+
+# ---------------------------------------------------------------- Mac build
+if [[ "${SKIP_MAC:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
+  if [[ "${PACKAGE_ONLY:-0}" == "1" ]]; then
+    log "Package-only: reusing existing macOS bundle (no rebuild)"
+    staged_dmg="$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
+    if [[ -f "$staged_dmg" ]]; then
+      log "macOS bundle already staged: ${staged_dmg##*/}"
+    else
+      dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name "iyou-home_${VERSION}_x64.dmg" -print -quit 2>/dev/null || true)"
+      [[ -n "$dmg" && -f "$dmg" ]] \
+        || fail "package-only: no existing iyou-home_${VERSION}_x64.dmg to stage"
+      mkdir -p "$RELEASE_DIR"
+      cp "$dmg" "$staged_dmg"
+      log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
+    fi
+  else
+    log "Building macOS bundle (local)"
+    npm run tauri build
+    dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null || true)"
+    [[ -n "$dmg" && -f "$dmg" ]] || fail "no .dmg produced under src-tauri/target/release/bundle/dmg/"
+    mkdir -p "$RELEASE_DIR"
+    cp "$dmg" "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
+    log "macOS bundle staged: iyou-home_${VERSION}_x64.dmg"
+  fi
+else
+  log "Skipping macOS build"
+fi
+
+# ---------------------------------------------------------------- Linux build
+if [[ "${SKIP_LINUX:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
+  if [[ "${PACKAGE_ONLY:-0}" == "1" ]]; then
+    log "Package-only: skipping dc13 Linux build; keeping any previously staged .deb/.AppImage"
+  else
+    log "Building Linux bundles on dc13 (streaming repository, clean build)"
+
+    tar_flags=(--exclude='.git' --exclude='node_modules' --exclude='src-tauri/target' --exclude='dist')
+    if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
+      tar_flags+=(--no-xattrs)
+    fi
+
+    remote_cmd='set -euo pipefail; export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"; rm -rf ~/build-runner; mkdir -p ~/build-runner; tar -xzf - -C ~/build-runner; cd ~/build-runner; npm ci; npm run tauri build; ls -1 src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage'
+
+    tar "${tar_flags[@]}" -czf - -C "$ROOT" . | ssh -o BatchMode=yes dc13 "$remote_cmd"
+
+    mkdir -p "$RELEASE_DIR"
+    scp "dc13:~/build-runner/src-tauri/target/release/bundle/deb/"*.deb "$RELEASE_DIR/"
+    scp "dc13:~/build-runner/src-tauri/target/release/bundle/appimage/"*.AppImage "$RELEASE_DIR/"
+    scp "dc13:~/build-runner/src-tauri/target/release/bundle/rpm/"*.rpm "$RELEASE_DIR/" 2>/dev/null || true
+
+    log "Linux bundles staged: .deb, .AppImage (+ .rpm)"
+  fi
+else
+  log "Skipping dc13 Linux build"
+fi
+
+# ---------------------------------------------------------------- Initial tag & release
+# Windows CI requires the GitHub Release to exist so it can upload the .exe.
+# Ensure the tag and release exist on remote before dispatching/synchronizing Windows CI.
+if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
+  log "Checking remote release status for v${VERSION} on ${REPO} (remote '${REMOTE}')"
+  git push "$REMOTE" HEAD
+  if ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+    git tag "v${VERSION}"
+    log "Created tag v${VERSION}"
+  fi
+  git push "$REMOTE" "refs/tags/v${VERSION}:refs/tags/v${VERSION}" || log "tag already present on remote"
+
+  notes="${RELEASE_NOTES:-Automated Sovereign Desktop Build}"
+  initial_assets=(
+    "$RELEASE_DIR/iyou-home_${VERSION}_amd64.deb"
+    "$RELEASE_DIR/iyou-home_${VERSION}_amd64.AppImage"
+    "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg"
+    "$RELEASE_DIR"/iyou-home-*.rpm
+  )
+  initial_args=()
+  for a in "${initial_assets[@]}"; do
+    [[ -f "$a" ]] && initial_args+=("$a")
+  done
+
+  if ! gh release view "v${VERSION}" --repo "$REPO" >/dev/null 2>&1; then
+    log "Creating initial release v${VERSION} with available macOS & Linux assets..."
+    gh release create "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --title "iyou_home v${VERSION}" --notes "$notes"
+  elif (( ${#initial_args[@]} > 0 )); then
+    gh release upload "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --clobber
+  fi
+fi
+
+# ---------------------------------------------------------------- Windows CI Sync
+# Synchronize with the GitHub Actions windows-latest runner and download the fresh .exe
+if [[ "${SKIP_WINDOWS:-0}" != "1" ]]; then
+  sync_windows_exe
+else
+  log "Skipping Windows CI synchronization (SKIP_WINDOWS=1)"
+fi
+
+# If specifically invoked with --sync-windows, finalize checksums, torrent, mirrors, QNAP seed, and upload then exit
+if [[ "${SYNC_WINDOWS_ONLY:-0}" == "1" ]]; then
+  log "Windows synchronization complete. Updating master checksums, torrent, mirrors, QNAP seed, and GitHub release..."
+  generate_checksums
+  generate_bittorrent_and_mirrors
+  if [[ "${SKIP_SEED:-0}" != "1" ]]; then
+    seed_qnap_torrent
+  fi
+  if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
+    publish_release_assets
+  fi
+  auto_patch_idp
+  print_release_summary
+  log "Windows synchronization and downstream release assets updated successfully."
+  exit 0
+fi
+
+# ---------------------------------------------------------------- payload check
+log "Validating release payload completeness"
+payload_missing=()
+if [[ "${SKIP_MAC:-0}" != "1" ]]; then
+  [[ -f "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg" ]] \
+    || payload_missing+=("macOS .dmg (iyou-home_${VERSION}_x64.dmg)")
+fi
+if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
+  [[ -n "$(find "$RELEASE_DIR" -maxdepth 1 -name "*.deb" 2>/dev/null | head -n1)" ]] \
+    || payload_missing+=("Linux .deb")
+  [[ -n "$(find "$RELEASE_DIR" -maxdepth 1 -name "*.AppImage" 2>/dev/null | head -n1)" ]] \
+    || payload_missing+=("Linux .AppImage")
+fi
+if [[ "${SKIP_WINDOWS:-0}" != "1" && "${NO_WAIT_WINDOWS:-0}" != "1" ]]; then
+  [[ -f "$RELEASE_DIR/iyou-home_${VERSION}_x64-setup.exe" ]] \
+    || payload_missing+=("Windows .exe (iyou-home_${VERSION}_x64-setup.exe)")
+fi
+
+if (( ${#payload_missing[@]} > 0 )); then
+  log "Expected platform bundles missing from ${RELEASE_DIR}:"
+  printf '  [MISSING] %s\n' "${payload_missing[@]}"
+  if [[ "${FORCE_PARTIAL_TORRENT:-0}" == "1" ]]; then
+    log "FORCE_PARTIAL_TORRENT=1 — continuing with a partial payload."
+  else
+    log "A partial torrent would silently omit these platforms from the release"
+    log "and from the magnet URI verified by iyou_idp (_download_modal.html)."
+    ans=""
+    read -r -p "Proceed and generate a PARTIAL payload torrent? [y/N] " ans </dev/tty || ans=""
+    if [[ ! "$ans" =~ ^[yY]$ ]]; then
+      fail "aborted: stage the missing bundles (or set FORCE_PARTIAL_TORRENT=1) and re-run"
+    fi
+  fi
+else
+  log "All expected platform bundles present in the payload."
+fi
+
+# ---------------------------------------------------------------- checksums
+generate_checksums
+
+# ---------------------------------------------------------------- mirrors & bittorrent
+generate_bittorrent_and_mirrors
+
+# ---------------------------------------------------------------- seed box (QNAP)
+if [[ "${SKIP_SEED:-0}" != "1" ]]; then
+  seed_qnap_torrent
+else
+  log "Skipping seed box sync (SKIP_SEED=1)"
+  SEED_STATUS="skipped (SKIP_SEED=1)"
+fi
+
+# ---------------------------------------------------------------- publish & update
+publish_release_assets
 
 # ---------------------------------------------------------------- automate iyou_idp update
 auto_patch_idp
 
 # ---------------------------------------------------------------- self-check
-if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
+if [[ "${SKIP_UPLOAD:-0}" != "1" && ${#FINAL_RELEASE_ASSETS[@]} -gt 0 ]]; then
   log "Verifying published asset URLs (expect 302/200, not 404)"
   failed=0
-  for a in "${final_args[@]}"; do
+  for a in "${FINAL_RELEASE_ASSETS[@]}"; do
     name="$(basename "$a")"
     code="$(curl -sI -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/v${VERSION}/${name}" || true)"
     if [[ "$code" != "302" && "$code" != "200" ]]; then

@@ -19,6 +19,7 @@ the GitHub Release for every version tag — eliminating manual staging and the
 │   ├─ Windows sync  (gh run watch / gh release download --pattern "*.exe")     │
 │   ├─ checksums     (release-artifacts/SHA256SUMS.txt with all 4 platforms)    │
 │   ├─ mirrors       (BitTorrent .torrent, magnet URI & IPFS root CID)           │
+│   ├─ QNAP seed     (rsync payload, stage .torrent, transmission-remote 9091)   │
 │   ├─ final pub     (upload updated SHA256SUMS.txt, .torrent, MIRRORS.txt)      │
 │   ├─ patch IdP     (atomic SHA-256 update in iyou_idp _download_modal.html)    │
 │   └─ self-check    (curl HEAD each asset URL → [OK]/[FAIL])                    │
@@ -39,8 +40,9 @@ macOS bundles are produced locally via `npm run tauri build`; Windows NSIS insta
 `.exe` bundles are compiled on GitHub Actions (`windows-latest`) via
 `.github/workflows/build-windows.yml`. The release script synchronizes with the Windows runner,
 downloads the verified `.exe` installer directly into the staging payload, computes all
-consolidated SHA-256 checksums, and automatically updates the verification table in
-`iyou_idp`'s `_download_modal.html`.
+consolidated SHA-256 checksums, seeds the complete release bundle to the QNAP NAS via
+BitTorrent (`transmission-remote`), publishes final assets to GitHub Releases, and
+automatically updates the verification table in `iyou_idp`'s `_download_modal.html`.
 
 ---
 
@@ -108,7 +110,7 @@ depend strictly on the canonical SemVer format.
 ## 4. Triggering a Release
 
 ```bash
-./scripts/release.sh [patch|minor|major|<version>|current]
+./scripts/release.sh [patch|minor|major|<version>|current] [options]
 ```
 
 What it does, in order:
@@ -127,23 +129,47 @@ What it does, in order:
    `npm ci && npm run tauri build`, and pulls back `.deb`, `.AppImage` (and `.rpm`).
    *Note:* the stream uses `--no-xattrs` on macOS `bsdtar` — without it the pipe
    stalls on per-file extended-attribute headers.
-5. **Checksums** — writes `release-artifacts/SHA256SUMS.txt`.
-6. **Peer-to-Peer Mirrors** — packages all installer binaries into
-   `release-artifacts/iyou-home_${VERSION}.torrent` embedded with public trackers
-   (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.stealth.si:80/announce`,
-   `udp://tracker.torrent.eu.org:451/announce`), computes the 40-character BitTorrent
-   Info Hash (BTIH) and standard Magnet URI, computes the deterministic IPFS root CID
-   (using local `ipfs` or the `dc13` runner with `ipfs add -r -Q --only-hash`), and writes
-   structured mirror links to `release-artifacts/MIRRORS.txt`.
-7. **Publish** — pushes branch `HEAD` to `$REMOTE`, tags `v${VERSION}` (if absent),
-   pushes the tag, then `gh release create` (asset upload). If the release already exists
-   it falls back to `gh release upload --clobber`, making the script **idempotent**.
-8. **Windows build dispatch** — unless `SKIP_WINDOWS=1`, dispatches
-   `.github/workflows/build-windows.yml` on the GitHub Actions `windows-latest` runner
-   for `v${VERSION}`. Compilation runs asynchronously (~9-10 mins) and uploads the
-   `.exe` installer and `SHA256SUMS_WINDOWS.txt` directly to the release.
-9. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
+5. **Initial publish & Windows build dispatch** — tags `v${VERSION}`, publishes initial
+   macOS/Linux assets, and dispatches `.github/workflows/build-windows.yml` on GitHub Actions
+   `windows-latest` (unless `SKIP_WINDOWS=1`).
+6. **Windows sync (`sync_windows_exe`)** — monitors the GitHub Actions Windows CI runner,
+   downloads the freshly built `iyou-home_${VERSION}_x64-setup.exe` directly into the release
+   payload folder, and validates that its commit matches the release tag.
+7. **Checksums (`generate_checksums`)** — compiled *after* the Windows `.exe` is retrieved.
+   Writes the canonical `release-artifacts/SHA256SUMS.txt` with verified SHA-256 digests
+   across all 4 primary platforms (macOS DMG, Windows EXE, Debian DEB, AppImage) plus RPM.
+8. **Peer-to-Peer Mirrors (`generate_bittorrent_and_mirrors`)** — packages all installer
+   binaries into `release-artifacts/iyou-home_${VERSION}.torrent` embedded with public trackers
+   (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.demonii.com:1337/announce`,
+   `udp://tracker.torrent.eu.org:451/announce`), computes the 40-character BitTorrent Info Hash
+   (BTIH) and standard Magnet URI, computes the deterministic IPFS root CID via `dc13` or local
+   `ipfs`, and writes `release-artifacts/MIRRORS.txt`.
+9. **QNAP BitTorrent Seeding (`seed_qnap_torrent`)** — if reachable (`ssh qnap`), automatically
+   rsyncs the full payload directory (~116 MB) to the QNAP NAS at `/share/homes/iyou/releases`,
+   ensures client data symlinks (`iyou-home_${VERSION}`), copies the `.torrent` into the watch folder,
+   registers the torrent with `transmission-remote 9091 -a`, purges any obsolete torrents with
+   mismatched hashes, verifies 100% piece integrity, and activates immediate seeding.
+10. **Final publish (`publish_release_assets`)** — updates the live GitHub Release with the authentic
+   master `SHA256SUMS.txt`, `.torrent`, and `MIRRORS.txt` via `gh release upload --clobber`.
+11. **IdP download modal patch (`auto_patch_idp`)** — locates `../iyou_idp` and performs atomic
+   in-place updates on `_download_modal.html` for all 4 platform SHA-256 digests and the
+   BTIH magnet URI.
+12. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
    logs `[OK]` (HTTP 302/200), `[ASYNC]` (for Windows build underway), or `[FAIL]`.
+
+### CLI Options
+
+| Flag | Purpose |
+|---|---|
+| `--current` | Re-run pipeline for currently committed version without bumping |
+| `--sync-windows` | Download fresh Windows binary from GitHub Actions, re-hash, re-generate torrent, seed to QNAP, clobber release, and patch IdP modal |
+| `--seed-qnap` | Re-hash staged payload, generate `.torrent`, sync payload to QNAP via rsync, and verify 100% seeding in Transmission |
+| `--patch-idp` | Calculate SHA-256 digests of release payload and patch `_download_modal.html` in `iyou_idp` |
+| `--dry-run` | Inspect commit/tag alignment, check Windows build status, preview IdP modal diff, and test QNAP SSH reachability without making changes |
+| `--no-seed` / `--skip-seed` | Skip copying payload to QNAP and skip transmission registration |
+| `--no-wait-windows` | Dispatch Windows build on GitHub Actions without blocking on completion |
+| `--package-only` | Stage already-built local bundles without triggering rebuilds |
+| `--idp-path DIR` | Explicit path to `iyou_idp` repository |
 
 ### Environment overrides
 
@@ -154,6 +180,11 @@ What it does, in order:
 | `SKIP_LINUX=1` | skip the remote dc13 Linux build |
 | `SKIP_WINDOWS=1` | skip the Windows NSIS GitHub Actions build dispatch |
 | `SKIP_UPLOAD=1` | stage + checksum only; no tag, no push, no publish |
+| `SKIP_SEED=1` | skip QNAP NAS payload transfer and transmission registration |
+| `SEED_HOST` | SSH alias / hostname for torrent seed box (default: `qnap`) |
+| `QNAP_TORRENT_DATA_DIR` | Override target payload data folder on QNAP (default: auto-detected or `/share/homes/iyou/releases`) |
+| `QNAP_TORRENT_WATCH_DIR` | Override `.torrent` watch folder on QNAP (default: auto-detected or `/share/Download/watch`) |
+| `IDP_PATH` | Explicit path to `iyou_idp` repository (default: auto-detects `../iyou_idp`) |
 | `RELEASE_NOTES` | custom GitHub Release notes text |
 | `RELEASE_REMOTE` | git remote to push the tag to (default: auto-detected) |
 
@@ -197,6 +228,25 @@ IPFS_NATIVE_URI=ipfs://Qm.../
 
 - **BitTorrent Client:** Open `iyou-home_<V>.torrent` or copy `MAGNET_LINK` into any standard client (Transmission, qBittorrent, aria2c).
 - **IPFS Gateways:** Fetch directly via public gateway (`IPFS_GATEWAY_URL`) or natively via Brave/IPFS daemon (`IPFS_NATIVE_URI`).
+
+### QNAP BitTorrent Seeding & Storage Automation
+
+To ensure immediate swarm availability upon release publication, `scripts/release.sh` integrates automated seeding to a local or remote QNAP NAS (reachable via SSH alias `qnap`):
+
+1. **Host Reachability & Detection:**
+   The script checks SSH connectivity (`ssh -q -o ConnectTimeout=3 -o BatchMode=yes qnap exit`). If reachable, it inspects running processes and filesystem paths on the NAS to detect the active engine:
+   - **Transmission:** Looks for `transmission-daemon` or `/opt/bin/transmission-remote`. Connects to RPC port 9091.
+   - **qBittorrent / rTorrent / Download Station:** Discovers native and containerized watch/data directories under `/share/Download` or `/share/CACHEDEV1_DATA/Download`.
+2. **Payload Syncing:**
+   Uses `rsync -avP --delete` (falling back to `scp`) to transfer the staged release folder (`release-artifacts/iyou_home_${VERSION}`) to the QNAP storage path (default: `/share/homes/iyou/releases/iyou_home_${VERSION}`).
+   A symlink `iyou-home_${VERSION}` is maintained so torrent clients looking for hyphenated directory names resolve the payload seamlessly.
+3. **Torrent Registration & Verification:**
+   - Cleans up obsolete torrents registered under the same version tag whose BTIH does not match the newly generated metainfo.
+   - Adds the `.torrent` file to Transmission targeting the data folder (`transmission-remote 9091 -a <TORRENT> -w <DATA_DIR>`).
+   - Issues `--verify` to trigger cryptographic piece checking across the 116 MB payload.
+   - Verifies 100% completion (`Have: 116.5 MB verified`) and starts active seeding (`--start`).
+4. **Standalone Operations:**
+   Run `./scripts/release.sh --seed-qnap` at any time to re-verify the local payload, re-hash, re-generate the torrent metainfo, and ensure the NAS seeder is 100% active.
 
 ---
 
