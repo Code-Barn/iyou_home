@@ -12,16 +12,18 @@ the GitHub Release for every version tag — eliminating manual staging and the
 ```
 ┌────────────────────────── local (developer machine) ──────────────────────────┐
 │  scripts/release.sh                                                            │
-│   ├─ pre-flight   (clean git, SemVer, gh auth, ssh dc13)                       │
-│   ├─ macOS build  (npm run tauri build → .dmg → release-artifacts/)            │
-│   ├─ Linux build  (tar . | ssh dc13 → npm ci && tauri build → deb/AppImage)   │
-│   ├─ checksums    (release-artifacts/SHA256SUMS.txt)                           │
-│   ├─ mirrors      (BitTorrent .torrent, magnet URI & IPFS root CID)            │
-│   ├─ publish      (tag vX.Y.Z, gh release create|upload --clobber)             │
-│   ├─ Windows CI   (gh workflow run build-windows.yml -f tag=vX.Y.Z)            │
-│   └─ self-check   (curl HEAD each asset URL → [OK]/[ASYNC]/[FAIL])             │
+│   ├─ pre-flight    (clean git, SemVer, gh auth, ssh dc13)                      │
+│   ├─ macOS build   (npm run tauri build → .dmg → release-artifacts/)           │
+│   ├─ Linux build   (tar . | ssh dc13 → npm ci && tauri build → deb/AppImage)  │
+│   ├─ initial pub   (tag vX.Y.Z, gh release create/upload macOS & Linux)        │
+│   ├─ Windows sync  (gh run watch / gh release download --pattern "*.exe")     │
+│   ├─ checksums     (release-artifacts/SHA256SUMS.txt with all 4 platforms)    │
+│   ├─ mirrors       (BitTorrent .torrent, magnet URI & IPFS root CID)           │
+│   ├─ final pub     (upload updated SHA256SUMS.txt, .torrent, MIRRORS.txt)      │
+│   ├─ patch IdP     (atomic SHA-256 update in iyou_idp _download_modal.html)    │
+│   └─ self-check    (curl HEAD each asset URL → [OK]/[FAIL])                    │
 └────────────────────────────────────────────────────────────────────────────────┘
-          │ ssh dc13 (self-hosted runner)       │ gh workflow dispatch
+          │ ssh dc13 (self-hosted runner)       │ gh workflow dispatch / sync
           ▼                                     ▼
 ┌────────────────── dc13 metal runner ┐ ┌────────────── GitHub Actions (windows-latest) ─┐
 │  ~/build-runner/                    │ │  .github/workflows/build-windows.yml             │
@@ -35,7 +37,10 @@ Linux bundles are produced on the sovereign self-hosted runner (`dc13`,
 `[self-hosted, linux, dc13, tauri-builder]`) matching `.github/workflows/release.yml`;
 macOS bundles are produced locally via `npm run tauri build`; Windows NSIS installer
 `.exe` bundles are compiled on GitHub Actions (`windows-latest`) via
-`.github/workflows/build-windows.yml` and attached directly to the release upon completion.
+`.github/workflows/build-windows.yml`. The release script synchronizes with the Windows runner,
+downloads the verified `.exe` installer directly into the staging payload, computes all
+consolidated SHA-256 checksums, and automatically updates the verification table in
+`iyou_idp`'s `_download_modal.html`.
 
 ---
 
