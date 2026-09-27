@@ -138,22 +138,25 @@ What it does, in order:
 7. **Checksums (`generate_checksums`)** — compiled *after* the Windows `.exe` is retrieved.
    Writes the canonical `release-artifacts/SHA256SUMS.txt` with verified SHA-256 digests
    across all 4 primary platforms (macOS DMG, Windows EXE, Debian DEB, AppImage) plus RPM.
-8. **Peer-to-Peer Mirrors (`generate_bittorrent_and_mirrors`)** — packages all installer
+8. **Peer-to-Peer Mirrors & BEP 19 Web Seeding (`generate_bittorrent_and_mirrors`)** — packages all installer
    binaries into `release-artifacts/iyou-home_${VERSION}.torrent` embedded with public trackers
    (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.demonii.com:1337/announce`,
-   `udp://tracker.torrent.eu.org:451/announce`), computes the 40-character BitTorrent Info Hash
-   (BTIH) and standard Magnet URI, computes the deterministic IPFS root CID via `dc13` or local
-   `ipfs`, and writes `release-artifacts/MIRRORS.txt`.
-9. **QNAP BitTorrent Seeding (`seed_qnap_torrent`)** — if reachable (`ssh qnap`), automatically
-   rsyncs the full payload directory (~116 MB) to the QNAP NAS at `/share/homes/iyou/releases`,
-   ensures client data symlinks (`iyou-home_${VERSION}`), copies the `.torrent` into the watch folder,
-   registers the torrent with `transmission-remote 9091 -a`, purges any obsolete torrents with
-   mismatched hashes, verifies 100% piece integrity, and activates immediate seeding.
+   `udp://tracker.torrent.eu.org:451/announce`) and **BEP 19 Web Seeding** (`url-list` pointing to
+   `https://github.com/Code-Barn/iyou_home/releases/download/v${VERSION}/`). Computes the 40-character BitTorrent
+   Info Hash (BTIH) and standard Magnet URI (with `&ws=` parameter), computes the deterministic IPFS root
+   CID via `dc13` or local `ipfs`, and writes `release-artifacts/MIRRORS.txt` including `WEB_SEED_URL`.
+9. **QNAP BitTorrent Seeding (`seed_qnap_torrent`)** — executed automatically by default on every release
+   and `--current` run unless skipped via `--skip-seed` or `SKIP_SEED=1`. Probes SSH connectivity
+   (`ssh -q -o ConnectTimeout=3 -o BatchMode=yes qnap exit`), rsyncs the full payload directory (~125 MB)
+   to the QNAP NAS at `/share/homes/iyou/releases`, ensures client data symlinks (`iyou-home_${VERSION}`),
+   stages the `.torrent` into the watch folder, registers the torrent with `transmission-remote 9091 -a`,
+   purges any obsolete torrents with mismatched hashes, verifies 100% piece integrity, and activates
+   immediate seeding.
 10. **Final publish (`publish_release_assets`)** — updates the live GitHub Release with the authentic
    master `SHA256SUMS.txt`, `.torrent`, and `MIRRORS.txt` via `gh release upload --clobber`.
 11. **IdP download modal patch (`auto_patch_idp`)** — locates `../iyou_idp` and performs atomic
-   in-place updates on `_download_modal.html` for all 4 platform SHA-256 digests and the
-   BTIH magnet URI.
+   in-place updates on both `_download_modal.html` and `download_modal.js` (`MAGNET_FALLBACK_URI`) for all
+   4 platform SHA-256 digests and the fresh BTIH magnet URI with web seed.
 12. **Self-check** — issues a `curl -I HEAD` against every published asset URL and
    logs `[OK]` (HTTP 302/200), `[ASYNC]` (for Windows build underway), or `[FAIL]`.
 
@@ -218,8 +221,9 @@ decentralized retrieval URIs:
 
 ```ini
 RELEASE_VERSION=v0.2.0
-MAGNET_LINK=magnet:?xt=urn:btih:d96ed3eb2faf...&dn=iyou-home_0.2.0&tr=udp%3A%2F%2Ftracker.opentrackr.org...
+MAGNET_LINK=magnet:?xt=urn:btih:d96ed3eb2faf...&dn=iyou-home_0.2.0&tr=udp%3A%2F%2Ftracker.opentrackr.org...&ws=https%3A%2F%2Fgithub.com%2FCode-Barn%2Fiyou_home%2Freleases%2Fdownload%2Fv0.2.0%2F
 TORRENT_FILE=iyou-home_0.2.0.torrent
+WEB_SEED_URL=https://github.com/Code-Barn/iyou_home/releases/download/v0.2.0/
 IPFS_ROOT_CID=Qm...
 IPFS_GATEWAY_URL=https://ipfs.io/ipfs/Qm.../
 IPFS_ALT_GATEWAY_URL=https://dweb.link/ipfs/Qm.../

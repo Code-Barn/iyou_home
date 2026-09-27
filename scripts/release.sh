@@ -113,6 +113,33 @@ find_idp_download_modal() {
   return 1
 }
 
+# Locate iyou_idp download_modal.js
+find_idp_download_js() {
+  local candidate_dirs=(
+    "${IDP_PATH:-}"
+    "$ROOT/../iyou_idp"
+    "../iyou_idp"
+  )
+  for base in "${candidate_dirs[@]}"; do
+    [[ -n "$base" && -d "$base" ]] || continue
+    local p1="$base/auth_bridge/static/auth_bridge/js/download_modal.js"
+    local p2="$base/static/auth_bridge/js/download_modal.js"
+    for p in "$p1" "$p2"; do
+      if [[ -f "$p" ]]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+    local found
+    found="$(find "$base" -name "download_modal.js" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" && -f "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Compute primary artifact SHA-256 hashes: macOS (.dmg), Windows (.exe), Debian (.deb), AppImage
 PRIMARY_WIN_SHA=""
 PRIMARY_MAC_SHA=""
@@ -201,11 +228,14 @@ print(f"{w}|{m}|{d}|{a}")
   fi
 }
 
-# Automate iyou_idp _download_modal.html updates
+# Automate iyou_idp _download_modal.html & download_modal.js updates
 auto_patch_idp() {
-  log "Automating iyou_idp SHA-256 update in _download_modal.html"
+  log "Automating iyou_idp SHA-256 update in _download_modal.html and download_modal.js"
   local modal_file
   modal_file="$(find_idp_download_modal || true)"
+  local js_file
+  js_file="$(find_idp_download_js || true)"
+
   if [[ -z "$modal_file" || ! -f "$modal_file" ]]; then
     warn "Could not locate iyou_idp _download_modal.html (checked ../iyou_idp and IDP_PATH)."
     warn "Skipping automatic download modal patch."
@@ -213,6 +243,7 @@ auto_patch_idp() {
   fi
 
   log "Found download modal at: $modal_file"
+  [[ -n "$js_file" ]] && log "Found download modal script at: $js_file"
   compute_primary_hashes
 
   log "Primary Artifact SHA-256 Hashes for v${VERSION}:"
@@ -234,7 +265,8 @@ auto_patch_idp() {
     "${PRIMARY_APP_SHA:-}" \
     "${DRY_RUN:-0}" \
     "${VERSION}" \
-    "${MAGNET_LINK:-}" << 'PYEOF'
+    "${MAGNET_LINK:-}" \
+    "${js_file:-}" << 'PYEOF'
 import sys, os, re
 
 modal_path = sys.argv[1]
@@ -245,6 +277,7 @@ app_sha = sys.argv[5].strip() if len(sys.argv) > 5 else ""
 dry_run = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
 version = sys.argv[7].strip() if len(sys.argv) > 7 else ""
 magnet_uri = sys.argv[8].strip() if len(sys.argv) > 8 else ""
+js_path = sys.argv[9].strip() if len(sys.argv) > 9 else ""
 
 if not os.path.isfile(modal_path):
     sys.stderr.write(f"[ERROR] Modal file not found: {modal_path}\n")
@@ -306,12 +339,31 @@ else:
         print(f"\n[OK] Successfully patched {changes_needed} hash(es) into {modal_path} (atomic replace).")
     else:
         print(f"\n[OK] All hashes in {modal_path} are already up-to-date. No write needed.")
+
+# Also update download_modal.js MAGNET_FALLBACK_URI if js_path is present
+if js_path and os.path.isfile(js_path) and magnet_uri and "magnet:?xt=urn:btih:" in magnet_uri and not magnet_uri.startswith("["):
+    with open(js_path, "r", encoding="utf-8") as f:
+        js_content = f.read()
+    js_pat = r"(var\s+MAGNET_FALLBACK_URI\s*=\s*')[^']+(';)"
+    if re.search(js_pat, js_content):
+        updated_js = re.sub(js_pat, rf"\g<1>{magnet_uri}\g<2>", js_content)
+        if updated_js != js_content:
+            if not dry_run:
+                tmp_js = js_path + ".tmp"
+                with open(tmp_js, "w", encoding="utf-8") as f:
+                    f.write(updated_js)
+                os.replace(tmp_js, js_path)
+                print(f"[OK] Patched MAGNET_FALLBACK_URI in {js_path}")
+            else:
+                print(f"[DRY-RUN] Would patch MAGNET_FALLBACK_URI in {js_path}")
+        else:
+            print(f"[OK] MAGNET_FALLBACK_URI in {js_path} is already up-to-date.")
 PYEOF
 
   # If git repo exists in ../iyou_idp, display git diff
   if [[ -d "$ROOT/../iyou_idp/.git" && "${DRY_RUN:-0}" != "1" ]]; then
     log "Git diff in iyou_idp:"
-    git -C "$ROOT/../iyou_idp" diff -U1 "$modal_file" || true
+    git -C "$ROOT/../iyou_idp" diff -U1 "$modal_file" ${js_file:+"$js_file"} || true
   fi
 }
 
@@ -663,7 +715,7 @@ generate_bittorrent_and_mirrors() {
 
   if [[ -n "$PYTHON_BIN" ]]; then
     log "Generating BitTorrent metainfo using $PYTHON_BIN (bencode engine)..."
-    eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" << 'PYEOF'
+    eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" "$REPO" << 'PYEOF'
 import os
 import sys
 import hashlib
@@ -695,8 +747,10 @@ def bencode(val):
 
 release_dir = sys.argv[1]
 version = sys.argv[2]
+repo = sys.argv[3] if len(sys.argv) > 3 else "Code-Barn/iyou_home"
 torrent_name = f"iyou-home_{version}.torrent"
 torrent_path = os.path.join(release_dir, torrent_name)
+web_seed_url = f"https://github.com/{repo}/releases/download/v{version}/"
 
 trackers = [
     "udp://tracker.opentrackr.org:1337/announce",
@@ -717,8 +771,10 @@ if not files:
     magnet = f"magnet:?xt=urn:btih:{btih}&dn=iyou-home_{version}"
     for tr in trackers:
         magnet += f"&tr={urllib.parse.quote(tr, safe='')}"
+    magnet += f"&ws={urllib.parse.quote(web_seed_url, safe='')}"
     print(f"BTIH={btih}")
     print(f"MAGNET_LINK='{magnet}'")
+    print(f"WEB_SEED_URL='{web_seed_url}'")
     sys.exit(0)
 
 piece_len = 262144  # 256 KiB
@@ -758,6 +814,7 @@ torrent_dict = {
     "created by": "iyou_home release automation",
     "creation date": int(time.time()),
     "info": info_dict,
+    "url-list": [web_seed_url],
 }
 
 info_bencoded = bencode(info_dict)
@@ -769,17 +826,21 @@ with open(torrent_path, "wb") as fh:
 magnet = f"magnet:?xt=urn:btih:{btih}&dn=iyou-home_{version}"
 for tr in trackers:
     magnet += f"&tr={urllib.parse.quote(tr, safe='')}"
+magnet += f"&ws={urllib.parse.quote(web_seed_url, safe='')}"
 
 print(f"BTIH={btih}")
 print(f"MAGNET_LINK='{magnet}'")
+print(f"WEB_SEED_URL='{web_seed_url}'")
 PYEOF
 )"
     log "BitTorrent Info Hash (BTIH): ${BTIH}"
     log "Magnet URI: ${MAGNET_LINK}"
+    log "BEP 19 Web Seed URL: ${WEB_SEED_URL}"
   else
     warn "Python interpreter not found; skipping BitTorrent generation"
     BTIH="[NOT_GENERATED]"
     MAGNET_LINK="[NOT_GENERATED]"
+    WEB_SEED_URL="[NOT_GENERATED]"
   fi
 
   # IPFS Root CID & Gateways
@@ -821,6 +882,7 @@ PYEOF
 RELEASE_VERSION=v${VERSION}
 MAGNET_LINK=${MAGNET_LINK}
 TORRENT_FILE=${TORRENT_FILE}
+WEB_SEED_URL=${WEB_SEED_URL:-https://github.com/${REPO}/releases/download/v${VERSION}/}
 IPFS_ROOT_CID=${IPFS_ROOT_CID}
 IPFS_GATEWAY_URL=${IPFS_GATEWAY_URL}
 IPFS_ALT_GATEWAY_URL=${IPFS_ALT_GATEWAY_URL}
@@ -862,8 +924,8 @@ publish_release_assets() {
 seed_qnap_torrent() {
   log "Automating BitTorrent seeding on QNAP NAS (${SEED_HOST})"
 
-  if [[ "${SKIP_SEED:-0}" == "1" ]]; then
-    log "Skipping QNAP torrent seeding (SKIP_SEED=1 / --no-seed)."
+  if [[ "${SKIP_SEED:-0}" == "1" || "${SKIP_SEED:-}" =~ ^[tT][rR][uU][eE]$ ]]; then
+    log "Skipping QNAP torrent seeding (SKIP_SEED=1 / --skip-seed)."
     SEED_STATUS="skipped (SKIP_SEED=1)"
     return 0
   fi
@@ -1069,7 +1131,13 @@ done
 active_id=$("$TR_BIN" 9091 -l 2>/dev/null | grep -E "iyou[-_]home_${VERSION}" | awk '{print $1}' | tail -n1)
 if [ -n "$active_id" ]; then
   "$TR_BIN" 9091 -t "$active_id" --verify >/dev/null 2>&1 || true
-  sleep 2
+  for wait_i in $(seq 1 15); do
+    sleep 1
+    status_info=$("$TR_BIN" 9091 -t "$active_id" -i 2>/dev/null || true)
+    if echo "$status_info" | grep -q -E "Percent Done: 100%|Have:.*verified|State: Seeding"; then
+      break
+    fi
+  done
   "$TR_BIN" 9091 -t "$active_id" --start >/dev/null 2>&1 || true
   "$TR_BIN" 9091 -t "$active_id" -i
 else
@@ -1381,7 +1449,13 @@ fi
 # ---------------------------------------------------------------- stage
 log "Staging directory: ${RELEASE_DIR}"
 if [[ "${PACKAGE_ONLY:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
-  rm -f "$RELEASE_DIR"/iyou-home_* "$RELEASE_DIR"/iyou-home-* "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt
+  if [[ "${SKIP_MAC:-0}" != "1" ]]; then
+    rm -f "$RELEASE_DIR"/iyou-home_*_x64.dmg
+  fi
+  if [[ "${SKIP_LINUX:-0}" != "1" ]]; then
+    rm -f "$RELEASE_DIR"/iyou-home_*_amd64.deb "$RELEASE_DIR"/iyou-home_*_amd64.AppImage "$RELEASE_DIR"/iyou-home-*.rpm
+  fi
+  rm -f "$RELEASE_DIR"/SHA256SUMS.txt "$RELEASE_DIR"/MIRRORS.txt "$RELEASE_DIR"/iyou-home_*.torrent
 fi
 
 # ---------------------------------------------------------------- Mac build
@@ -1410,6 +1484,11 @@ if [[ "${SKIP_MAC:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
   fi
 else
   log "Skipping macOS build"
+  mkdir -p "$RELEASE_DIR"
+  if [[ ! -f "$RELEASE_DIR/iyou-home_${VERSION}_x64.dmg" ]]; then
+    log "Restoring iyou-home_${VERSION}_x64.dmg from existing release v${VERSION}..."
+    gh release download "v${VERSION}" --repo "$REPO" --pattern "*_x64.dmg" --dir "$RELEASE_DIR" --clobber 2>/dev/null || true
+  fi
 fi
 
 # ---------------------------------------------------------------- Linux build
@@ -1437,6 +1516,13 @@ if [[ "${SKIP_LINUX:-0}" != "1" && "${SYNC_WINDOWS_ONLY:-0}" != "1" ]]; then
   fi
 else
   log "Skipping dc13 Linux build"
+  mkdir -p "$RELEASE_DIR"
+  for pattern in "*_amd64.deb" "*_amd64.AppImage" "*-1.x86_64.rpm"; do
+    if [[ -z "$(find "$RELEASE_DIR" -maxdepth 1 -name "$pattern" 2>/dev/null | head -n1)" ]]; then
+      log "Restoring $pattern from existing release v${VERSION}..."
+      gh release download "v${VERSION}" --repo "$REPO" --pattern "$pattern" --dir "$RELEASE_DIR" --clobber 2>/dev/null || true
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------- Initial tag & release
