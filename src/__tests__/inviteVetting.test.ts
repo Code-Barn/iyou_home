@@ -18,10 +18,13 @@
 import { describe, expect, it } from "vitest";
 import {
   BOOTSTRAP_NOTICE,
+  GENESIS_MAX_USES,
   MAX_CONTACTS_CEILING,
+  MEMBER_MAX_USES,
   MIN_CONTACTS_FLOOR,
   clampThreshold,
   deriveInviteStanding,
+  maxUsesLimit,
 } from "../components/invites/inviteVetting";
 import type { IssuerStatus } from "../lib/types";
 
@@ -31,6 +34,7 @@ function issuer(overrides: Partial<IssuerStatus> = {}, vetting: Partial<IssuerSt
     role: "member",
     quota_used_last_30d: 0,
     quota_limit: 3,
+    max_uses_limit: MEMBER_MAX_USES,
     vetting: {
       account_age_days: 60,
       contact_count: 6,
@@ -61,6 +65,43 @@ describe("clampThreshold", () => {
 
   it("truncates fractional input", () => {
     expect(clampThreshold(3.9)).toBe(3);
+  });
+});
+
+describe("maxUsesLimit", () => {
+  it("prefers the enclave-reported limit so the UI cannot disagree with it", () => {
+    // A non-Genesis issuer whose enclave still reports 100: the enclave's own
+    // number wins over the local mirror of the predicate.
+    const peer = deriveInviteStanding({ issuer: issuer(), devMode: false, contactCount: 6 });
+    expect(peer.is_genesis).toBe(false);
+    expect(maxUsesLimit(peer, issuer({ max_uses_limit: 100 }))).toBe(100);
+  });
+
+  it("mirrors the Rust predicate when the enclave has not reported a limit", () => {
+    // `max_uses_limit` absent, as it would be against an older enclave build.
+    const stale = { ...issuer(), max_uses_limit: undefined as never };
+
+    const peer = deriveInviteStanding({ issuer: stale, devMode: false, contactCount: 6 });
+    expect(maxUsesLimit(peer, stale)).toBe(MEMBER_MAX_USES);
+
+    const genesisIssuer = {
+      ...stale,
+      vetting: { ...issuer().vetting, is_genesis: true },
+    };
+    const genesis = deriveInviteStanding({
+      issuer: genesisIssuer,
+      devMode: false,
+      contactCount: 0,
+    });
+    expect(genesis.is_genesis).toBe(true);
+    expect(maxUsesLimit(genesis, genesisIssuer)).toBe(GENESIS_MAX_USES);
+  });
+
+  it("rejects a nonsensical reported limit rather than trusting it", () => {
+    const peer = deriveInviteStanding({ issuer: issuer(), devMode: false, contactCount: 6 });
+    expect(maxUsesLimit(peer, issuer({ max_uses_limit: 0 }))).toBe(MEMBER_MAX_USES);
+    expect(maxUsesLimit(peer, issuer({ max_uses_limit: Number.NaN }))).toBe(MEMBER_MAX_USES);
+    expect(maxUsesLimit(peer, null)).toBe(MEMBER_MAX_USES);
   });
 });
 

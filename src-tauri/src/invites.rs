@@ -48,6 +48,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
 use tauri::{AppHandle, Manager};
 
 // ---------- constants (RFC-002 §5.2) ----------
@@ -77,8 +79,24 @@ pub const MIN_CONTACTS_THRESHOLD_FLOOR: usize = 1;
 pub const MAX_CONTACTS_THRESHOLD_CEILING: usize = 50;
 /// Upper bound on `valid_days` when minting (RFC §5.1: expiry ≤ 90 d).
 pub const MAX_VALID_DAYS: u64 = 90;
-/// `max_uses` clamp (RFC §5.1: shared family tokens ≤ 4).
+/// `max_uses` clamp for ordinary peer issuers (RFC §5.1: shared family tokens
+/// ≤ 4). Genesis/Admin identities mint community-scale codes and are held to
+/// `MAX_USES_PER_TOKEN_GENESIS` instead — see `max_uses_limit_for`.
 pub const MAX_USES_PER_TOKEN: u32 = 4;
+/// `max_uses` ceiling for Genesis / Operator issuers, who mint community-scale
+/// onboarding codes (e.g. a 10–50 use campus or mesh invite).
+///
+/// A high-`max_uses` token is a *shared bearer credential*: every holder of
+/// the link can consume a use. Issuers minting community codes should treat the
+/// QR/link as a secret and prefer short `valid_days`.
+pub const MAX_USES_PER_TOKEN_GENESIS: u32 = 100;
+/// Airlock landing page for scannable invites.
+///
+/// QR codes and share links point at an absolute HTTPS URL rather than the raw
+/// token JSON: phone cameras only offer "Open in Safari/Chrome" for payloads
+/// they recognise as links, and otherwise mis-parse a JSON blob as an
+/// SMS/phone-number payload.
+pub const INVITE_AIRLOCK_BASE: &str = "https://iyou.me/airlock/";
 /// Nonce floor: 16 random bytes = 32 lowercase hex chars.
 pub const NONCE_MIN_BYTES: usize = 16;
 
@@ -208,7 +226,25 @@ pub struct IssuerStatus {
     pub quota_used_last_30d: u32,
     /// 0 = unlimited.
     pub quota_limit: u32,
+    /// Effective `max_uses` ceiling for this issuer: 4 for ordinary members,
+    /// 100 for Genesis / Operator. Surfaced so the modal's input bounds match
+    /// the enforcing predicate instead of hard-coding a stale limit.
+    pub max_uses_limit: u32,
     pub vetting: VettingStatus,
+}
+
+/// Rendered invite handoff: the scannable deep link plus its QR data URL.
+///
+/// The enclave builds both from one `token_json` so the wire format (airlock
+/// base + base64url token) has exactly one authority — the frontend never
+/// hand-rolls the link.
+#[derive(Debug, Clone, Serialize)]
+pub struct InviteQrPayload {
+    /// `https://iyou.me/airlock/?invite=<base64url token>` — shareable and
+    /// scannable as a browser link.
+    pub link: String,
+    /// `data:image/png;base64,...` QR encoding of `link`.
+    pub qr_data_url: String,
 }
 
 // ---------- crypto core (RFC-002 §3) ----------
@@ -322,6 +358,52 @@ pub fn clamp_min_contacts(value: u32) -> usize {
         MIN_CONTACTS_THRESHOLD_FLOOR,
         MAX_CONTACTS_THRESHOLD_CEILING,
     )
+}
+
+/// Effective `max_uses` ceiling for an issuer: community-scale for Genesis /
+/// Operator, RFC-002's family-token bound of 4 for everyone else.
+pub fn max_uses_limit_for(snapshot: &VettingSnapshot) -> u32 {
+    if snapshot.is_genesis {
+        MAX_USES_PER_TOKEN_GENESIS
+    } else {
+        MAX_USES_PER_TOKEN
+    }
+}
+
+/// base64url (RFC 4648 §5) with padding stripped.
+///
+/// Padding is dropped because the output is carried in a URL query value, where
+/// `=` would otherwise need escaping. The alphabet is URL-safe (`-` / `_`), so
+/// the result needs no percent-encoding either.
+pub fn base64url_encode(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Build the scannable invite deep link for a serialized signed token.
+///
+/// `token_json` must be the token's JSON text; it is encoded as UTF-8 bytes
+/// into the `invite` query parameter. The receiving airlock page decodes it
+/// back to JSON and runs the normal RFC-002 admission gate, so this is a
+/// transport encoding only — it adds no confidentiality.
+pub fn invite_deep_link(token_json: &str) -> String {
+    format!(
+        "{}?invite={}",
+        INVITE_AIRLOCK_BASE,
+        base64url_encode(token_json.as_bytes())
+    )
+}
+
+/// Validate the token JSON, build the airlock deep link, and render its QR.
+///
+/// Both outputs come from the same `token_json`, so the copyable link and the
+/// scanned QR can never drift apart.
+pub fn render_invite_qr_payload(token_json: &str) -> Result<InviteQrPayload, String> {
+    // Reject malformed payloads before handing bytes to the QR encoder.
+    let _: serde_json::Value = serde_json::from_str(token_json)
+        .map_err(|e| format!("Invalid token JSON for QR encoding: {}", e))?;
+    let link = invite_deep_link(token_json);
+    let qr_data_url = crate::pairing::render_qr_png_b64(&link)?;
+    Ok(InviteQrPayload { link, qr_data_url })
 }
 
 /// Local standing snapshot feeding the member vetting predicate.
@@ -956,10 +1038,11 @@ pub(crate) fn mint_token_core(
     now: u64,
 ) -> Result<InviteCapabilityToken, String> {
     let requested = InviteTier::parse(tier)?;
-    if max_uses == 0 || max_uses > MAX_USES_PER_TOKEN {
+    let max_uses_limit = max_uses_limit_for(vetting);
+    if max_uses == 0 || max_uses > max_uses_limit {
         return Err(format!(
             "max_uses must be between 1 and {}",
-            MAX_USES_PER_TOKEN
+            max_uses_limit
         ));
     }
     let valid_days = valid_days.clamp(1, MAX_VALID_DAYS);
@@ -1028,6 +1111,7 @@ pub fn issuer_status(app: &AppHandle, did: &str) -> Result<IssuerStatus, String>
         } else {
             MEMBER_MONTHLY_QUOTA
         },
+        max_uses_limit: max_uses_limit_for(&snapshot),
         vetting: VettingStatus {
             account_age_days: age_days,
             contact_count: snapshot.contact_count,
@@ -1508,6 +1592,207 @@ mod tests {
         .expect("admin mint should bypass quota");
         assert_eq!(promoted.tier, "admin");
         assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 4);
+    }
+
+    #[test]
+    fn base64url_is_url_safe_and_unpadded() {
+        // Bytes chosen to hit all three alphabet differences: '+' and '/' in
+        // standard base64 become '-' and '_' in base64url, and padding is
+        // stripped so the value needs no percent-encoding in a query string.
+        let raw = [0xfbu8, 0xff, 0xbf, 0x00, 0x10];
+        let encoded = base64url_encode(&raw);
+        assert!(!encoded.contains('+'), "unexpected: {}", encoded);
+        assert!(!encoded.contains('/'), "unexpected: {}", encoded);
+        assert!(!encoded.contains('='), "unexpected: {}", encoded);
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "unexpected: {}",
+            encoded
+        );
+
+        // Round-trips back to the original bytes.
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&encoded)
+            .expect("decode");
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn invite_deep_link_is_an_absolute_https_url_carrying_the_token() {
+        let token_json = serde_json::to_string(&signed_token()).expect("serialize");
+        let link = invite_deep_link(&token_json);
+
+        // Phone cameras only offer "open in browser" for absolute HTTPS URLs;
+        // this is the property that makes the QR scannable as a link.
+        assert!(link.starts_with(INVITE_AIRLOCK_BASE), "unexpected: {}", link);
+        assert!(link.starts_with("https://"), "unexpected: {}", link);
+
+        // The `invite` parameter round-trips back to the exact token JSON.
+        let encoded = link
+            .strip_prefix(INVITE_AIRLOCK_BASE)
+            .and_then(|rest| rest.strip_prefix("?invite="))
+            .expect("invite query parameter");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("decode");
+        assert_eq!(String::from_utf8(decoded).expect("utf8"), token_json);
+
+        // No percent-encoding was needed: the whole link is URL-safe.
+        assert!(!link.contains('%'), "unexpected: {}", link);
+        assert!(!link.contains('?') || link.matches('?').count() == 1);
+    }
+
+    #[test]
+    fn qr_payload_renders_a_png_of_the_link_and_rejects_non_json() {
+        let token_json = serde_json::to_string(&signed_token()).expect("serialize");
+        let payload = render_invite_qr_payload(&token_json).expect("render");
+
+        // The QR and the copyable link derive from the same token.
+        assert_eq!(payload.link, invite_deep_link(&token_json));
+        assert!(payload.link.starts_with("https://iyou.me/airlock/?invite="));
+
+        // A real base64 PNG data URL.
+        assert!(
+            payload.qr_data_url.starts_with("data:image/png;base64,"),
+            "unexpected: {}",
+            &payload.qr_data_url[..payload.qr_data_url.len().min(40)]
+        );
+        let png_b64 = payload
+            .qr_data_url
+            .strip_prefix("data:image/png;base64,")
+            .expect("prefix");
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .expect("png decodes");
+        assert_eq!(&png[1..4], b"PNG", "not a PNG signature");
+
+        // Malformed token JSON is still rejected before reaching the encoder.
+        let err = render_invite_qr_payload("{not json").unwrap_err();
+        assert!(err.contains("Invalid token JSON"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn community_scale_token_fits_in_a_qr() {
+        // Worst case: a fully-populated community token (4 scopes, satellite
+        // binding, 100 uses) must still render — the QR has a hard capacity.
+        let mut t = signed_token();
+        t.max_uses = MAX_USES_PER_TOKEN_GENESIS;
+        t.satellite_id = "sat.iyou.me".to_string();
+        t.scope = vec![
+            "join".to_string(),
+            "relay:read".to_string(),
+            "relay:write".to_string(),
+            "relay:admin".to_string(),
+        ];
+        let token_json = serde_json::to_string(&t).expect("serialize");
+        let payload = render_invite_qr_payload(&token_json)
+            .expect("community-scale invite must fit in a QR");
+        assert!(payload.qr_data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn max_uses_ceiling_scales_with_genesis_standing() {
+        let peer = VettingSnapshot::default();
+        assert_eq!(max_uses_limit_for(&peer), MAX_USES_PER_TOKEN);
+        assert_eq!(max_uses_limit_for(&peer), 4);
+
+        let genesis = VettingSnapshot { is_genesis: true, ..peer };
+        assert_eq!(max_uses_limit_for(&genesis), MAX_USES_PER_TOKEN_GENESIS);
+        assert_eq!(max_uses_limit_for(&genesis), 100);
+    }
+
+    #[test]
+    fn genesis_mints_community_scale_tokens_while_peers_stay_capped_at_four() {
+        let mut conn = mem_db();
+        let signing_key = test_signing_key();
+        let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
+        let now = now();
+
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 5,
+            ..Default::default()
+        };
+        let genesis = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 0,
+            is_genesis: true,
+            ..Default::default()
+        };
+
+        // Genesis: community-scale uses are accepted.
+        for uses in [10u32, 50, 100] {
+            let token = mint_token_core(
+                &mut conn,
+                &signing_key,
+                &kp.did,
+                "member",
+                uses,
+                30,
+                vec!["join".to_string()],
+                None,
+                &genesis,
+                now,
+            )
+            .unwrap_or_else(|e| panic!("genesis should mint max_uses={}: {}", uses, e));
+            assert_eq!(token.max_uses, uses);
+            assert!(verify_token_signature(&token).is_ok());
+        }
+
+        // Genesis ceiling is still enforced above 100.
+        let err = mint_token_core(
+            &mut conn,
+            &signing_key,
+            &kp.did,
+            "member",
+            101,
+            30,
+            vec!["join".to_string()],
+            None,
+            &genesis,
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("between 1 and 100"), "unexpected: {}", err);
+
+        // Ordinary peer: the RFC-002 bound of 4 is unchanged. Uses a fresh
+        // ledger so the genesis mints above do not exhaust the rolling quota.
+        let mut peer_conn = mem_db();
+        let err = mint_token_core(
+            &mut peer_conn,
+            &signing_key,
+            &kp.did,
+            "member",
+            5,
+            30,
+            vec!["join".to_string()],
+            None,
+            &peer,
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("between 1 and 4"), "unexpected: {}", err);
+
+        // ...and 4 is still fine for a peer.
+        let token = mint_token_core(
+            &mut peer_conn,
+            &signing_key,
+            &kp.did,
+            "member",
+            4,
+            30,
+            vec!["join".to_string()],
+            None,
+            &peer,
+            now,
+        )
+        .expect("peer may still mint 4-use tokens");
+        assert_eq!(token.max_uses, 4);
     }
 
     #[test]

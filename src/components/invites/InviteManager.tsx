@@ -33,6 +33,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
   InviteCapabilityToken,
+  InviteQrPayload,
   InviteRecord,
   InviteTier,
   IssuerStatus,
@@ -42,6 +43,7 @@ import {
   MIN_CONTACTS_FLOOR,
   clampThreshold,
   deriveInviteStanding,
+  maxUsesLimit,
 } from "./inviteVetting";
 
 const SCOPE_OPTIONS = ["relay:read", "relay:write"] as const;
@@ -132,7 +134,11 @@ export default function InviteManager() {
   const [mintError, setMintError] = useState<string | null>(null);
   const [mintedToken, setMintedToken] = useState<InviteCapabilityToken | null>(null);
   const [qrUrl, setQrUrl] = useState<string | null>(null);
+  // Airlock deep link (`https://iyou.me/airlock/?invite=…`) — built by the
+  // enclave alongside the QR so the two can never encode different tokens.
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const [revokingNonce, setRevokingNonce] = useState<string | null>(null);
 
@@ -150,6 +156,14 @@ export default function InviteManager() {
     () => deriveInviteStanding({ issuer, devMode: isDevMode(), contactCount }),
     [issuer, contactCount],
   );
+
+  // `max_uses` ceiling: 4 for ordinary peers, 100 for Genesis / Operator.
+  const maxUsesLimitValue = useMemo(() => maxUsesLimit(standing, issuer), [standing, issuer]);
+
+  // Clamp a draft `max_uses` into the current ceiling. Applied on read so a
+  // standing change (e.g. rotating away from Genesis) can never leave a
+  // stale over-limit value in the input.
+  const effectiveMaxUses = Math.min(maxUsesLimitValue, Math.max(1, maxUses));
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -180,7 +194,9 @@ export default function InviteManager() {
     setMintError(null);
     setMintedToken(null);
     setQrUrl(null);
+    setInviteLink(null);
     setCopied(false);
+    setCopiedLink(false);
     setThresholdError(null);
     // Members may only issue member-tier invites.
     setTier(issuer?.role === "admin" ? "member" : "member");
@@ -196,6 +212,8 @@ export default function InviteManager() {
     setShowModal(false);
     setMintedToken(null);
     setQrUrl(null);
+    setInviteLink(null);
+    setCopiedLink(false);
   };
 
   /**
@@ -233,24 +251,47 @@ export default function InviteManager() {
     try {
       const token = await invoke<InviteCapabilityToken>("create_invite_token", {
         tier,
-        maxUses,
+        maxUses: effectiveMaxUses,
         validDays,
         scope: ["join", ...extraScopes],
         satelliteId: satelliteId.trim() || null,
       });
       setMintedToken(token);
-      let qr: string | null = null;
+      // The enclave builds the airlock deep link and the QR from this same
+      // token JSON, so the copyable link and the scanned code cannot drift.
+      let qr: InviteQrPayload | null = null;
       try {
-        qr = await invoke<string>("render_invite_qr", { tokenJson: JSON.stringify(token) });
+        qr = await invoke<InviteQrPayload>("render_invite_qr", {
+          tokenJson: JSON.stringify(token),
+        });
       } catch {
         // QR rendering is best-effort — the copyable JSON remains usable.
       }
-      setQrUrl(qr);
+      setInviteLink(qr?.link ?? null);
+      setQrUrl(qr?.qr_data_url ?? null);
       await refresh();
     } catch (err) {
       setMintError(String(err));
     } finally {
       setMinting(false);
+    }
+  };
+
+  const handleCopyLink = async () => {
+    if (!inviteLink) return;
+    try {
+      await writeText(inviteLink);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 1800);
+    } catch {
+      // Clipboard plugin unavailable — fallback to navigator.
+      try {
+        await navigator.clipboard.writeText(inviteLink);
+        setCopiedLink(true);
+        setTimeout(() => setCopiedLink(false), 1800);
+      } catch {
+        // no-op
+      }
     }
   };
 
@@ -536,8 +577,9 @@ export default function InviteManager() {
                   </h3>
                 </div>
                 <p style={{ fontSize: "0.82rem", color: "#6b7280", marginTop: 0 }}>
-                  Share the token below (or scan the QR) with the person you are
-                  inviting. The recipient scans/validates it against your DID.
+                  Share the link below (or scan the QR) with the person you are
+                  inviting. Scanning opens the airlock page, which decodes the
+                  token and validates it against your DID.
                 </p>
                 <div
                   style={{
@@ -564,24 +606,38 @@ export default function InviteManager() {
                         color: "#0f172a",
                       }}
                     />
-                    <button
-                      type="button"
-                      data-testid="invite-copy-json"
-                      onClick={handleCopy}
-                      style={{ marginTop: "0.5rem", fontSize: "0.82rem" }}
-                    >
-                      {copied ? "✓ Copied" : "Copy Token JSON"}
-                    </button>
+                    <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.5rem" }}>
+                      <button
+                        type="button"
+                        data-testid="invite-copy-json"
+                        onClick={handleCopy}
+                        style={{ fontSize: "0.82rem" }}
+                      >
+                        {copied ? "✓ Copied" : "Copy Token JSON"}
+                      </button>
+                      {inviteLink && (
+                        <button
+                          type="button"
+                          data-testid="invite-copy-link"
+                          onClick={handleCopyLink}
+                          style={{ fontSize: "0.82rem" }}
+                        >
+                          {copiedLink ? "✓ Link Copied" : "Copy Invite Link"}
+                        </button>
+                      )}
+                    </div>
                   </div>
                   {qrUrl && (
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.35rem" }}>
                       <img
                         data-testid="invite-qr-image"
                         src={qrUrl}
-                        alt="Invite token QR code"
+                        alt="Invite link QR code"
                         style={{ width: 180, height: 180, borderRadius: 8, border: "1px solid #e5e7eb" }}
                       />
-                      <span style={{ fontSize: "0.72rem", color: "#6b7280" }}>Scan to invite</span>
+                      <span style={{ fontSize: "0.72rem", color: "#6b7280" }}>
+                        Scan to open invite link
+                      </span>
                     </div>
                   )}
                 </div>
@@ -732,17 +788,29 @@ export default function InviteManager() {
 
                 <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.9rem" }}>
                   <label style={{ fontSize: "0.85rem", fontWeight: 600, flex: 1 }}>
-                    Max uses (1–4)
+                    {`Max uses (1–${maxUsesLimitValue})`}
                     <input
                       data-testid="invite-max-uses"
                       type="number"
                       min={1}
-                      max={4}
+                      max={maxUsesLimitValue}
                       value={maxUses}
-                      onChange={(e) => setMaxUses(Math.max(1, Math.min(4, Number(e.target.value) || 1)))}
+                      onChange={(e) =>
+                        setMaxUses(
+                          Math.max(1, Math.min(maxUsesLimitValue, Number(e.target.value) || 1)),
+                        )
+                      }
                       style={{ display: "block", width: "100%", marginTop: "0.3rem", fontSize: "0.85rem" }}
                     />
                   </label>
+                  {(standing.is_genesis || standing.is_admin) && maxUsesLimitValue > 4 && (
+                    <span
+                      data-testid="invite-max-uses-hint"
+                      style={{ alignSelf: "flex-end", fontSize: "0.74rem", color: "#6b7280", marginBottom: "1.35rem" }}
+                    >
+                      Community-scale codes enabled for Genesis / Operator
+                    </span>
+                  )}
                   <label style={{ fontSize: "0.85rem", fontWeight: 600, flex: 1 }}>
                     Valid days (1–90)
                     <input

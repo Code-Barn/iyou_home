@@ -222,7 +222,7 @@ All commands below are registered in `tauri::generate_handler!` (`src-tauri/src/
 - `get_issuer_status`: Returns caller's role (`Admin`, `Member`, `Guest`), quota allowance, vetting attributes, and `is_genesis` standing.
 - `set_issuer_role`: Admin role assignment in `invites.db`.
 - `set_vetting_threshold`: Persists the operator-tunable mutual-contact requirement (`invite_min_contacts`, clamped to 1–50) in `preferences.json`.
-- `render_invite_qr`: Generates QR code data URL for mobile invite transit.
+- `render_invite_qr`: Validates the token JSON, then returns the scannable airlock deep link (`https://iyou.me/airlock/?invite=<base64url>`) plus a PNG QR data URL encoding that same link. The link is built in Rust so the copyable link and the scanned QR cannot drift; an absolute HTTPS payload is what makes phone cameras open a browser instead of mis-parsing the QR as an SMS number.
 
 ### Operator Moderation & Admin (RFC-003)
 - `admin_probe`: Verifies operator admin status for a satellite.
@@ -345,13 +345,13 @@ All commands below are registered in `tauri::generate_handler!` (`src-tauri/src/
 ## 7. Verification & Test Commands
 
 ```bash
-# Rust Backend Unit & Integration Tests (184 tests)
+# Rust Backend Unit & Integration Tests (190 tests)
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # Frontend TypeScript Typecheck & Production Build
 npx tsc --noEmit && npm run build
 
-# Vitest Suite (162 unit tests across 19 test files)
+# Vitest Suite (168 unit tests across 19 test files)
 npx vitest run
 ```
 

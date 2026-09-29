@@ -1054,13 +1054,16 @@ fn set_vetting_threshold(app: AppHandle, min_contacts: u32) -> Result<u32, Strin
     Ok(invites::clamp_min_contacts(prefs.invite_min_contacts) as u32)
 }
 
-/// Render a signed invite token as a base64 PNG data URL for display.
+/// Render a signed invite token's shareable handoff: the scannable airlock
+/// deep link plus a QR data URL encoding that same link.
+///
+/// The QR carries an absolute `https://` URL, not the raw token JSON, so mobile
+/// cameras surface it as a browser link instead of mis-parsing it as an
+/// SMS/phone-number payload. Both the link and the QR derive from the same
+/// `token_json`, so they cannot drift.
 #[tauri::command]
-fn render_invite_qr(token_json: String) -> Result<String, String> {
-    // Reject malformed payloads before handing bytes to the QR encoder.
-    let _: serde_json::Value = serde_json::from_str(&token_json)
-        .map_err(|e| format!("Invalid token JSON for QR encoding: {}", e))?;
-    crate::pairing::render_qr_png_b64(&token_json)
+fn render_invite_qr(token_json: String) -> Result<invites::InviteQrPayload, String> {
+    invites::render_invite_qr_payload(&token_json)
 }
 
 // ---------- RFC-003 satellite admin & moderation ----------

@@ -22,12 +22,13 @@ import type { InviteCapabilityToken, IssuerStatus, InviteRecord } from "../lib/t
 
 type InvokeHandler = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
-const { mockInvoke, defaultHandler } = vi.hoisted(() => {
+const { mockInvoke, defaultHandler, TOKEN } = vi.hoisted(() => {
   const MEMBER_STATUS: IssuerStatus = {
     did: "did:key:z6Mkprimary",
     role: "member",
     quota_used_last_30d: 1,
     quota_limit: 3,
+    max_uses_limit: 4,
     vetting: {
       account_age_days: 60,
       contact_count: 6,
@@ -83,7 +84,10 @@ const { mockInvoke, defaultHandler } = vi.hoisted(() => {
       case "create_invite_token":
         return Promise.resolve(TOKEN);
       case "render_invite_qr":
-        return Promise.resolve("data:image/png;base64,iVBORw0KGgo=");
+        return Promise.resolve({
+          link: "https://iyou.me/airlock/?invite=eyJ2IjoxfQ",
+          qr_data_url: "data:image/png;base64,iVBORw0KGgo=",
+        });
       case "revoke_invite":
         return Promise.resolve();
       default:
@@ -91,7 +95,7 @@ const { mockInvoke, defaultHandler } = vi.hoisted(() => {
     }
   };
 
-  return { mockInvoke: vi.fn<InvokeHandler>(handler), defaultHandler: handler };
+  return { mockInvoke: vi.fn<InvokeHandler>(handler), defaultHandler: handler, TOKEN };
 });
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -116,6 +120,7 @@ describe("InviteManager (RFC-002)", () => {
           role: "member",
           quota_used_last_30d: 2,
           quota_limit: 3,
+          max_uses_limit: 4,
           vetting: {
             account_age_days: 60,
             contact_count: 6,
@@ -147,7 +152,7 @@ describe("InviteManager (RFC-002)", () => {
     expect(screen.getByText(/No invites issued yet/)).toBeInTheDocument();
   });
 
-  it("mints a token and shows the copyable JSON and QR code", async () => {
+  it("mints a token and shows the copyable JSON, invite link and QR code", async () => {
     render(<InviteManager />);
 
     // Open the modal.
@@ -168,12 +173,19 @@ describe("InviteManager (RFC-002)", () => {
 
     fireEvent.click(screen.getByTestId("invite-submit"));
 
-    // Minted result: copyable JSON + QR image.
+    // Minted result: copyable JSON + invite link + QR image.
     const jsonArea = await screen.findByTestId("invite-token-json");
     expect((jsonArea as HTMLTextAreaElement).value).toContain(
       "deadbeefdeadbeefdeadbeefdeadbeef",
     );
     expect(screen.getByTestId("invite-qr-image")).toHaveAttribute("src", "data:image/png;base64,iVBORw0KGgo=");
+
+    // The enclave builds the link from the same token JSON; the modal forwards
+    // that exact string rather than encoding it in the browser.
+    expect(mockInvoke).toHaveBeenCalledWith("render_invite_qr", {
+      tokenJson: JSON.stringify(TOKEN),
+    });
+    expect(screen.getByTestId("invite-copy-link")).toHaveTextContent("Copy Invite Link");
 
     expect(mockInvoke).toHaveBeenCalledWith("create_invite_token", {
       tier: "member",
@@ -182,6 +194,41 @@ describe("InviteManager (RFC-002)", () => {
       scope: ["join", "relay:read"],
       satelliteId: "sat.iyou.me",
     });
+  });
+
+  it("copies the airlock invite link to the clipboard", async () => {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+    fireEvent.click(screen.getByTestId("invite-submit"));
+
+    const copyLink = await screen.findByTestId("invite-copy-link");
+    fireEvent.click(copyLink);
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("https://iyou.me/airlock/?invite=eyJ2IjoxfQ");
+    });
+    expect(await screen.findByTestId("invite-copy-link")).toHaveTextContent("Link Copied");
+  });
+
+  it("clamps max_uses to 4 for an ordinary member", async () => {
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    const input = screen.getByTestId("invite-max-uses") as HTMLInputElement;
+    expect(input).toHaveAttribute("max", "4");
+    expect(screen.getByText("Max uses (1–4)")).toBeInTheDocument();
+
+    // A community-scale request is clamped down to the ordinary-peer ceiling.
+    fireEvent.change(input, { target: { value: "50" } });
+    expect(input).toHaveValue(4);
+
+    fireEvent.click(screen.getByTestId("invite-submit"));
+    await screen.findByTestId("invite-token-json");
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "create_invite_token",
+      expect.objectContaining({ maxUses: 4 }),
+    );
   });
 
   it("surfaces issuance errors from the policy gate", async () => {
@@ -299,6 +346,7 @@ describe("InviteManager (RFC-002)", () => {
           role: "admin",
           quota_used_last_30d: 7,
           quota_limit: 0,
+          max_uses_limit: 100,
           vetting: {
             account_age_days: 60,
             contact_count: 6,
@@ -338,6 +386,7 @@ describe("InviteManager (RFC-002)", () => {
           role: "admin",
           quota_used_last_30d: 7,
           quota_limit: 0,
+          max_uses_limit: 100,
           vetting: {
             account_age_days: 60,
             contact_count: 6,
@@ -381,6 +430,7 @@ function genesisStatus(vettingOverrides: Record<string, unknown> = {}): IssuerSt
     role: "member",
     quota_used_last_30d: 0,
     quota_limit: 3,
+    max_uses_limit: 100,
     vetting: {
       account_age_days: 0,
       contact_count: 0,
@@ -523,6 +573,41 @@ describe("InviteManager — Genesis / Operator bypass", () => {
       "Member vetting: need >= 5 mutual contacts (have 0).",
     );
     expect(screen.getByTestId("invite-submit")).toBeDisabled();
+  });
+
+  it("raises the max_uses ceiling to 100 for a community-scale code", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    const input = screen.getByTestId("invite-max-uses") as HTMLInputElement;
+    expect(input).toHaveAttribute("max", "100");
+    expect(screen.getByText("Max uses (1–100)")).toBeInTheDocument();
+    expect(screen.getByTestId("invite-max-uses-hint")).toHaveTextContent(
+      "Community-scale codes enabled for Genesis / Operator",
+    );
+
+    // A mid-range community code is submitted as-is, not clamped.
+    fireEvent.change(input, { target: { value: "50" } });
+    expect(input).toHaveValue(50);
+
+    fireEvent.click(screen.getByTestId("invite-submit"));
+    await screen.findByTestId("invite-token-json");
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "create_invite_token",
+      expect.objectContaining({ maxUses: 50 }),
+    );
+
+    // The 100 ceiling still holds.
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+    fireEvent.change(screen.getByTestId("invite-max-uses"), { target: { value: "100" } });
+    expect(screen.getByTestId("invite-max-uses")).toHaveValue(100);
   });
 
   it("blocks a flagged Genesis issuer — the bypass never waives moderation flags", async () => {

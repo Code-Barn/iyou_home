@@ -394,7 +394,24 @@ export interface IssuerStatus {
   quota_used_last_30d: number;
   /** 0 = unlimited (admin). */
   quota_limit: number;
+  /**
+   * Effective `max_uses` ceiling for this issuer: 4 for ordinary members, 100
+   * for Genesis / Operator. Mirrors `invites::max_uses_limit_for` so the modal
+   * input bounds never disagree with the enforcing predicate.
+   */
+  max_uses_limit: number;
   vetting: VettingStatus;
+}
+
+/** Scannable invite handoff (mirrors `invites::InviteQrPayload`). */
+export interface InviteQrPayload {
+  /**
+   * `https://iyou.me/airlock/?invite=<base64url token>` — an absolute HTTPS
+   * URL so phone cameras surface it as a browser link.
+   */
+  link: string;
+  /** `data:image/png;base64,...` QR encoding of `link`. */
+  qr_data_url: string;
 }
 
 /** Invite issuance standing, as rendered by the Issue Invite modal. */

@@ -47,6 +47,14 @@ import type { InviteIssuanceStanding, IssuerStatus } from "../../lib/types";
 export const MIN_CONTACTS_FLOOR = 1;
 /** Mirrors `invites::MAX_CONTACTS_THRESHOLD_CEILING`. */
 export const MAX_CONTACTS_CEILING = 50;
+/** Mirrors `invites::MAX_USES_PER_TOKEN` (RFC-002 family-token bound). */
+export const MEMBER_MAX_USES = 4;
+/**
+ * Mirrors `invites::MAX_USES_PER_TOKEN_GENESIS`. Genesis / Operator issuers mint
+ * community-scale onboarding codes, so they are held to a higher ceiling than
+ * the family-token bound of 4 applied to ordinary peers.
+ */
+export const GENESIS_MAX_USES = 100;
 
 /** Copy shown whenever the mutual-vetting gate is waived. */
 export const BOOTSTRAP_NOTICE = "Operator bootstrap mode: mutual vetting bypassed";
@@ -64,6 +72,22 @@ export interface StandingInput {
 export function clampThreshold(value: number): number {
   if (!Number.isFinite(value)) return MIN_CONTACTS_FLOOR;
   return Math.min(MAX_CONTACTS_CEILING, Math.max(MIN_CONTACTS_FLOOR, Math.trunc(value)));
+}
+
+/**
+ * Effective `max_uses` ceiling for the current issuer.
+ *
+ * Prefers the enclave's own `max_uses_limit` so the input bound can never
+ * disagree with the enforcing predicate; falls back to the local mirror of
+ * `invites::max_uses_limit_for` while standing is still loading, and stays at
+ * the conservative 4 for a non-Genesis issuer if the field is absent.
+ */
+export function maxUsesLimit(standing: InviteIssuanceStanding, issuer: IssuerStatus | null): number {
+  const reported = issuer?.max_uses_limit;
+  if (typeof reported === "number" && Number.isFinite(reported) && reported >= 1) {
+    return Math.trunc(reported);
+  }
+  return standing.is_genesis || standing.is_admin ? GENESIS_MAX_USES : MEMBER_MAX_USES;
 }
 
 /**

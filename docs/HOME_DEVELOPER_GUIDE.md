@@ -24,7 +24,7 @@ npm run tauri dev
 
 ### 1.3 Verification & Test Commands
 ```bash
-# Execute full backend Rust test suite (184 tests)
+# Execute full backend Rust test suite (190 tests)
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # Run TypeScript typecheck & production bundle build
@@ -173,18 +173,18 @@ All commands below are `#[tauri::command]` functions invoked from the React side
 | `get_issuer_status` | — | `IssuerStatus` | Returns the active L1 DID's role (`Admin`, `Member`, `Guest`), quota allowance, and vetting attributes — including `is_genesis` and the `bypass_reason` surfaced to the Issue Invite modal. |
 | `set_issuer_role` | `did: string, role: string` | `()` | Enclave-local administrative role assignment in `invites.db`. |
 | `set_vetting_threshold` | `minContacts: u32` | `u32` | Persists the operator-tunable mutual-contact requirement (`invite_min_contacts`) in `preferences.json` and returns the clamped value in force. |
-| `render_invite_qr` | `tokenJson: string` | `String` (data URL) | Generates QR code matrix data URL for direct mobile invite ingestion. |
+| `render_invite_qr` | `tokenJson: string` | `InviteQrPayload` | Validates the token JSON, then returns the scannable airlock deep link plus a PNG data URL QR encoding that same link (`{ link, qr_data_url }`). See §4.3.2. |
 
 #### 4.3.1 Genesis / Operator Bypass & Configurable Threshold
 
 The `>= 5 mutual contacts` gate is an anti-Sybil control aimed at *ordinary peers*. Applied literally it deadlocks the first operator: a greenfield root identity has an empty contact book by definition, so it could never mint the invite that populates that book.
 
-| Issuer | Account age | Mutual contacts | Moderation flags | Tier choice | Quota |
-|:---|:---|:---|:---|:---|:---|
-| **Genesis / Operator** (current L1 Public Persona) | waived | **waived** | **enforced** | member only | enforced (3 / 30 d) |
-| **Admin** (`issuers` registry) | waived | waived | **enforced** | any | unlimited |
-| **Member** (ordinary) | enforced | enforced | **enforced** | member only | enforced (3 / 30 d) |
-| **Guest** | — | — | — | **cannot mint** | — |
+| Issuer | Account age | Mutual contacts | Moderation flags | Tier choice | `max_uses` | Quota |
+|:---|:---|:---|:---|:---|:---|:---|
+| **Genesis / Operator** (current L1 Public Persona) | waived | **waived** | **enforced** | member only | **100** | enforced (3 / 30 d) |
+| **Admin** (`issuers` registry) | waived | waived | **enforced** | any | 4 | unlimited |
+| **Member** (ordinary) | enforced | enforced | **enforced** | member only | 4 | enforced (3 / 30 d) |
+| **Guest** | — | — | — | **cannot mint** | — | — |
 
 **Resolution.** `is_genesis_identity` matches the issuer DID against a profile in the *local* vault and requires `profile_id == "primary"`, `level == 1`, and `!is_system_reserved`. The check deliberately does not pin `derivation_index`, so genesis standing survives `rotate_primary_persona` (the break-glass successor keeps the exemption; the tombstoned `retired_primary_*` does not). Level 0 Anchor personas are excluded — the air-gapped sanctum never mints. Because the DID is matched against a local vault profile, the signal cannot be forged by a peer asserting a DID.
 
@@ -193,6 +193,24 @@ The `>= 5 mutual contacts` gate is an anti-Sybil control aimed at *ordinary peer
 **Configurable threshold.** `invite_min_contacts` is an *operator preference* read back by the enclave at enforcement time — never a per-request client argument, so a member cannot weaken the gate for themselves by passing a lower value to `create_invite_token`. It is clamped to `[MIN_CONTACTS_THRESHOLD_FLOOR = 1, MAX_CONTACTS_THRESHOLD_CEILING = 50]`, and is derived in the UI by `src/components/invites/inviteVetting.ts`, which mirrors the Rust predicate and fails **closed** when issuer standing has not loaded.
 
 **Dev affordance.** A `import.meta.env.DEV` build waives the *displayed* gate and labels itself `Operator bootstrap mode: mutual vetting bypassed (frontend dev build — the enclave still enforces its own policy)`. It is presentation-only: the enclave remains the enforcing authority, and a dev build without Genesis standing still surfaces the backend denial.
+
+#### 4.3.2 Invite Links & Community-Scale Tokens
+
+**Shareable handoff.** `render_invite_qr` returns both halves of the handoff from a single `token_json`, so the copyable link and the scanned code can never encode different tokens:
+
+```
+https://iyou.me/airlock/?invite=<base64url(token_json)>
+```
+
+`INVITE_AIRLOCK_BASE` and the encoding live in the enclave, not the browser: `invite_deep_link` base64url-encodes (RFC 4648 §5, padding stripped, `-`/`_` alphabet) the token JSON into the `invite` query parameter, and `render_invite_qr_payload` renders *that link* rather than the raw JSON. The payload is therefore an absolute HTTPS URL, which is what makes a phone camera offer "Open in Safari/Chrome" — a raw JSON blob is mis-parsed as an SMS/phone-number payload.
+
+The token JSON is still validated before it reaches the QR encoder, and the Issue Invite modal still exposes the raw JSON via `Copy Token JSON` alongside the new `Copy Invite Link`.
+
+> **Transport encoding only.** The link carries the complete signed token in the clear, so it is a bearer credential: anyone holding it can consume a use. Prefer short `valid_days` for any shared code, and treat the QR / link as a secret. The airlock route is also a server-side dependency — see the open item below.
+
+**`max_uses` by issuer.** `max_uses_limit_for` returns `MAX_USES_PER_TOKEN_GENESIS = 100` for a Genesis / Operator issuer and RFC-002's family-token bound of `MAX_USES_PER_TOKEN = 4` for everyone else. This lets the root identity mint community onboarding codes (a 10–50 use campus or mesh invite) while ordinary peers stay capped at 4. The effective limit is surfaced on `IssuerStatus.max_uses_limit` and read back by the modal, so the input bound can never disagree with the enforcing predicate.
+
+**Open item — the airlock route does not yet exist.** `https://iyou.me/airlock/` currently returns **404** (the domain root serves the Sovereign Login page). The QR and link are correct and verified to encode the intended URL, but scanning one lands on a 404 until the airlock page is deployed and taught to base64url-decode the `invite` parameter, then run the normal RFC-002 admission gate.
 
 ### 4.4 Moderation & Admin (RFC-003)
 
