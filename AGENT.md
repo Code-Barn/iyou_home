@@ -37,6 +37,7 @@ This document serves as the canonical system reference, architecture specificati
 9. **Sovereign Capabilities & Denial Codes (RFC-002)**:
    - Invites are cryptographically signed capability tokens (`InviteCapabilityToken`).
    - Token validation fails closed and evaluates schema $\rightarrow$ expiry $\rightarrow$ signature $\rightarrow$ revocation $\rightarrow$ budget $\rightarrow$ replay, returning canonical RFC-002 denial codes (`INVALID`, `EXPIRED`, `USED`, `REVOKED`).
+   - **Genesis / Operator bootstrap bypass**: the anti-Sybil mutual-contact gate is waived for the vault's root identity (the current Level 1 Public Persona, resolved structurally against the local vault and therefore unforgeable) and for `Admin` issuers. The moderation-flag gate is never waived at any tier, and the requirement itself remains operator-tunable within a clamped floor so it can be tightened or relaxed but never disabled for ordinary members.
 10. **Operator Moderation & Live Severing (RFC-003)**:
     - Operator actions are persisted to an append-only `moderation.db` ledger.
     - Ban enforcement severs live connections via typed termination frames, blocks event ingestion at relay ingress, and cascades tombstones (T1 events, T2 media blobs, T3 kind:1605 broadcasts).
@@ -218,8 +219,9 @@ All commands below are registered in `tauri::generate_handler!` (`src-tauri/src/
 - `list_invites`: Lists all invite records from `invites.db` with computed status pills.
 - `revoke_invite`: Tombstones invite nonce and prunes graph edge in `invites.db`.
 - `validate_invite_token`: Admission-gate preview checking schema, expiry, signature, revocation, budget, and replay.
-- `get_issuer_status`: Returns caller's role (`Admin`, `Member`, `Guest`), quota allowance, and vetting attributes.
+- `get_issuer_status`: Returns caller's role (`Admin`, `Member`, `Guest`), quota allowance, vetting attributes, and `is_genesis` standing.
 - `set_issuer_role`: Admin role assignment in `invites.db`.
+- `set_vetting_threshold`: Persists the operator-tunable mutual-contact requirement (`invite_min_contacts`, clamped to 1–50) in `preferences.json`.
 - `render_invite_qr`: Generates QR code data URL for mobile invite transit.
 
 ### Operator Moderation & Admin (RFC-003)
@@ -343,13 +345,13 @@ All commands below are registered in `tauri::generate_handler!` (`src-tauri/src/
 ## 7. Verification & Test Commands
 
 ```bash
-# Rust Backend Unit & Integration Tests (176 tests)
+# Rust Backend Unit & Integration Tests (184 tests)
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # Frontend TypeScript Typecheck & Production Build
 npx tsc --noEmit && npm run build
 
-# Vitest Suite (139 unit tests across 18 test files)
+# Vitest Suite (162 unit tests across 19 test files)
 npx vitest run
 ```
 

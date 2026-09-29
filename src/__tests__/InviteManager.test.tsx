@@ -31,11 +31,15 @@ const { mockInvoke, defaultHandler } = vi.hoisted(() => {
     vetting: {
       account_age_days: 60,
       contact_count: 6,
+      min_contacts_required: 5,
+      contacts_remaining: -1,
       active_moderation_flags: 0,
       account_age_ok: true,
       contacts_ok: true,
       flags_ok: true,
       eligible: true,
+      is_genesis: false,
+      bypass_reason: null,
     },
   };
 
@@ -72,6 +76,10 @@ const { mockInvoke, defaultHandler } = vi.hoisted(() => {
         return Promise.resolve(MEMBER_STATUS);
       case "list_invites":
         return Promise.resolve([LIVE_INVITE]);
+      case "list_contacts":
+        return Promise.resolve([]);
+      case "set_vetting_threshold":
+        return Promise.resolve(5);
       case "create_invite_token":
         return Promise.resolve(TOKEN);
       case "render_invite_qr":
@@ -111,11 +119,15 @@ describe("InviteManager (RFC-002)", () => {
           vetting: {
             account_age_days: 60,
             contact_count: 6,
+            min_contacts_required: 5,
+            contacts_remaining: -1,
             active_moderation_flags: 0,
             account_age_ok: true,
             contacts_ok: true,
             flags_ok: true,
             eligible: true,
+            is_genesis: false,
+            bypass_reason: null,
           },
         });
       }
@@ -130,7 +142,8 @@ describe("InviteManager (RFC-002)", () => {
     });
     expect(screen.getByTestId("invite-quota")).toHaveTextContent("2 / 3 used");
     expect(screen.getByTestId("vetting-chip-Account-60d")).toHaveTextContent("✓ Account 60d");
-    expect(screen.getByTestId("vetting-chip-6-contacts")).toHaveTextContent("✓ 6 contacts");
+    expect(screen.getByTestId("vetting-chip-6-5-contacts")).toHaveTextContent("✓ 6/5 contacts");
+    expect(screen.getByTestId("vetting-chip-0-mod-flags")).toHaveTextContent("✓ 0 mod flags");
     expect(screen.getByText(/No invites issued yet/)).toBeInTheDocument();
   });
 
@@ -289,11 +302,15 @@ describe("InviteManager (RFC-002)", () => {
           vetting: {
             account_age_days: 60,
             contact_count: 6,
+            min_contacts_required: 5,
+            contacts_remaining: -1,
             active_moderation_flags: 0,
             account_age_ok: true,
             contacts_ok: true,
             flags_ok: true,
             eligible: true,
+            is_genesis: false,
+            bypass_reason: null,
           },
         });
       }
@@ -324,11 +341,15 @@ describe("InviteManager (RFC-002)", () => {
           vetting: {
             account_age_days: 60,
             contact_count: 6,
+            min_contacts_required: 5,
+            contacts_remaining: -1,
             active_moderation_flags: 0,
             account_age_ok: true,
             contacts_ok: true,
             flags_ok: true,
             eligible: true,
+            is_genesis: false,
+            bypass_reason: null,
           },
         });
       }
@@ -351,5 +372,209 @@ describe("InviteManager (RFC-002)", () => {
       "create_invite_token",
       expect.objectContaining({ tier: "guest" }),
     );
+  });
+});
+/** Root/operator standing: empty contact book, fresh account, Genesis flag set. */
+function genesisStatus(vettingOverrides: Record<string, unknown> = {}): IssuerStatus {
+  return {
+    did: "did:key:z6Mkprimary",
+    role: "member",
+    quota_used_last_30d: 0,
+    quota_limit: 3,
+    vetting: {
+      account_age_days: 0,
+      contact_count: 0,
+      min_contacts_required: 5,
+      contacts_remaining: 5,
+      active_moderation_flags: 0,
+      account_age_ok: false,
+      contacts_ok: false,
+      flags_ok: true,
+      eligible: true,
+      is_genesis: true,
+      bypass_reason:
+        "Operator bootstrap mode: mutual vetting bypassed (Genesis / Operator identity, 0 contact(s) — threshold 5 not applied)",
+      ...vettingOverrides,
+    },
+  };
+}
+
+describe("InviteManager — Genesis / Operator bypass", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(defaultHandler);
+    // Vitest runs with `import.meta.env.DEV === true`; pin it off so these
+    // cases assert the Genesis logic rather than the dev affordance.
+    vi.stubEnv("DEV", false);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("mints the bootstrap invite with 0 contacts where an ordinary member cannot", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+
+    // Tier reads "Genesis / Operator", not the raw registry role.
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-role")).toHaveTextContent("Genesis / Operator");
+    });
+
+    // The bypass notice carries the exact required wording.
+    expect(screen.getByTestId("invite-bypass-notice")).toHaveTextContent(
+      "Operator bootstrap mode: mutual vetting bypassed",
+    );
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+    expect(screen.getByTestId("invite-modal")).toBeInTheDocument();
+    expect(screen.getByTestId("invite-modal-bypass-notice")).toHaveTextContent(
+      "Operator bootstrap mode: mutual vetting bypassed",
+    );
+
+    // Mint & Sign is ENABLED despite 0 contacts, and the mint round-trips.
+    const submit = screen.getByTestId("invite-submit");
+    expect(submit).not.toBeDisabled();
+    expect(submit).toHaveTextContent("Mint & Sign (bypassed)");
+    expect(screen.queryByTestId("invite-blocked-reason")).not.toBeInTheDocument();
+
+    fireEvent.click(submit);
+    await screen.findByTestId("invite-token-json");
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "create_invite_token",
+      expect.objectContaining({ tier: "member" }),
+    );
+  });
+
+  it("shows the honest 0-contact counter while waiving the threshold", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    expect(screen.getByTestId("invite-threshold")).toHaveValue(5);
+    expect(screen.getByTestId("invite-threshold-label")).toHaveTextContent(
+      "mutual contacts (have 0)",
+    );
+    expect(screen.getByTestId("invite-threshold-label")).toHaveTextContent(
+      "Not applied to you: Genesis / Operator bypass",
+    );
+  });
+
+  it("persists a lowered threshold through set_vetting_threshold", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "set_vetting_threshold") return Promise.resolve(args?.minContacts);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    fireEvent.change(screen.getByTestId("invite-threshold"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("invite-threshold-save"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_vetting_threshold", {
+        minContacts: 2,
+      });
+    });
+    await screen.findByTestId("invite-threshold-saved");
+  });
+
+  it("keeps Mint disabled and explains the block for an ordinary member", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") {
+        return Promise.resolve(
+          genesisStatus({
+            is_genesis: false,
+            account_age_days: 90,
+            account_age_ok: true,
+            eligible: false,
+            bypass_reason: null,
+          }),
+        );
+      }
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-role")).toHaveTextContent("Member");
+    });
+    // No bypass notice for an ordinary peer.
+    expect(screen.queryByTestId("invite-bypass-notice")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+
+    expect(screen.getByTestId("invite-blocked-reason")).toHaveTextContent(
+      "Member vetting: need >= 5 mutual contacts (have 0).",
+    );
+    expect(screen.getByTestId("invite-submit")).toBeDisabled();
+  });
+
+  it("blocks a flagged Genesis issuer — the bypass never waives moderation flags", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") {
+        return Promise.resolve(
+          genesisStatus({ active_moderation_flags: 2, flags_ok: false, eligible: false }),
+        );
+      }
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    expect(screen.getByTestId("invite-blocked-reason")).toHaveTextContent(
+      "2 active moderation flag(s)",
+    );
+    expect(screen.getByTestId("invite-submit")).toBeDisabled();
+  });
+});
+
+describe("InviteManager — dev fallback bypass", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(defaultHandler);
+  });
+
+  it("enables minting in a dev build and says so explicitly", async () => {
+    // `import.meta.env.DEV` is true under vitest, which is exactly the
+    // dev-build affordance the fallback is meant to cover.
+    expect(import.meta.env.DEV).toBe(true);
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") {
+        // Not Genesis, not Admin, 0 contacts: normally blocked.
+        return Promise.resolve(genesisStatus({ is_genesis: false, eligible: false, bypass_reason: null }));
+      }
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-bypass-notice")).toHaveTextContent(
+        "Operator bootstrap mode: mutual vetting bypassed",
+      );
+    });
+    expect(screen.getByTestId("invite-bypass-notice")).toHaveTextContent("frontend dev build");
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+    expect(screen.getByTestId("invite-submit")).not.toBeDisabled();
   });
 });

@@ -58,8 +58,23 @@ pub const TOKEN_VERSION: u8 = 1;
 pub const MEMBER_MONTHLY_QUOTA: u32 = 3;
 /// Member vetting: account must be older than 14 days.
 pub const MEMBER_ACCOUNT_AGE_DAYS: i64 = 14;
-/// Member vetting: at least 5 mutual contacts in contacts.json.
+/// Member vetting: default mutual-contact requirement (5).
+///
+/// Operators may tune this per-enclave via
+/// `UserPreferences::invite_min_contacts` (see `set_vetting_threshold`), but
+/// it is clamped to `[MIN_CONTACTS_THRESHOLD_FLOOR,
+/// MAX_CONTACTS_THRESHOLD_CEILING]` so the anti-Sybil gate can be tightened or
+/// relaxed but never removed for ordinary members.
 pub const MEMBER_MIN_CONTACTS: usize = 5;
+/// Hard floor for the operator-tunable mutual-contact threshold.
+///
+/// Genesis/Admin issuers bypass the gate entirely (see
+/// `VettingSnapshot::is_genesis`); every other member is held to at least this
+/// many mutual contacts, so no configuration can reduce ordinary-peer
+/// anti-Sybil to zero.
+pub const MIN_CONTACTS_THRESHOLD_FLOOR: usize = 1;
+/// Hard ceiling for the operator-tunable mutual-contact threshold.
+pub const MAX_CONTACTS_THRESHOLD_CEILING: usize = 50;
 /// Upper bound on `valid_days` when minting (RFC §5.1: expiry ≤ 90 d).
 pub const MAX_VALID_DAYS: u64 = 90;
 /// `max_uses` clamp (RFC §5.1: shared family tokens ≤ 4).
@@ -162,11 +177,28 @@ pub struct InviteRecord {
 pub struct VettingStatus {
     pub account_age_days: i64,
     pub contact_count: usize,
+    /// Operator-configurable mutual-contact requirement applied to ordinary
+    /// members. Clamped to `[MIN_CONTACTS_THRESHOLD_FLOOR,
+    /// MAX_CONTACTS_THRESHOLD_CEILING]`.
+    pub min_contacts_required: usize,
+    /// `min_contacts_required - contact_count`. Negative when the issuer is
+    /// short of the requirement.
+    pub contacts_remaining: i64,
     pub active_moderation_flags: usize,
     pub account_age_ok: bool,
     pub contacts_ok: bool,
     pub flags_ok: bool,
+    /// True when the issuer may mint under the current standing. Genesis and
+    /// Admin issuers are `true` regardless of the contact threshold.
     pub eligible: bool,
+    /// True when the issuer is the vault's root / Genesis identity (the
+    /// operator's Level 1 public persona). Genesis issuers are exempt from the
+    /// account-age and mutual-contact gates, which are otherwise impossible to
+    /// satisfy during first-run bootstrap.
+    pub is_genesis: bool,
+    /// Human-readable explanation of why the mutual-vetting gate is not being
+    /// applied, or `None` when ordinary vetting is in force.
+    pub bypass_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +314,16 @@ fn unix_now() -> u64 {
 
 // ---------- vetting & quota predicates (RFC-002 §5.2) ----------
 
+/// Clamp an operator-supplied mutual-contact threshold into the enforceable
+/// range. Anything outside the range is a hard configuration error upstream;
+/// this keeps the predicate total.
+pub fn clamp_min_contacts(value: u32) -> usize {
+    (value as usize).clamp(
+        MIN_CONTACTS_THRESHOLD_FLOOR,
+        MAX_CONTACTS_THRESHOLD_CEILING,
+    )
+}
+
 /// Local standing snapshot feeding the member vetting predicate.
 #[derive(Debug, Clone, Copy)]
 pub struct VettingSnapshot {
@@ -290,10 +332,56 @@ pub struct VettingSnapshot {
     pub contact_count: usize,
     /// RFC-003 moderation-flag count; absent ledger = 0 in v0.2.1.
     pub active_moderation_flags: usize,
+    /// Operator-tunable mutual-contact requirement for ordinary members.
+    pub min_contacts_required: usize,
+    /// True when the issuer is the vault's root / Genesis identity. Genesis
+    /// issuers are exempt from the account-age and mutual-contact gates.
+    pub is_genesis: bool,
 }
 
-/// Member vetting: account age > 14 days, ≥ 5 contacts, 0 flags.
+impl Default for VettingSnapshot {
+    fn default() -> Self {
+        Self {
+            joined_unix: 0,
+            contact_count: 0,
+            active_moderation_flags: 0,
+            min_contacts_required: MEMBER_MIN_CONTACTS,
+            is_genesis: false,
+        }
+    }
+}
+
+/// Status line describing why the mutual-vetting gate is not applied, or
+/// `None` when ordinary vetting is in force. Surfaced verbatim to the UI so
+/// the operator sees *why* issuance is permitted rather than a silent hole.
+pub fn genesis_bypass_reason(snapshot: &VettingSnapshot) -> Option<String> {
+    if !snapshot.is_genesis {
+        return None;
+    }
+    Some(format!(
+        "Operator bootstrap mode: mutual vetting bypassed (Genesis / Operator identity, {} contact(s) — threshold {} not applied)",
+        snapshot.contact_count, snapshot.min_contacts_required
+    ))
+}
+
+/// Member vetting: account age > 14 days, ≥ `min_contacts_required` contacts,
+/// 0 flags.
+///
+/// Genesis / Operator issuers bypass the account-age and mutual-contact gates
+/// (see `enforce_issuance_policy`) but are **never** exempt from the
+/// moderation-flag gate: a flagged identity stops issuing regardless of tier.
 pub fn member_eligible(snapshot: &VettingSnapshot, now: u64) -> Result<(), String> {
+    // Safety gate first, and it applies to everyone including Genesis: an
+    // issuer carrying active moderation flags must not mint.
+    if snapshot.active_moderation_flags > 0 {
+        return Err(format!(
+            "Member vetting: issuer has {} active moderation flags",
+            snapshot.active_moderation_flags
+        ));
+    }
+    if snapshot.is_genesis {
+        return Ok(());
+    }
     let age_days = ((now as i64).saturating_sub(snapshot.joined_unix)) / 86_400;
     if age_days <= MEMBER_ACCOUNT_AGE_DAYS {
         return Err(format!(
@@ -301,16 +389,10 @@ pub fn member_eligible(snapshot: &VettingSnapshot, now: u64) -> Result<(), Strin
             age_days, MEMBER_ACCOUNT_AGE_DAYS
         ));
     }
-    if snapshot.contact_count < MEMBER_MIN_CONTACTS {
+    if snapshot.contact_count < snapshot.min_contacts_required {
         return Err(format!(
             "Member vetting: need >= {} mutual contacts (have {})",
-            MEMBER_MIN_CONTACTS, snapshot.contact_count
-        ));
-    }
-    if snapshot.active_moderation_flags > 0 {
-        return Err(format!(
-            "Member vetting: issuer has {} active moderation flags",
-            snapshot.active_moderation_flags
+            snapshot.min_contacts_required, snapshot.contact_count
         ));
     }
     Ok(())
@@ -352,9 +434,39 @@ pub fn enforce_issuance_policy(
     }
 }
 
+/// Resolve whether `did` is the vault's root / Genesis (operator) identity.
+///
+/// Genesis is defined *structurally* — the DID must be a profile that actually
+/// exists in this vault and be the current Level 1 Public Persona:
+///   * `profile_id == "primary"`, which also excludes break-glass tombstoned
+///     `retired_primary_*` personas, and
+///   * `level == 1` and `!is_system_reserved`, which excludes the Level 0
+///     Anchor sanctum and all Level 2+ contextual burners.
+///
+/// The original genesis persona is the `derivation_index == 1` derivation;
+/// after `rotate_primary_persona` the successor primary is derived at index
+/// N > 1 and keeps genesis standing, so the check deliberately does not pin
+/// the index.
+///
+/// Because the DID is matched against a local vault profile, the signal is not
+/// forgeable from outside the enclave: a peer cannot claim genesis standing by
+/// asserting a DID.
+pub fn is_genesis_identity(app: &AppHandle, did: &str) -> bool {
+    let Ok(vault) = crate::vault::load_vault(app) else {
+        return false;
+    };
+    vault.profiles.iter().any(|p| {
+        p.did == did
+            && p.profile_id == crate::vault::DEFAULT_PERSONA_PROFILE_ID
+            && p.level == 1
+            && !p.is_system_reserved
+    })
+}
+
 /// Build the local standing snapshot. Contacts come from `contacts.json`; the
 /// account-age proxy is the earliest contact record. Moderation flags are 0
-/// until RFC-003 lands.
+/// until RFC-003 lands. The mutual-contact threshold is the operator preference
+/// `invite_min_contacts`, clamped into the enforceable range.
 pub fn synthesize_vetting_snapshot(app: &AppHandle) -> VettingSnapshot {
     let mut contact_count = 0usize;
     let mut joined_unix = 0i64;
@@ -367,10 +479,19 @@ pub fn synthesize_vetting_snapshot(app: &AppHandle) -> VettingSnapshot {
             .min()
             .unwrap_or(0);
     }
+    let min_contacts_required =
+        clamp_min_contacts(crate::load_preferences(app).invite_min_contacts);
+    // Genesis is evaluated against the *active* L1 DID — the same identity
+    // `mint_invite_token` signs with, resolved via the shared helper.
+    let is_genesis = crate::resolve_profile_keypair(app, None)
+        .map(|(_, did)| is_genesis_identity(app, &did))
+        .unwrap_or(false);
     VettingSnapshot {
         joined_unix,
         contact_count,
         active_moderation_flags: 0,
+        min_contacts_required,
+        is_genesis,
     }
 }
 
@@ -879,11 +1000,25 @@ pub fn issuer_status(app: &AppHandle, did: &str) -> Result<IssuerStatus, String>
     let now = unix_now();
     let role = resolve_issuer_role(&conn, did);
     let quota_used_last_30d = quota_used_last_30d(&conn, did, now);
-    let snapshot = synthesize_vetting_snapshot(app);
+    let mut snapshot = synthesize_vetting_snapshot(app);
+    // `did` is resolved by the caller from the active persona; trust that
+    // parameter over the independently-synthesized active DID so the badge can
+    // never disagree with the identity the mint command would use.
+    if !did.is_empty() {
+        snapshot.is_genesis = snapshot.is_genesis || is_genesis_identity(app, did);
+    }
     let age_days = (((now as i64).saturating_sub(snapshot.joined_unix)) / 86_400).max(0);
     let account_age_ok = age_days > MEMBER_ACCOUNT_AGE_DAYS;
-    let contacts_ok = snapshot.contact_count >= MEMBER_MIN_CONTACTS;
+    let contacts_ok = snapshot.contact_count >= snapshot.min_contacts_required;
     let flags_ok = snapshot.active_moderation_flags == 0;
+    let bypass_reason = genesis_bypass_reason(&snapshot);
+    // Genesis and Admin issuers skip the age/contact gates entirely. Moderation
+    // flags are never waived for anyone.
+    let is_genesis = snapshot.is_genesis;
+    let bypassed = is_genesis || role == InviteTier::Admin;
+    let eligible = flags_ok && (bypassed || (account_age_ok && contacts_ok));
+    let contacts_remaining =
+        (snapshot.min_contacts_required as i64) - (snapshot.contact_count as i64);
     Ok(IssuerStatus {
         did: did.to_string(),
         role: role.as_str().to_string(),
@@ -896,11 +1031,15 @@ pub fn issuer_status(app: &AppHandle, did: &str) -> Result<IssuerStatus, String>
         vetting: VettingStatus {
             account_age_days: age_days,
             contact_count: snapshot.contact_count,
+            min_contacts_required: snapshot.min_contacts_required,
+            contacts_remaining,
             active_moderation_flags: snapshot.active_moderation_flags,
             account_age_ok,
             contacts_ok,
             flags_ok,
-            eligible: account_age_ok && contacts_ok && flags_ok,
+            eligible,
+            is_genesis,
+            bypass_reason,
         },
     })
 }
@@ -1104,30 +1243,205 @@ mod tests {
     #[test]
     fn member_vetting_boundaries() {
         let now = now();
-        let fresh = VettingSnapshot { joined_unix: (now as i64) - 14 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let fresh = VettingSnapshot { joined_unix: (now as i64) - 14 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
         // Exactly 14 days is NOT > 14.
         let err = enforce_issuance_policy(InviteTier::Member, InviteTier::Member, 0, Some(3), &fresh, now).unwrap_err();
         assert!(err.contains("14d"), "unexpected: {}", err);
-        let old = VettingSnapshot { joined_unix: (now as i64) - 15 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let old = VettingSnapshot { joined_unix: (now as i64) - 15 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
         assert!(enforce_issuance_policy(InviteTier::Member, InviteTier::Member, 0, Some(3), &old, now).is_ok());
         // Too few contacts.
-        let few = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 4, active_moderation_flags: 0 };
+        let few = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 4, active_moderation_flags: 0, ..Default::default() };
         let err = enforce_issuance_policy(InviteTier::Member, InviteTier::Member, 0, Some(3), &few, now).unwrap_err();
         assert!(err.contains("contacts"), "unexpected: {}", err);
         // Active moderation flags block issuance.
-        let flagged = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 1 };
+        let flagged = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 1, ..Default::default() };
         let err = enforce_issuance_policy(InviteTier::Member, InviteTier::Member, 0, Some(3), &flagged, now).unwrap_err();
         assert!(err.contains("moderation"), "unexpected: {}", err);
         // Member cannot mint admin-tier invites.
-        let old = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let old = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
         let err = enforce_issuance_policy(InviteTier::Member, InviteTier::Admin, 0, Some(3), &old, now).unwrap_err();
         assert!(err.contains("only mint member-tier"), "unexpected: {}", err);
     }
 
     #[test]
+    fn genesis_bypasses_bootstrap_impossible_gates() {
+        let now = now();
+        // The chicken-and-egg bootstrap case: brand-new root operator with an
+        // empty contact book and a brand-new account. Every ordinary member
+        // gate fails, but the Genesis identity must still be able to mint the
+        // first onboarding invite.
+        let genesis = VettingSnapshot {
+            joined_unix: now as i64,
+            contact_count: 0,
+            active_moderation_flags: 0,
+            min_contacts_required: MEMBER_MIN_CONTACTS,
+            is_genesis: true,
+        };
+        assert_eq!(member_eligible(&genesis, now), Ok(()));
+        assert!(enforce_issuance_policy(
+            InviteTier::Member,
+            InviteTier::Member,
+            0,
+            Some(3),
+            &genesis,
+            now
+        )
+        .is_ok());
+
+        // The identical snapshot WITHOUT genesis standing still fails closed —
+        // here on the account-age gate, which is evaluated first.
+        let peer = VettingSnapshot { is_genesis: false, ..genesis };
+        let err = member_eligible(&peer, now).unwrap_err();
+        assert!(err.contains("account age"), "unexpected: {}", err);
+
+        // And an aged-in peer with an empty contact book is rejected on the
+        // mutual-contact gate.
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            ..peer
+        };
+        let err = member_eligible(&peer, now).unwrap_err();
+        assert!(err.contains("mutual contacts"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn genesis_never_bypasses_moderation_flags_or_tier_restrictions() {
+        let now = now();
+        // Safety gate is never waived, not even for the operator.
+        let flagged_genesis = VettingSnapshot {
+            joined_unix: now as i64,
+            contact_count: 0,
+            active_moderation_flags: 2,
+            min_contacts_required: MEMBER_MIN_CONTACTS,
+            is_genesis: true,
+        };
+        let err = member_eligible(&flagged_genesis, now).unwrap_err();
+        assert!(err.contains("moderation"), "unexpected: {}", err);
+
+        // Genesis status does not grant admin-tier issuance — only the
+        // `issuers` registry role does.
+        let genesis = VettingSnapshot {
+            active_moderation_flags: 0,
+            is_genesis: true,
+            ..flagged_genesis
+        };
+        let err = enforce_issuance_policy(
+            InviteTier::Member,
+            InviteTier::Admin,
+            0,
+            Some(3),
+            &genesis,
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("only mint member-tier"), "unexpected: {}", err);
+
+        // ...and the rolling quota still applies to Genesis members.
+        let err = enforce_issuance_policy(
+            InviteTier::Member,
+            InviteTier::Member,
+            3,
+            Some(3),
+            &genesis,
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("quota"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn configurable_threshold_gates_ordinary_members() {
+        let now = now();
+        let base = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 3,
+            active_moderation_flags: 0,
+            min_contacts_required: MEMBER_MIN_CONTACTS,
+            is_genesis: false,
+        };
+        // Default threshold of 5 rejects a 3-contact issuer.
+        let err = member_eligible(&base, now).unwrap_err();
+        assert!(err.contains("need >= 5 mutual contacts"), "unexpected: {}", err);
+
+        // Operator tunes the requirement down to 3 — now satisfied.
+        let relaxed = VettingSnapshot { min_contacts_required: 3, ..base };
+        assert_eq!(member_eligible(&relaxed, now), Ok(()));
+
+        // ...and the error text tracks the configured value.
+        let strict = VettingSnapshot { min_contacts_required: 10, ..base };
+        let err = member_eligible(&strict, now).unwrap_err();
+        assert!(
+            err.contains("need >= 10 mutual contacts (have 3)"),
+            "unexpected: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn threshold_clamp_keeps_anti_sybil_floor_intact() {
+        // The operator can never configure the gate away for ordinary members.
+        assert_eq!(clamp_min_contacts(0), MIN_CONTACTS_THRESHOLD_FLOOR);
+        assert_eq!(clamp_min_contacts(1), 1);
+        assert_eq!(clamp_min_contacts(5), 5);
+        assert_eq!(
+            clamp_min_contacts(u32::MAX),
+            MAX_CONTACTS_THRESHOLD_CEILING
+        );
+    }
+
+    #[test]
+    fn genesis_bypass_reason_is_surfaced_only_for_genesis() {
+        let now = now();
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 0,
+            ..Default::default()
+        };
+        assert!(genesis_bypass_reason(&peer).is_none());
+
+        let genesis = VettingSnapshot { is_genesis: true, ..peer };
+        let reason = genesis_bypass_reason(&genesis).expect("genesis reason");
+        assert!(
+            reason.contains("Operator bootstrap mode: mutual vetting bypassed"),
+            "unexpected: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn genesis_member_mints_a_bootstrap_token() {
+        let mut conn = mem_db();
+        let signing_key = test_signing_key();
+        let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
+        let now = now();
+        let genesis = VettingSnapshot {
+            joined_unix: now as i64,
+            contact_count: 0,
+            active_moderation_flags: 0,
+            min_contacts_required: MEMBER_MIN_CONTACTS,
+            is_genesis: true,
+        };
+        let token = mint_token_core(
+            &mut conn,
+            &signing_key,
+            &kp.did,
+            "member",
+            1,
+            30,
+            vec!["join".to_string()],
+            None,
+            &genesis,
+            now,
+        )
+        .expect("genesis issuer must be able to mint the first invite");
+        assert!(verify_token_signature(&token).is_ok());
+        assert_eq!(token.tier, "member");
+    }
+
+    #[test]
     fn guest_cannot_issue_and_admin_unlimited() {
         let now = now();
-        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
         assert!(enforce_issuance_policy(InviteTier::Guest, InviteTier::Member, 0, Some(3), &snapshot, now).is_err());
         // Admin: far past quota, still mintable.
         assert!(enforce_issuance_policy(InviteTier::Admin, InviteTier::Admin, 999, None, &snapshot, now).is_ok());
@@ -1140,7 +1454,7 @@ mod tests {
         let signing_key = test_signing_key();
         let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
         let now = now();
-        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
 
         // Mint 3 invites within the window — all succeed.
         for _ in 0..3 {
@@ -1202,7 +1516,7 @@ mod tests {
         let signing_key = test_signing_key();
         let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
         let now = now();
-        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
 
         let token = mint_token_core(
             &mut conn,
@@ -1250,7 +1564,7 @@ mod tests {
         let signing_key = test_signing_key();
         let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
         let now = now();
-        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0 };
+        let snapshot = VettingSnapshot { joined_unix: (now as i64) - 60 * 86_400, contact_count: 5, active_moderation_flags: 0, ..Default::default() };
         let token = mint_token_core(
             &mut conn,
             &signing_key,

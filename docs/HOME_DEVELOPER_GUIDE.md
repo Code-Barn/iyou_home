@@ -24,13 +24,13 @@ npm run tauri dev
 
 ### 1.3 Verification & Test Commands
 ```bash
-# Execute full backend Rust test suite (176 tests)
+# Execute full backend Rust test suite (184 tests)
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # Run TypeScript typecheck & production bundle build
 npx tsc --noEmit && npm run build
 
-# Run Vitest test runner (139 unit tests across 18 test files)
+# Run Vitest test runner (162 unit tests across 19 test files)
 npx vitest run
 ```
 
@@ -170,9 +170,29 @@ All commands below are `#[tauri::command]` functions invoked from the React side
 | `list_invites` | — | `Vec<InviteRecord>` | Newest first, each with a computed status pill. |
 | `revoke_invite` | `nonce: string` | `()` | Tombstones the nonce + graph edge in `invites.db`; refuses unknown nonces (fail-closed). |
 | `validate_invite_token` | `tokenJson: string, presentingDid: string` | `ValidationResult` | Admission-gate preview: schema → expiry → signature → revocation → use budget → replay/self-claim, returning the RFC-002 denial code (`INVALID`, `EXPIRED`, `USED`, `REVOKED`) on failure. |
-| `get_issuer_status` | — | `IssuerStatus` | Returns the active L1 DID's role (`Admin`, `Member`, `Guest`), quota allowance, and vetting attributes. |
+| `get_issuer_status` | — | `IssuerStatus` | Returns the active L1 DID's role (`Admin`, `Member`, `Guest`), quota allowance, and vetting attributes — including `is_genesis` and the `bypass_reason` surfaced to the Issue Invite modal. |
 | `set_issuer_role` | `did: string, role: string` | `()` | Enclave-local administrative role assignment in `invites.db`. |
+| `set_vetting_threshold` | `minContacts: u32` | `u32` | Persists the operator-tunable mutual-contact requirement (`invite_min_contacts`) in `preferences.json` and returns the clamped value in force. |
 | `render_invite_qr` | `tokenJson: string` | `String` (data URL) | Generates QR code matrix data URL for direct mobile invite ingestion. |
+
+#### 4.3.1 Genesis / Operator Bypass & Configurable Threshold
+
+The `>= 5 mutual contacts` gate is an anti-Sybil control aimed at *ordinary peers*. Applied literally it deadlocks the first operator: a greenfield root identity has an empty contact book by definition, so it could never mint the invite that populates that book.
+
+| Issuer | Account age | Mutual contacts | Moderation flags | Tier choice | Quota |
+|:---|:---|:---|:---|:---|:---|
+| **Genesis / Operator** (current L1 Public Persona) | waived | **waived** | **enforced** | member only | enforced (3 / 30 d) |
+| **Admin** (`issuers` registry) | waived | waived | **enforced** | any | unlimited |
+| **Member** (ordinary) | enforced | enforced | **enforced** | member only | enforced (3 / 30 d) |
+| **Guest** | — | — | — | **cannot mint** | — |
+
+**Resolution.** `is_genesis_identity` matches the issuer DID against a profile in the *local* vault and requires `profile_id == "primary"`, `level == 1`, and `!is_system_reserved`. The check deliberately does not pin `derivation_index`, so genesis standing survives `rotate_primary_persona` (the break-glass successor keeps the exemption; the tombstoned `retired_primary_*` does not). Level 0 Anchor personas are excluded — the air-gapped sanctum never mints. Because the DID is matched against a local vault profile, the signal cannot be forged by a peer asserting a DID.
+
+**Never waived.** The moderation-flag gate applies to *every* issuer including Genesis and Admin. Genesis status also confers no tier escalation (admin-tier tokens still require an `Admin` registry entry) and no quota relief.
+
+**Configurable threshold.** `invite_min_contacts` is an *operator preference* read back by the enclave at enforcement time — never a per-request client argument, so a member cannot weaken the gate for themselves by passing a lower value to `create_invite_token`. It is clamped to `[MIN_CONTACTS_THRESHOLD_FLOOR = 1, MAX_CONTACTS_THRESHOLD_CEILING = 50]`, and is derived in the UI by `src/components/invites/inviteVetting.ts`, which mirrors the Rust predicate and fails **closed** when issuer standing has not loaded.
+
+**Dev affordance.** A `import.meta.env.DEV` build waives the *displayed* gate and labels itself `Operator bootstrap mode: mutual vetting bypassed (frontend dev build — the enclave still enforces its own policy)`. It is presentation-only: the enclave remains the enforcing authority, and a dev build without Genesis standing still surfaces the backend denial.
 
 ### 4.4 Moderation & Admin (RFC-003)
 

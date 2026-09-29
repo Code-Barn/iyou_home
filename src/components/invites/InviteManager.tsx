@@ -21,9 +21,13 @@
  * Surfaces issuer standing (role, rolling monthly quota, vetting milestones),
  * a minting modal (tier / max_uses / valid_days / satellite / scope), a
  * copyable + QR-encodable token handoff, and a revocable admission ledger.
+ *
+ * The mutual-contact anti-Sybil gate is waived for the vault's Genesis /
+ * Operator identity and for Admin issuers (see `inviteVetting.ts`); ordinary
+ * members remain subject to the operator-tunable contact threshold.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -33,8 +37,21 @@ import type {
   InviteTier,
   IssuerStatus,
 } from "../../lib/types";
+import {
+  MAX_CONTACTS_CEILING,
+  MIN_CONTACTS_FLOOR,
+  clampThreshold,
+  deriveInviteStanding,
+} from "./inviteVetting";
 
 const SCOPE_OPTIONS = ["relay:read", "relay:write"] as const;
+
+/**
+ * True in a `vite dev` build. Read at render time (not cached at module scope)
+ * so tests can stub `import.meta.env.DEV`. The enclave remains the enforcing
+ * authority regardless — this only waives the *displayed* gate.
+ */
+const isDevMode = (): boolean => Boolean(import.meta.env?.DEV);
 
 const STATUS_STYLE: Record<InviteRecord["status"], CSSProperties> = {
   live: {
@@ -82,6 +99,13 @@ const ROLE_STYLE: Record<InviteTier, CSSProperties> = {
   },
 };
 
+/** Genesis / Operator badge — the root network identity. */
+const GENESIS_STYLE: CSSProperties = {
+  background: "#4c1d95",
+  color: "#ffffff",
+  border: "1px solid #ddd6fe",
+};
+
 function formatDate(ts: number): string {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleDateString();
@@ -112,15 +136,34 @@ export default function InviteManager() {
 
   const [revokingNonce, setRevokingNonce] = useState<string | null>(null);
 
+  // Genesis / Admin bypass state.
+  const [contacts, setContacts] = useState<{ peer_id: string }[]>([]);
+  const [thresholdDraft, setThresholdDraft] = useState<number | null>(null);
+  const [thresholdSaved, setThresholdSaved] = useState<number | null>(null);
+  const [thresholdError, setThresholdError] = useState<string | null>(null);
+  const [savingThreshold, setSavingThreshold] = useState(false);
+
+  const contactCount = contacts.length;
+  const threshold = clampThreshold(issuer?.vetting?.min_contacts_required ?? 5);
+
+  const standing = useMemo(
+    () => deriveInviteStanding({ issuer, devMode: isDevMode(), contactCount }),
+    [issuer, contactCount],
+  );
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [status, records] = await Promise.all([
+      const [status, records, contactList] = await Promise.all([
         invoke<IssuerStatus>("get_issuer_status"),
         invoke<InviteRecord[]>("list_invites"),
+        // Best-effort: drives the "root identity with an empty contact book"
+        // bootstrap case. The enclave also computes this server-side.
+        invoke<{ peer_id: string }[]>("list_contacts").catch(() => []),
       ]);
       setIssuer(status);
       setInvites(records);
+      setContacts(contactList ?? []);
       setError(null);
     } catch (err) {
       setError(String(err));
@@ -138,12 +181,14 @@ export default function InviteManager() {
     setMintedToken(null);
     setQrUrl(null);
     setCopied(false);
+    setThresholdError(null);
     // Members may only issue member-tier invites.
     setTier(issuer?.role === "admin" ? "member" : "member");
     setMaxUses(1);
     setValidDays(30);
     setSatelliteId("");
     setExtraScopes([]);
+    setThresholdDraft(null);
     setShowModal(true);
   };
 
@@ -151,6 +196,29 @@ export default function InviteManager() {
     setShowModal(false);
     setMintedToken(null);
     setQrUrl(null);
+  };
+
+  /**
+   * Persist the operator-tunable mutual-contact threshold. The enclave clamps
+   * the value into [1, 50] and is the enforcing authority — this control tunes
+   * the gate, it can never switch it off for ordinary members.
+   */
+  const handleSaveThreshold = async () => {
+    if (thresholdDraft === null) return;
+    setSavingThreshold(true);
+    setThresholdError(null);
+    try {
+      const applied = await invoke<number>("set_vetting_threshold", {
+        minContacts: thresholdDraft,
+      });
+      setThresholdSaved(applied);
+      setThresholdDraft(null);
+      await refresh();
+    } catch (err) {
+      setThresholdError(String(err));
+    } finally {
+      setSavingThreshold(false);
+    }
   };
 
   const toggleScope = (scope: string) => {
@@ -225,29 +293,53 @@ export default function InviteManager() {
   const vettingChips = () => {
     if (!issuer) return null;
     const v = issuer.vetting;
-    const chips: { ok: boolean; label: string }[] = [
-      { ok: v.account_age_ok, label: `Account ${v.account_age_days}d` },
-      { ok: v.contacts_ok, label: `${v.contact_count} contacts` },
-      { ok: v.flags_ok, label: "0 mod flags" },
+    const required = v.min_contacts_required ?? 5;
+    // Under a Genesis/Admin bypass the age and contact chips describe state
+    // that is explicitly not gating issuance, so mark them waived rather than
+    // failing. The moderation-flag chip is never waived and always reflects the
+    // real gate.
+    const waived = standing.bypassed;
+    const chips: { ok: boolean; label: string; waived?: boolean }[] = [
+      {
+        ok: v.account_age_ok,
+        label: `Account ${v.account_age_days}d`,
+        waived: waived && !v.account_age_ok,
+      },
+      {
+        ok: v.contacts_ok,
+        label: `${v.contact_count}/${required} contacts`,
+        waived: waived && !v.contacts_ok,
+      },
+      { ok: v.flags_ok, label: `${v.active_moderation_flags} mod flags` },
     ];
-    return chips.map((c) => (
-      <span
-        key={c.label}
-        data-testid={`vetting-chip-${c.label.replace(/\s+/g, "-")}`}
-        title={c.ok ? "Requirement met" : "Requirement not yet met"}
-        style={{
-          fontSize: "0.72rem",
-          padding: "0.15rem 0.5rem",
-          borderRadius: "999px",
-          background: c.ok ? "#ecfdf5" : "#fffbeb",
-          color: c.ok ? "#047857" : "#92400e",
-          border: `1px solid ${c.ok ? "#a7f3d0" : "#fde68a"}`,
-          fontWeight: 600,
-        }}
-      >
-        {c.ok ? "✓" : "✗"} {c.label}
-      </span>
-    ));
+    return chips.map((c) => {
+      const passing = c.ok;
+      return (
+        <span
+          key={c.label}
+          data-testid={`vetting-chip-${c.label.replace(/[^a-z0-9]+/gi, "-")}`}
+          title={
+            passing
+              ? "Requirement met"
+              : c.waived
+                ? "Waived — Genesis / Operator bypass"
+                : "Requirement not yet met"
+          }
+          style={{
+            fontSize: "0.72rem",
+            padding: "0.15rem 0.5rem",
+            borderRadius: "999px",
+            background: passing ? "#ecfdf5" : c.waived ? "#eef2ff" : "#fffbeb",
+            color: passing ? "#047857" : c.waived ? "#3730a3" : "#92400e",
+            border: `1px solid ${passing ? "#a7f3d0" : c.waived ? "#c7d2fe" : "#fde68a"}`,
+            fontWeight: 600,
+            textDecoration: c.waived ? "line-through" : "none",
+          }}
+        >
+          {passing ? "✓" : c.waived ? "⊘" : "✗"} {c.label}
+        </span>
+      );
+    });
   };
 
   return (
@@ -281,14 +373,14 @@ export default function InviteManager() {
             <span
               data-testid="invite-role"
               style={{
-                ...ROLE_STYLE[issuer?.role ?? "member"],
+                ...(standing.is_genesis ? GENESIS_STYLE : ROLE_STYLE[issuer?.role ?? "member"]),
                 fontSize: "0.72rem",
                 padding: "0.15rem 0.55rem",
                 borderRadius: "999px",
                 fontWeight: 700,
               }}
             >
-              {ROLE_LABEL[issuer?.role ?? "member"]}
+              {standing.is_genesis ? "Genesis / Operator" : ROLE_LABEL[issuer?.role ?? "member"]}
             </span>
             <span data-testid="invite-quota" title="Rolling 30-day issuance window">
               {"\uD83D\uDCC5"} {quotaLabel()}
@@ -300,6 +392,24 @@ export default function InviteManager() {
           {"\u2709\uFE0F"} Issue Invite
         </button>
       </div>
+
+      {standing.notice && (
+        <div
+          data-testid="invite-bypass-notice"
+          role="status"
+          style={{
+            padding: "0.5rem 0.8rem",
+            borderRadius: "6px",
+            background: "#eef2ff",
+            border: "1px solid #c7d2fe",
+            color: "#3730a3",
+            fontSize: "0.8rem",
+            marginBottom: "0.75rem",
+          }}
+        >
+          {"\u2299\uFE0F"} {standing.notice}
+        </div>
+      )}
 
       {error && (
         <div
@@ -490,8 +600,28 @@ export default function InviteManager() {
                   Mint a signed capability token bound to your Level 1 identity.
                   {issuer?.role === "admin"
                     ? " As Admin you may issue any tier with no quota."
-                    : " Members: ≤ 3 per rolling 30 days, member tier only."}
+                    : standing.is_genesis
+                      ? " Genesis / Operator: mutual vetting is bypassed so you can seed the first invites."
+                      : " Members: ≤ 3 per rolling 30 days, member tier only."}
                 </p>
+
+                {standing.notice && (
+                  <div
+                    data-testid="invite-modal-bypass-notice"
+                    role="status"
+                    style={{
+                      padding: "0.5rem 0.8rem",
+                      borderRadius: "6px",
+                      background: "#eef2ff",
+                      border: "1px solid #c7d2fe",
+                      color: "#3730a3",
+                      fontSize: "0.8rem",
+                      marginBottom: "0.9rem",
+                    }}
+                  >
+                    {"\u2299\uFE0F"} {standing.notice}
+                  </div>
+                )}
 
                 <label style={{ display: "block", marginBottom: "0.9rem", fontSize: "0.85rem", fontWeight: 600 }}>
                   Tier
@@ -509,6 +639,96 @@ export default function InviteManager() {
                     ))}
                   </select>
                 </label>
+
+                {/* Operator-tunable RFC-002 §5.2 mutual-contact threshold.
+                    Persisted enclave-side via `set_vetting_threshold`; it tunes
+                    the gate for ordinary members and never disables it. */}
+                <label
+                  data-testid="invite-threshold-label"
+                  style={{ display: "block", marginBottom: "0.9rem", fontSize: "0.85rem", fontWeight: 600 }}
+                >
+                  Member vetting: need {">="}{" "}
+                  <input
+                    data-testid="invite-threshold"
+                    type="number"
+                    min={MIN_CONTACTS_FLOOR}
+                    max={MAX_CONTACTS_CEILING}
+                    value={thresholdDraft ?? threshold}
+                    onChange={(e) => setThresholdDraft(Number(e.target.value))}
+                    style={{
+                      display: "inline-block",
+                      width: "5rem",
+                      margin: "0 0.25rem",
+                      fontSize: "0.85rem",
+                      fontWeight: 600,
+                    }}
+                  />{" "}
+                  mutual contacts (have {contactCount})
+                  <span style={{ display: "block", fontWeight: 400, fontSize: "0.75rem", color: "#6b7280", marginTop: "0.25rem" }}>
+                    {standing.bypassed
+                      ? "Not applied to you: Genesis / Operator bypass. This threshold still applies to ordinary member issuers."
+                      : `Applies to ordinary member issuers. Range ${MIN_CONTACTS_FLOOR}–${MAX_CONTACTS_CEILING}.`}
+                  </span>
+                </label>
+                {thresholdDraft !== null ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "-0.5rem", marginBottom: "0.9rem" }}>
+                    <button
+                      type="button"
+                      onClick={handleSaveThreshold}
+                      disabled={savingThreshold}
+                      data-testid="invite-threshold-save"
+                      style={{ fontSize: "0.78rem" }}
+                    >
+                      {savingThreshold ? "Saving…" : "Save threshold"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setThresholdDraft(null);
+                        setThresholdError(null);
+                      }}
+                      data-testid="invite-threshold-cancel"
+                      style={{ fontSize: "0.78rem" }}
+                    >
+                      Reset
+                    </button>
+                  </div>
+                ) : (
+                  thresholdSaved !== null && (
+                    <div
+                      data-testid="invite-threshold-saved"
+                      style={{
+                        padding: "0.4rem 0.7rem",
+                        borderRadius: "6px",
+                        background: "#ecfdf5",
+                        border: "1px solid #a7f3d0",
+                        color: "#047857",
+                        fontSize: "0.78rem",
+                        marginTop: "-0.5rem",
+                        marginBottom: "0.9rem",
+                      }}
+                    >
+                      ✓ Threshold applied: need {"≥"} {thresholdSaved} mutual contacts
+                    </div>
+                  )
+                )}
+                {thresholdError && (
+                  <div
+                    data-testid="invite-threshold-error"
+                    style={{
+                      padding: "0.5rem 0.8rem",
+                      borderRadius: "6px",
+                      background: "#fef2f2",
+                      border: "1px solid #fecaca",
+                      color: "#b91c1c",
+                      fontSize: "0.8rem",
+                      marginTop: "-0.5rem",
+                      marginBottom: "0.9rem",
+                    }}
+                  >
+                    {thresholdError}
+                  </div>
+                )}
 
                 <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.9rem" }}>
                   <label style={{ fontSize: "0.85rem", fontWeight: 600, flex: 1 }}>
@@ -587,6 +807,23 @@ export default function InviteManager() {
                   </div>
                 )}
 
+                {standing.blocked_reason && (
+                  <div
+                    data-testid="invite-blocked-reason"
+                    style={{
+                      padding: "0.5rem 0.8rem",
+                      borderRadius: "6px",
+                      background: "#fffbeb",
+                      border: "1px solid #fde68a",
+                      color: "#92400e",
+                      fontSize: "0.8rem",
+                      marginBottom: "0.85rem",
+                    }}
+                  >
+                    {"\u26A0\uFE0F"} {standing.blocked_reason}
+                  </div>
+                )}
+
                 <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.6rem", marginTop: "0.25rem" }}>
                   <button type="button" onClick={closeModal} data-testid="invite-cancel-modal">
                     Cancel
@@ -594,11 +831,16 @@ export default function InviteManager() {
                   <button
                     type="button"
                     onClick={handleMint}
-                    disabled={minting}
+                    disabled={minting || !standing.can_mint}
                     data-testid="invite-submit"
-                    style={{ opacity: minting ? 0.6 : 1 }}
+                    title={standing.blocked_reason ?? undefined}
+                    style={{ opacity: minting || !standing.can_mint ? 0.6 : 1 }}
                   >
-                    {minting ? "\u23F3 Minting…" : "\u2709\uFE0F Mint & Sign"}
+                    {minting
+                      ? "\u23F3 Minting…"
+                      : standing.bypassed
+                        ? "\u2709\uFE0F Mint & Sign (bypassed)"
+                        : "\u2709\uFE0F Mint & Sign"}
                   </button>
                 </div>
               </>

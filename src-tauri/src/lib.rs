@@ -129,6 +129,19 @@ pub struct UserPreferences {
     /// Public persona publish (`kind:0`) disabled (Teen default).
     #[serde(default)]
     pub public_persona_broadcast: bool,
+    /// RFC-002 §5.2 operator-tunable mutual-contact requirement for ordinary
+    /// member issuers. Clamped to
+    /// `[invites::MIN_CONTACTS_THRESHOLD_FLOOR,
+    /// invites::MAX_CONTACTS_THRESHOLD_CEILING]` on read so legacy or
+    /// hand-edited preferences can never disable the anti-Sybil gate.
+    /// Genesis / Admin issuers bypass this threshold entirely.
+    #[serde(default = "default_invite_min_contacts")]
+    pub invite_min_contacts: u32,
+}
+
+/// RFC-002 default mutual-contact threshold (5).
+pub fn default_invite_min_contacts() -> u32 {
+    invites::MEMBER_MIN_CONTACTS as u32
 }
 
 pub fn default_relay_mesh() -> Vec<String> {
@@ -161,6 +174,7 @@ impl Default for UserPreferences {
             mutual_contacts_only_dm: false,
             restricted_feed_indexing: false,
             public_persona_broadcast: true,
+            invite_min_contacts: default_invite_min_contacts(),
         }
     }
 }
@@ -1014,6 +1028,30 @@ fn set_issuer_role(app: AppHandle, did: String, role: String) -> Result<(), Stri
     let role_enum = invites::InviteTier::parse(&role)?;
     let conn = invites::invites_connection(&app)?;
     invites::set_issuer_role_in_db(&conn, &did, role_enum)
+}
+
+/// Operator-tunable RFC-002 §5.2 mutual-contact threshold.
+///
+/// Persists `invite_min_contacts` in `preferences.json` and returns the clamped
+/// value actually in force. This is an *operator preference*, never a
+/// per-request client argument: the value is read back by the enclave at
+/// enforcement time, so a member cannot weaken the gate for themselves by
+/// passing a lower number to `create_invite_token`.
+///
+/// Genesis / Admin issuers are unaffected — they already bypass the gate.
+/// Moderation flags are never waived, at any threshold.
+#[tauri::command]
+fn set_vetting_threshold(app: AppHandle, min_contacts: u32) -> Result<u32, String> {
+    if min_contacts as usize > invites::MAX_CONTACTS_THRESHOLD_CEILING {
+        return Err(format!(
+            "invite_min_contacts must not exceed {}",
+            invites::MAX_CONTACTS_THRESHOLD_CEILING
+        ));
+    }
+    let mut prefs = load_preferences(&app);
+    prefs.invite_min_contacts = min_contacts;
+    save_preferences(&app, &prefs)?;
+    Ok(invites::clamp_min_contacts(prefs.invite_min_contacts) as u32)
 }
 
 /// Render a signed invite token as a base64 PNG data URL for display.
@@ -3934,6 +3972,7 @@ pub fn run() {
             validate_invite_token,
             get_issuer_status,
             set_issuer_role,
+            set_vetting_threshold,
             render_invite_qr,
             admin_probe,
             admin_list_members,
@@ -4170,6 +4209,7 @@ mod tests {
             mutual_contacts_only_dm: false,
             restricted_feed_indexing: false,
             public_persona_broadcast: true,
+            invite_min_contacts: 3,
         };
 
         let json = serde_json::to_string(&prefs).expect("Should serialize");

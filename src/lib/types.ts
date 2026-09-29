@@ -364,11 +364,27 @@ export interface InviteRecord {
 export interface VettingStatus {
   account_age_days: number;
   contact_count: number;
+  /**
+   * Operator-tunable mutual-contact requirement applied to ordinary members.
+   * Clamped server-side to [1, 50]; Genesis/Admin issuers bypass it entirely.
+   */
+  min_contacts_required: number;
+  /** `min_contacts_required - contact_count`; negative when short of the bar. */
+  contacts_remaining: number;
   active_moderation_flags: number;
   account_age_ok: boolean;
   contacts_ok: boolean;
   flags_ok: boolean;
+  /** True when the issuer may mint under the current standing. */
   eligible: boolean;
+  /**
+   * True when the issuer is the vault's root / Genesis identity (the current
+   * Level 1 Public Persona). Resolved structurally against the local vault, so
+   * it cannot be claimed by asserting a DID.
+   */
+  is_genesis: boolean;
+  /** Why the mutual-vetting gate is not applied, or null when it is. */
+  bypass_reason: string | null;
 }
 
 /** Issuer standing (mirrors `invites::IssuerStatus`). */
@@ -379,6 +395,26 @@ export interface IssuerStatus {
   /** 0 = unlimited (admin). */
   quota_limit: number;
   vetting: VettingStatus;
+}
+
+/** Invite issuance standing, as rendered by the Issue Invite modal. */
+export interface InviteIssuanceStanding {
+  /** True when the active persona may mint without the mutual-contact gate. */
+  bypassed: boolean;
+  /** True for the vault's root / Genesis identity. */
+  is_genesis: boolean;
+  /** True when the issuer carries an `admin` role in the RFC-002 registry. */
+  is_admin: boolean;
+  /** True when a frontend dev build is waiving the gate for convenience. */
+  dev_bypass: boolean;
+  /** Tier label to render: "Genesis / Operator", "Admin", or the raw role. */
+  tier_label: string;
+  /** Status notice explaining the bypass, or null when ordinary vetting applies. */
+  notice: string | null;
+  /** True when the "Mint & Sign" button should be enabled. */
+  can_mint: boolean;
+  /** Blocked reason, or null when minting is permitted. */
+  blocked_reason: string | null;
 }
 
 // ---------- Satellite Admin & Moderation (RFC-003) ----------
