@@ -38,10 +38,14 @@ target/
 test_seed*.json
 
 # Runtime TLS certificates & keys
+# SEC-002: private key material must NEVER be committed. Operators stage
+# certificates locally at deploy time; the binary generates an ephemeral
+# in-memory authority when none are provisioned.
 src-tauri/certs/*.crt
 src-tauri/certs/*.key
 src-tauri/certs/*.pem
 src-tauri/certs/production.crt
+src-tauri/certs/production.key
 
 # Archived Historical Documentation
 docs/archive/

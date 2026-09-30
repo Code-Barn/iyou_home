@@ -151,7 +151,7 @@ Identity keys are derived deterministically from a single 32-byte cryptographic 
 
 ## 5. WebSocket Bridge Protocol (`wss://home.iyou.me:9001`)
 
-The Signature Bridge terminates TLS natively with runtime certificate loading from `{app_data}/certs/` (or ephemeral fallback in memory) and provides PNA pre-flights:
+The Signature Bridge terminates TLS natively with runtime certificate loading from `{app_data}/certs/` **only when an operator has manually provisioned both `production.crt` and `production.key`**; otherwise it falls back to an ephemeral in-memory self-signed authority. **Zero private key material is compiled into the binary (SEC-002).** It provides PNA pre-flights:
 `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Private-Network: true`.
 
 ### 5.1 Inbound Frame Dispatch Matrix

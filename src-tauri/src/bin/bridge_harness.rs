@@ -18,10 +18,24 @@
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use iyou_home_lib::bridge::is_allowed_origin;
+// SEC-002: the harness resolves TLS assets through the same runtime path as
+// the application — operator-provisioned `{cert_dir}/production.{crt,key}` if
+// present, otherwise an ephemeral in-memory rcgen authority. No key material
+// is compiled into this binary.
+use iyou_home_lib::certs::resolve_tls_assets;
+
+/// Directory scanned for operator-provisioned certificates. Override with
+/// `IYOU_TLS_CERT_DIR`; defaults to `./certs` relative to the working
+/// directory.
+fn cert_dir() -> std::path::PathBuf {
+    match std::env::var("IYOU_TLS_CERT_DIR") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::PathBuf::from("certs"),
+    }
+}
 
 fn extract_header(http_request: &str, header_name: &str) -> Option<String> {
     let target = format!("{}:", header_name.to_lowercase());
@@ -42,13 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting Bridge Test Harness on wss://home.iyou.me:9001 (dual-stack [::]:9001)...");
 
-    let cert_bytes = include_bytes!("../../certs/production.crt");
-    let key_bytes = include_bytes!("../../certs/production.key");
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_bytes[..])
-        .collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut &key_bytes[..])?
-        .expect("production.key must contain private key");
+    let cert_dir = cert_dir();
+    let (certs, key) = match resolve_tls_assets(&cert_dir) {
+        Ok(assets) => assets,
+        Err(e) => {
+            // Fail-closed: a half-provisioned or corrupt cert directory must
+            // never silently downgrade to a different served identity.
+            eprintln!("Bridge Test Harness TLS failure (NOT started): {}", e);
+            return Err(e.into());
+        }
+    };
 
     let config = ServerConfig::builder_with_provider(Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()?

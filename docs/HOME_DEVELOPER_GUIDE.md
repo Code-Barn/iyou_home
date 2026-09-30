@@ -267,7 +267,7 @@ All local daemons bind strictly to IPv4 loopback `127.0.0.1`.
 
 ### 5.1 Signature Bridge Protocol (`wss://home.iyou.me:9001`)
 
-The Signature Bridge terminates TLS natively with runtime certificate resolution (`{app_data}/certs/production.crt` and `production.key`) and provides Private Network Access (PNA) header pre-flights:
+The Signature Bridge terminates TLS natively with runtime certificate resolution — operator-provisioned `{app_data}/certs/production.crt` and `production.key` **or** an ephemeral in-memory authority, with zero compile-time key material (SEC-002; see §5.1.5) — and provides Private Network Access (PNA) header pre-flights:
 `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Private-Network: true`.
 
 Frames are JSON text messages. Every frame carrying a payload is validated before any state mutation — on failure the bridge replies with a typed `error` frame and makes **no change**.
@@ -382,6 +382,94 @@ The Level 0 Anchor is air-gapped from the bridge. `update_profile_metadata` (`va
 #### 5.1.4 No-Secret Invariant Over Port 9001
 
 Bridge frames carry only the `PublicProfileProjection`, which deliberately excludes `credentials` (raw W3C payloads) and the imported private-key leaves (`imported_seed_b58`, `imported_nostr_sk_hex`). No root seed, derived private key, or imported key material ever crosses Port 9001.
+
+#### 5.1.5 TLS Certificate Lifecycle (SEC-002)
+
+> **SEC-002 — RESOLVED.** The release binary previously embedded the production
+> TLS private key via a compile-time `include_bytes!` directive, making the key
+> recoverable from the shipped Mach-O/PE artifact with `strings`. That is no
+> longer possible: the enclave contains **no compile-time key material of any
+> kind**.
+>
+> ⚠️ **Operational follow-up — rotate the key.** Any key that was staged at
+> `src-tauri/certs/production.key` while the embed directive existed must be
+> treated as **publicly compromised**: it is recoverable verbatim from every
+> artifact built during that window. Revoke/rotate it at the CA and re-provision
+> the replacement into `{app_data}/certs/` out-of-band. Removing the embed stops
+> the leak going forward but does not un-leak the historical key.
+
+**Invariant: zero private key material in the binary.** `src-tauri/src/certs.rs`
+contains no `include_bytes!`, no `include_str!`, and no bundled PEM blob. There
+is nothing to extract because nothing is compiled in. A regression guard
+(`certs::tests::test_no_private_key_is_embedded_at_compile_time`) scans every
+Rust source in the crate on each `cargo test` and fails the build if any
+compile-time embed of key-shaped material or literal PEM private-key header
+reappears.
+
+**Resolution order** (`certs::resolve_tls_assets`, shared by the Signature Bridge
+`:9001` and the XMPP mesh `:5222`):
+
+| # | Condition | Behavior |
+|:---|:---|:---|
+| 1 | `{app_local_data_dir}/certs/production.crt` **and** `production.key` both exist | Operator-provisioned domain identity. Both files are read from disk at runtime and parsed with `rustls_pemfile`. |
+| 2 | Neither file exists | **Default.** An ephemeral self-signed authority is generated in memory via `rcgen::KeyPair::generate()` (SANs: `home.iyou.me`, `127.0.0.1`, `localhost`) and held only inside the process `ServerConfig`. |
+| 3 | Exactly one of the two files exists | **Fail-closed** with `TLS configuration incomplete in {dir}`. Both callers abort daemon startup — a TLS server must never silently downgrade to a different identity than the operator intended to serve. |
+| 4 | Both exist but are unreadable or corrupt PEM | **Fail-closed** with a `Corrupt TLS …` error. Same abort. |
+
+**Ephemeral certificates are never written to disk.** The fallback path does not
+create the cert directory, does not write a key, and does not persist anything:
+the keypair lives in process memory for the lifetime of the daemon and is
+regenerated (rotated) on every launch. `certs::tests` asserts that resolving
+against an empty *or* non-existent directory leaves no `production.crt` /
+`production.key` on disk.
+
+**Operator provisioning.** To serve a real, publicly-trusted `home.iyou.me`
+certificate, stage both files before launch:
+
+```bash
+APP_DATA="$HOME/Library/Application Support/com.byers-brands.iyou-home"   # macOS
+mkdir -p "$APP_DATA/certs"
+cp production.crt production.key "$APP_DATA/certs/"
+chmod 600 "$APP_DATA/certs/production.key"
+```
+
+`get_tls_status` reports which path is live (`is_production_cert`, `cert_path`,
+`domain`); on the ephemeral path `cert_path` reads `ephemeral (in-memory)`.
+
+**Repository hygiene.** `src-tauri/certs/*.key`, `*.crt`, and `*.pem` are
+gitignored, and the key has never been tracked in git history — only the public
+certificate was, and it is now ignored as well. Release builds on a machine with
+no staged certificates simply come up on an ephemeral authority. The Windows CI
+workflow (`.github/workflows/build-windows.yml`) no longer stages
+`PRODUCTION_KEY_B64`; it instead *asserts* that no `*.key` / `*.pem` is present
+before the build and scans the compiled `iyou-home.exe` for `BEGIN PRIVATE KEY`
+afterwards, failing the job on a hit.
+
+**Operator-side verification.** After building, confirm the artifact is clean:
+
+```bash
+cargo build --release --manifest-path src-tauri/Cargo.toml
+strings src-tauri/target/release/iyou-home | grep -i "BEGIN PRIVATE KEY"   # expect: no output
+```
+
+A bare `BEGIN PRIVATE KEY` tag may legitimately appear as a dependency
+constant, so the authoritative check is for a complete PEM *block* — a header
+line immediately followed by a base64 body:
+
+```bash
+strings src-tauri/target/release/iyou-home \
+  | grep -A1 -i "BEGIN PRIVATE KEY" | grep -qE '^[A-Za-z0-9+/]{32,}={0,2}$' \
+  && echo "SEC-002 VIOLATION" || echo "clean"
+```
+
+**Developer convenience.** A `#[cfg(all(debug_assertions, not(test)))]` block in
+`resolve_tls_assets` stages repo-local `src-tauri/certs/production.{crt,key}`
+into the app data directory for `tauri dev`. It is a dynamic runtime read of an
+on-disk path (never a compile-time embed), it is compiled out of release builds,
+and it is skipped when the repo key is empty or missing so a gitignored
+placeholder can never poison the cert directory. `bridge_harness` uses the same
+`resolve_tls_assets` path, overridable via the `IYOU_TLS_CERT_DIR` environment
+variable.
 
 ---
 

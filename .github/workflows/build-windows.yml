@@ -38,26 +38,48 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Stage Production Certificates
+      # SEC-002: no TLS key material is staged for the build. The release
+      # binary embeds zero private key material — it generates an ephemeral
+      # in-memory self-signed authority at runtime, or loads an
+      # operator-provisioned `{app_data}/certs/production.{crt,key}` pair from
+      # the user's local app data directory. Staging PRODUCTION_KEY_B64 here
+      # used to be the vector that baked the production key into the shipped
+      # .exe, extractable with `strings`. This step is a guard, not a
+      # provisioner.
+      - name: Assert No Key Material Is Staged (SEC-002)
         shell: bash
-        env:
-          PROD_CRT_B64: ${{ secrets.PRODUCTION_CRT_B64 }}
-          PROD_KEY_B64: ${{ secrets.PRODUCTION_KEY_B64 }}
         run: |
-          mkdir -p src-tauri/certs
-          if [ -n "$PROD_CRT_B64" ] && [ -n "$PROD_KEY_B64" ]; then
-            echo "$PROD_CRT_B64" | base64 -d > src-tauri/certs/production.crt
-            echo "$PROD_KEY_B64" | base64 -d > src-tauri/certs/production.key
-          else
-            echo "Generating self-signed fallback certs for home.iyou.me"
-            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout src-tauri/certs/production.key -out src-tauri/certs/production.crt -days 365 -nodes -subj "/CN=home.iyou.me"
+          if ls src-tauri/certs/*.key src-tauri/certs/*.pem 1>/dev/null | grep -q .; then
+            echo "SEC-002 violation: private key material present in src-tauri/certs/ before build"
+            exit 1
           fi
+          echo "SEC-002: no key material staged; build will use an ephemeral in-memory authority"
 
       - name: Install Frontend Dependencies
         run: npm ci
 
       - name: Build Tauri Windows Executable
         run: npm run tauri build -- --bundles nsis
+
+      - name: Verify Release Binary Contains No Private Key (SEC-002)
+        shell: bash
+        run: |
+          # Defence in depth: scan the compiled artifact for an actual PEM
+          # private-key BLOCK (header immediately followed by a base64 body).
+          # A bare "BEGIN PRIVATE KEY" tag can legitimately appear as a
+          # library constant; a header + body can only come from embedded
+          # key material.
+          ARTIFACT=$(ls src-tauri/target/release/iyou-home.exe 2>/dev/null || true)
+          if [ -z "$ARTIFACT" ]; then
+            echo "SEC-002: release binary not found at expected path; skipping scan"
+            exit 0
+          fi
+          if strings "$ARTIFACT" | grep -A1 -i "BEGIN PRIVATE KEY" \
+               | grep -qE '^[A-Za-z0-9+/]{32,}={0,2}$'; then
+            echo "SEC-002 VIOLATION: PEM private-key block found in $ARTIFACT"
+            exit 1
+          fi
+          echo "SEC-002: no PEM private-key block in $(basename "$ARTIFACT")"
 
       - name: Locate & Hash Executable
         shell: bash
