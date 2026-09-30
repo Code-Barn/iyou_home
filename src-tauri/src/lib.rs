@@ -909,7 +909,9 @@ fn get_public_did_document(did: String) -> Result<String, String> {
 /// Mint a signed invite capability token with the active Level 1 identity.
 /// Issuance is gated on the caller's resolved role (RFC-002 §5.2): Admin is
 /// unlimited, Member is vetted and quota-capped at 3 per rolling 30 days,
-/// Guest cannot mint.
+/// Guest cannot mint. The Genesis / Operator identity is exempt from the
+/// rolling cap (see `invites::issuance_quota_limit`); the moderation-flag
+/// gate still applies to it.
 #[tauri::command]
 fn create_invite_token(
     app: AppHandle,

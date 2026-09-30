@@ -22,9 +22,11 @@
  * a minting modal (tier / max_uses / valid_days / satellite / scope), a
  * copyable + QR-encodable token handoff, and a revocable admission ledger.
  *
- * The mutual-contact anti-Sybil gate is waived for the vault's Genesis /
- * Operator identity and for Admin issuers (see `inviteVetting.ts`); ordinary
- * members remain subject to the operator-tunable contact threshold.
+ * The mutual-contact anti-Sybil gate *and* the rolling 30-day issuance quota
+ * are waived for the vault's Genesis / Operator identity and for Admin issuers
+ * (see `inviteVetting.ts`); ordinary members remain subject to the
+ * operator-tunable contact threshold and the member quota. The quota ceiling is
+ * read from the enclave (`issuance_quota_limit`) rather than assumed to be 3.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -44,6 +46,7 @@ import {
   clampThreshold,
   deriveInviteStanding,
   maxUsesLimit,
+  quotaStanding,
 } from "./inviteVetting";
 
 const SCOPE_OPTIONS = ["relay:read", "relay:write"] as const;
@@ -160,10 +163,22 @@ export default function InviteManager() {
   // `max_uses` ceiling: 4 for ordinary peers, 100 for Genesis / Operator.
   const maxUsesLimitValue = useMemo(() => maxUsesLimit(standing, issuer), [standing, issuer]);
 
+  // Rolling 30-day issuance quota. `limit === null` (Genesis / Operator, Admin)
+  // means no cap is in force, so the pill reads "Unlimited" and minting is
+  // never blocked by quota.
+  const quota = useMemo(() => quotaStanding(standing, issuer), [standing, issuer]);
+
   // Clamp a draft `max_uses` into the current ceiling. Applied on read so a
   // standing change (e.g. rotating away from Genesis) can never leave a
   // stale over-limit value in the input.
   const effectiveMaxUses = Math.min(maxUsesLimitValue, Math.max(1, maxUses));
+
+  // Why minting is disabled, if at all: a moderation flag / vetting gate
+  // first, then quota. Genesis / Operator and Admin have no cap in force, so
+  // `quota.exhausted` is false and neither reason can appear for them.
+  const blockedReason: string | null = quota.exhausted
+    ? `Rolling 30-day issuance quota exhausted (${quota.used} of ${quota.limit} used). Revoke an unused invite to refund a slot.`
+    : standing.blocked_reason;
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -327,8 +342,7 @@ export default function InviteManager() {
 
   const quotaLabel = (): string => {
     if (!issuer) return "…";
-    if (issuer.role === "admin") return "Unlimited";
-    return `${issuer.quota_used_last_30d} / ${issuer.quota_limit || 3} used`;
+    return quota.label;
   };
 
   const vettingChips = () => {
@@ -423,7 +437,14 @@ export default function InviteManager() {
             >
               {standing.is_genesis ? "Genesis / Operator" : ROLE_LABEL[issuer?.role ?? "member"]}
             </span>
-            <span data-testid="invite-quota" title="Rolling 30-day issuance window">
+            <span
+              data-testid="invite-quota"
+              title={
+                quota.limit === null
+                  ? "Rolling 30-day issuance window — no quota limit in force"
+                  : `Rolling 30-day issuance window — ${quota.used} of ${quota.limit} used`
+              }
+            >
               {"\uD83D\uDCC5"} {quotaLabel()}
             </span>
             {vettingChips()}
@@ -654,11 +675,9 @@ export default function InviteManager() {
                 </h3>
                 <p style={{ fontSize: "0.8rem", color: "#6b7280", margin: "0 0 1rem" }}>
                   Mint a signed capability token bound to your Level 1 identity.
-                  {issuer?.role === "admin"
-                    ? " As Admin you may issue any tier with no quota."
-                    : standing.is_genesis
-                      ? " Genesis / Operator: mutual vetting is bypassed so you can seed the first invites."
-                      : " Members: ≤ 3 per rolling 30 days, member tier only."}
+                  {quota.limit === null
+                    ? " No 30-day issuance quota applies to you."
+                    : ` Members: ≤ ${quota.limit} per rolling 30 days, member tier only.`}
                 </p>
 
                 {standing.notice && (
@@ -892,6 +911,47 @@ export default function InviteManager() {
                   </div>
                 )}
 
+                {/* Standing note for an uncapped issuer. Positive, not a warning:
+                    the operator should see that no cap applies rather than infer
+                    it from an absent banner. */}
+                {quota.limit === null && (
+                  <div
+                    data-testid="invite-quota-waived"
+                    style={{
+                      padding: "0.5rem 0.8rem",
+                      borderRadius: "6px",
+                      background: "#ecfdf5",
+                      border: "1px solid #a7f3d0",
+                      color: "#047857",
+                      fontSize: "0.8rem",
+                      marginBottom: "0.85rem",
+                    }}
+                  >
+                    {"\u2713"} {standing.is_genesis ? "Genesis / Operator" : "Admin"} — no 30-day
+                    issuance quota limit. {quota.used} issued in the current window.
+                  </div>
+                )}
+
+                {/* Quota exhaustion notice. Rendered only for a *capped* issuer:
+                    with no limit in force (Genesis / Operator, Admin) the
+                    predicate can never trip, so no banner appears. */}
+                {quota.exhausted && (
+                  <div
+                    data-testid="invite-quota-exhausted"
+                    style={{
+                      padding: "0.5rem 0.8rem",
+                      borderRadius: "6px",
+                      background: "#fef2f2",
+                      border: "1px solid #fecaca",
+                      color: "#b91c1c",
+                      fontSize: "0.8rem",
+                      marginBottom: "0.85rem",
+                    }}
+                  >
+                    {"\u26A0\uFE0F"} {blockedReason}
+                  </div>
+                )}
+
                 <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.6rem", marginTop: "0.25rem" }}>
                   <button type="button" onClick={closeModal} data-testid="invite-cancel-modal">
                     Cancel
@@ -899,10 +959,10 @@ export default function InviteManager() {
                   <button
                     type="button"
                     onClick={handleMint}
-                    disabled={minting || !standing.can_mint}
+                    disabled={minting || !standing.can_mint || quota.exhausted}
                     data-testid="invite-submit"
-                    title={standing.blocked_reason ?? undefined}
-                    style={{ opacity: minting || !standing.can_mint ? 0.6 : 1 }}
+                    title={blockedReason ?? undefined}
+                    style={{ opacity: minting || !standing.can_mint || quota.exhausted ? 0.6 : 1 }}
                   >
                     {minting
                       ? "\u23F3 Minting…"

@@ -28,6 +28,7 @@ const { mockInvoke, defaultHandler, TOKEN } = vi.hoisted(() => {
     role: "member",
     quota_used_last_30d: 1,
     quota_limit: 3,
+    issuance_quota_limit: 3,
     max_uses_limit: 4,
     vetting: {
       account_age_days: 60,
@@ -120,6 +121,7 @@ describe("InviteManager (RFC-002)", () => {
           role: "member",
           quota_used_last_30d: 2,
           quota_limit: 3,
+          issuance_quota_limit: 3,
           max_uses_limit: 4,
           vetting: {
             account_age_days: 60,
@@ -346,6 +348,7 @@ describe("InviteManager (RFC-002)", () => {
           role: "admin",
           quota_used_last_30d: 7,
           quota_limit: 0,
+          issuance_quota_limit: null,
           max_uses_limit: 100,
           vetting: {
             account_age_days: 60,
@@ -386,6 +389,7 @@ describe("InviteManager (RFC-002)", () => {
           role: "admin",
           quota_used_last_30d: 7,
           quota_limit: 0,
+          issuance_quota_limit: null,
           max_uses_limit: 100,
           vetting: {
             account_age_days: 60,
@@ -429,7 +433,8 @@ function genesisStatus(vettingOverrides: Record<string, unknown> = {}): IssuerSt
     did: "did:key:z6Mkprimary",
     role: "member",
     quota_used_last_30d: 0,
-    quota_limit: 3,
+    quota_limit: 0,
+    issuance_quota_limit: null,
     max_uses_limit: 100,
     vetting: {
       account_age_days: 0,
@@ -628,6 +633,169 @@ describe("InviteManager — Genesis / Operator bypass", () => {
       "2 active moderation flag(s)",
     );
     expect(screen.getByTestId("invite-submit")).toBeDisabled();
+  });
+});
+
+describe("InviteManager — rolling quota waiver and refund", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(defaultHandler);
+    // Pin the dev affordance off so these cases assert the Genesis quota
+    // logic rather than the `import.meta.env.DEV` waiver.
+    vi.stubEnv("DEV", false);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** Genesis standing with a non-zero rolling-window count. */
+  function genesisWithUsage(used: number): IssuerStatus {
+    return { ...genesisStatus(), quota_used_last_30d: used };
+  }
+
+  it("shows an unlimited quota pill instead of 3 / 3 for Genesis / Operator", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisWithUsage(7));
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-role")).toHaveTextContent("Genesis / Operator");
+    });
+
+    // Past the old 3-token ceiling and still uncapped.
+    const pill = screen.getByTestId("invite-quota");
+    expect(pill).toHaveTextContent("7 issued (Unlimited)");
+    expect(pill).not.toHaveTextContent("/ 3 used");
+  });
+
+  it("renders no exhaustion banner and keeps Mint & Sign enabled past the old cap", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisWithUsage(12));
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-quota")).toHaveTextContent("12 issued (Unlimited)");
+    });
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+
+    // No red "Rolling 30-day issuance quota exhausted" banner.
+    expect(screen.queryByTestId("invite-quota-exhausted")).not.toBeInTheDocument();
+    expect(screen.queryByText(/quota exhausted/i)).not.toBeInTheDocument();
+
+    // A positive note replaces it, naming the identity and the running count.
+    expect(screen.getByTestId("invite-quota-waived")).toHaveTextContent(
+      "Genesis / Operator — no 30-day issuance quota limit. 12 issued",
+    );
+
+    const submit = screen.getByTestId("invite-submit");
+    expect(submit).not.toBeDisabled();
+    expect(submit).toHaveTextContent("Mint & Sign (bypassed)");
+
+    // The 4th-and-beyond mint actually reaches the enclave.
+    fireEvent.click(submit);
+    await screen.findByTestId("invite-token-json");
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "create_invite_token",
+      expect.objectContaining({ tier: "member" }),
+    );
+  });
+
+  it("treats Genesis as uncapped even when a legacy backend still reports quota_limit: 3", async () => {
+    // A pre-waiver enclave omits `issuance_quota_limit` and still reports the
+    // stale numeric 3. The UI must mirror the new policy, not the stale field.
+    const stale = { ...genesisWithUsage(3), issuance_quota_limit: undefined as never };
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(stale);
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-quota")).toHaveTextContent("3 issued (Unlimited)");
+    });
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+    expect(screen.queryByTestId("invite-quota-exhausted")).not.toBeInTheDocument();
+    expect(screen.getByTestId("invite-submit")).not.toBeDisabled();
+  });
+
+  it("still blocks and banners a capped member whose quota is exhausted", async () => {
+    // A fully vetted ordinary member, capped at 3, with the window spent.
+    const capped: IssuerStatus = {
+      ...genesisStatus({
+        is_genesis: false,
+        account_age_days: 90,
+        account_age_ok: true,
+        contacts_ok: true,
+        contact_count: 9,
+        eligible: true,
+        bypass_reason: null,
+      }),
+      role: "member",
+      quota_used_last_30d: 3,
+      quota_limit: 3,
+      issuance_quota_limit: 3,
+      max_uses_limit: 4,
+    };
+
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(capped);
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-quota")).toHaveTextContent("3 / 3 used");
+    });
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+
+    // The banner names the refund path, and the button is disabled.
+    const banner = screen.getByTestId("invite-quota-exhausted");
+    expect(banner).toHaveTextContent("Rolling 30-day issuance quota exhausted (3 of 3 used)");
+    expect(banner).toHaveTextContent("Revoke an unused invite to refund a slot");
+    expect(screen.getByTestId("invite-submit")).toBeDisabled();
+    // No waived note for a capped issuer.
+    expect(screen.queryByTestId("invite-quota-waived")).not.toBeInTheDocument();
+  });
+
+  it("honours a raised enclave ceiling rather than assuming 3", async () => {
+    const raised: IssuerStatus = {
+      ...genesisStatus({ is_genesis: false, account_age_days: 90, account_age_ok: true, contacts_ok: true, contact_count: 9, eligible: true, bypass_reason: null }),
+      quota_used_last_30d: 5,
+      quota_limit: 10,
+      issuance_quota_limit: 10,
+      max_uses_limit: 4,
+    };
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(raised);
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      if (cmd === "list_invites") return Promise.resolve([]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-quota")).toHaveTextContent("5 / 10 used");
+    });
+
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+    expect(screen.queryByTestId("invite-quota-exhausted")).not.toBeInTheDocument();
+    expect(screen.getByTestId("invite-submit")).not.toBeDisabled();
   });
 });
 

@@ -31,12 +31,25 @@
 //!   3. Signature: Ed25519 over the 32-byte digest, base58-encoded.
 //!
 //! Issuance policy (RFC-002 §5.2):
-//!   - Admin:  unlimited issuance of any tier (locally scoped via the
-//!             `issuers` table, operator-configured).
-//!   - Member: member-tier tokens only, ≤ 3 per rolling 30-day window,
-//!             gated on vetting (account age > 14 d, ≥ 5 mutual contacts,
-//!             0 active moderation flags).
-//!   - Guest:  cannot mint.
+//!   - Admin:   unlimited issuance of any tier (locally scoped via the
+//!              `issuers` table, operator-configured).
+//!   - Genesis: the vault's root / Operator identity (current L1 Public
+//!              Persona). Uncapped issuance, because the same chicken-and-egg
+//!              deadlock that waives mutual vetting (`is_genesis`, resolved
+//!              structurally against the local vault) also applies to the
+//!              token count: an operator onboarding a community must be able
+//!              to keep minting after the third invite. The moderation-flag
+//!              gate and the member-tier restriction still apply.
+//!   - Member:  member-tier tokens only, ≤ 3 per rolling 30-day window,
+//!              gated on vetting (account age > 14 d, ≥ 5 mutual contacts,
+//!              0 active moderation flags).
+//!   - Guest:   cannot mint.
+//!
+//! Quota accounting counts only tokens that still hold admission value:
+//! a token that was revoked *before it was ever redeemed* returns its slot
+//! to the rolling window (see `quota_used_last_30d`). A token that carried
+//! real admissions (`uses_count > 0`) keeps its slot, so revoking a token
+//! after the fact cannot launder Sybil volume back into a fresh budget.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -226,6 +239,11 @@ pub struct IssuerStatus {
     pub quota_used_last_30d: u32,
     /// 0 = unlimited.
     pub quota_limit: u32,
+    /// Rolling 30-day issuance cap for this issuer, or `None` when no cap is
+    /// in force (`Admin` registry entries and the Genesis / Operator
+    /// identity). This is the authority the frontend reads: it must never
+    /// assume a fixed ceiling of 3, which is the *ordinary member* bound.
+    pub issuance_quota_limit: Option<u32>,
     /// Effective `max_uses` ceiling for this issuer: 4 for ordinary members,
     /// 100 for Genesis / Operator. Surfaced so the modal's input bounds match
     /// the enforcing predicate instead of hard-coding a stale limit.
@@ -480,6 +498,46 @@ pub fn member_eligible(snapshot: &VettingSnapshot, now: u64) -> Result<(), Strin
     Ok(())
 }
 
+/// Effective rolling-30-day issuance cap for an issuer, or `None` when the
+/// issuer is uncapped.
+///
+/// `None` is the single "unlimited" signal used everywhere a limit is
+/// expected: it flows from here into `enforce_issuance_policy` and out to the
+/// UI as `IssuerStatus::issuance_quota_limit`, so the enclave and the modal
+/// can never disagree about whether a cap is in force.
+///
+/// **Uncapped issuers:**
+///   * `Admin` — an explicit `issuers` registry entry (unlimited, any tier).
+///   * Genesis / Operator — the vault's root identity. The rolling quota is a
+///     Sybil control aimed at *ordinary peers*; applied literally it deadlocks
+///     the operator the same way mutual vetting would, since the root
+///     identity is precisely the party that has to keep onboarding people.
+///     See `enforce_issuance_policy` — the tier and moderation gates are
+///     untouched by this waiver.
+pub fn issuance_quota_limit(role: InviteTier, snapshot: &VettingSnapshot) -> Option<u32> {
+    if role == InviteTier::Admin || snapshot.is_genesis {
+        None
+    } else {
+        Some(MEMBER_MONTHLY_QUOTA)
+    }
+}
+
+/// Rolling-quota predicate. `None` means no cap is in force and the issuer is
+/// always free to mint; a `Some(limit)` is exhausted once the window already
+/// holds `limit` counted tokens (see `quota_used_last_30d`).
+pub fn check_issuance_quota(used_last_30d: u32, quota_limit: Option<u32>) -> Result<(), String> {
+    let Some(limit) = quota_limit else {
+        return Ok(());
+    };
+    if used_last_30d >= limit {
+        return Err(format!(
+            "Rolling 30-day issuance quota exhausted ({} of {} used)",
+            used_last_30d, limit
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce the RFC-002 §5.2 issuance matrix for a resolved caller role.
 pub fn enforce_issuance_policy(
     caller_role: InviteTier,
@@ -503,13 +561,12 @@ pub fn enforce_issuance_policy(
                 ));
             }
             member_eligible(vetting, now)?;
-            if let Some(limit) = quota_limit {
-                if used_last_30d >= limit {
-                    return Err(format!(
-                        "Rolling 30-day issuance quota exhausted ({} of {} used)",
-                        used_last_30d, limit
-                    ));
-                }
+            // Genesis / Operator issuers are exempt from the rolling count. The
+            // gate is keyed off the snapshot rather than the caller's
+            // `quota_limit` argument so the waiver holds even for a caller that
+            // passes a stale `Some(MEMBER_MONTHLY_QUOTA)`.
+            if !vetting.is_genesis {
+                check_issuance_quota(used_last_30d, quota_limit)?;
             }
             Ok(())
         }
@@ -670,11 +727,23 @@ fn persist_minted_token(conn: &mut Connection, token: &InviteCapabilityToken) ->
     Ok(())
 }
 
-/// Number of invites issued by `issuer_did` in the rolling 30-day window.
+/// Number of invites issued by `issuer_did` in the rolling 30-day window that
+/// still count against the quota.
+///
+/// **Refund rule.** A token that was revoked *before it was ever redeemed*
+/// (`revoked_at IS NOT NULL AND uses_count = 0`) held no admission value and
+/// is therefore excluded: revoking a mistaken or superseded invite gives the
+/// slot back to the window. A token that actually carried admissions
+/// (`uses_count > 0`) keeps its slot, so revoking a used token cannot launder
+/// Sybil volume into a fresh budget. Live and expired tokens are both
+/// counted — an expired invite was still issued volume.
 pub fn quota_used_last_30d(conn: &Connection, issuer_did: &str, now: u64) -> u32 {
     let cutoff = (now as i64).saturating_sub(30 * 86_400);
     conn.query_row(
-        "SELECT COUNT(*) FROM issued_tokens WHERE issuer_did = ?1 AND created_at >= ?2",
+        "SELECT COUNT(*) FROM issued_tokens
+         WHERE issuer_did = ?1
+           AND created_at >= ?2
+           AND NOT (revoked_at IS NOT NULL AND uses_count = 0)",
         params![issuer_did, cutoff],
         |row| row.get::<_, i64>(0),
     )
@@ -1049,11 +1118,9 @@ pub(crate) fn mint_token_core(
 
     let role = resolve_issuer_role(conn, issuer_did);
     let used_last_30d = quota_used_last_30d(conn, issuer_did, now);
-    let quota_limit = if role == InviteTier::Admin {
-        None
-    } else {
-        Some(MEMBER_MONTHLY_QUOTA)
-    };
+    // Single authority for the cap: `None` (unlimited) for `Admin` registry
+    // entries and for the Genesis / Operator identity, `Some(3)` otherwise.
+    let quota_limit = issuance_quota_limit(role, vetting);
     enforce_issuance_policy(role, requested, used_last_30d, quota_limit, vetting, now)?;
 
     let mut token = InviteCapabilityToken {
@@ -1102,15 +1169,17 @@ pub fn issuer_status(app: &AppHandle, did: &str) -> Result<IssuerStatus, String>
     let eligible = flags_ok && (bypassed || (account_age_ok && contacts_ok));
     let contacts_remaining =
         (snapshot.min_contacts_required as i64) - (snapshot.contact_count as i64);
+    // Resolved after the Genesis / Admin promotion above so the surfaced cap
+    // matches the identity the mint command would actually use.
+    let issuance_quota_limit = issuance_quota_limit(role, &snapshot);
     Ok(IssuerStatus {
         did: did.to_string(),
         role: role.as_str().to_string(),
         quota_used_last_30d,
-        quota_limit: if role == InviteTier::Admin {
-            0
-        } else {
-            MEMBER_MONTHLY_QUOTA
-        },
+        // Legacy numeric projection of `issuance_quota_limit`, where 0 encodes
+        // "unlimited" (Admin and Genesis / Operator).
+        quota_limit: issuance_quota_limit.unwrap_or(0),
+        issuance_quota_limit,
         max_uses_limit: max_uses_limit_for(&snapshot),
         vetting: VettingStatus {
             account_age_days: age_days,
@@ -1420,8 +1489,12 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("only mint member-tier"), "unexpected: {}", err);
 
-        // ...and the rolling quota still applies to Genesis members.
-        let err = enforce_issuance_policy(
+        // ...and the rolling quota no longer applies to Genesis: the operator's
+        // own onboarding run is exactly the case a 3-token cap deadlocks.
+        // The waiver is keyed off the snapshot, so it holds even against a
+        // stale `Some(3)` limit from the caller.
+        assert_eq!(issuance_quota_limit(InviteTier::Member, &genesis), None);
+        assert!(enforce_issuance_policy(
             InviteTier::Member,
             InviteTier::Member,
             3,
@@ -1429,8 +1502,294 @@ mod tests {
             &genesis,
             now,
         )
+        .is_ok());
+        assert!(enforce_issuance_policy(
+            InviteTier::Member,
+            InviteTier::Member,
+            999,
+            Some(3),
+            &genesis,
+            now,
+        )
+        .is_ok());
+
+        // An ordinary member under the *same* stale limit is still refused.
+        // Flags cleared, so the only gate left to fail is the quota.
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 5,
+            active_moderation_flags: 0,
+            is_genesis: false,
+            ..flagged_genesis
+        };
+        assert_eq!(
+            issuance_quota_limit(InviteTier::Member, &peer),
+            Some(MEMBER_MONTHLY_QUOTA)
+        );
+        let err = enforce_issuance_policy(
+            InviteTier::Member,
+            InviteTier::Member,
+            3,
+            Some(MEMBER_MONTHLY_QUOTA),
+            &peer,
+            now,
+        )
         .unwrap_err();
         assert!(err.contains("quota"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn genesis_mints_far_past_the_member_quota() {
+        let mut conn = mem_db();
+        let signing_key = test_signing_key();
+        let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
+        let now = now();
+        // Fresh operator: empty contact book, brand-new account. Every ordinary
+        // member gate fails; the Genesis identity must still be able to mint
+        // the 4th, 5th, ... token of the window.
+        let genesis = VettingSnapshot {
+            joined_unix: now as i64,
+            contact_count: 0,
+            active_moderation_flags: 0,
+            min_contacts_required: MEMBER_MIN_CONTACTS,
+            is_genesis: true,
+        };
+        assert_eq!(issuance_quota_limit(InviteTier::Member, &genesis), None);
+
+        let mint = |conn: &mut Connection| {
+            mint_token_core(
+                conn,
+                &signing_key,
+                &kp.did,
+                "member",
+                1,
+                30,
+                vec!["join".to_string()],
+                None,
+                &genesis,
+                now,
+            )
+        };
+
+        // Tokens 1–3 fill the ordinary member allowance exactly.
+        for i in 1..=3 {
+            mint(&mut conn)
+                .unwrap_or_else(|e| panic!("genesis token {} must mint: {}", i, e));
+        }
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 3);
+
+        // The 4th and 5th — the tokens a member could never mint — succeed.
+        let fourth = mint(&mut conn)
+            .expect("Genesis must mint a 4th token in the rolling window");
+        assert!(verify_token_signature(&fourth).is_ok());
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 4);
+        let fifth = mint(&mut conn)
+            .expect("Genesis must mint a 5th token in the rolling window");
+        assert!(verify_token_signature(&fifth).is_ok());
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 5);
+
+        // ...and the ledger recorded them all as live member-tier tokens.
+        let records = list_invite_records(&conn, now).expect("list");
+        assert_eq!(records.len(), 5);
+        assert!(records.iter().all(|r| r.tier == "member" && r.status == "live"));
+
+        // The same ledger against an ordinary peer identity is still capped:
+        // only the waiver is new, not the quota arithmetic.
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 5,
+            is_genesis: false,
+            ..genesis
+        };
+        assert_eq!(
+            issuance_quota_limit(InviteTier::Member, &peer),
+            Some(MEMBER_MONTHLY_QUOTA)
+        );
+        let err = mint_token_core(
+            &mut conn,
+            &signing_key,
+            &kp.did,
+            "member",
+            1,
+            30,
+            vec!["join".to_string()],
+            None,
+            &peer,
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("quota exhausted (5 of 3 used)"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn revoking_an_unused_token_refunds_the_quota_slot() {
+        let mut conn = mem_db();
+        let signing_key = test_signing_key();
+        let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
+        let now = now();
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 5,
+            active_moderation_flags: 0,
+            ..Default::default()
+        };
+        let mint = |conn: &mut Connection| {
+            mint_token_core(
+                conn,
+                &signing_key,
+                &kp.did,
+                "member",
+                2,
+                30,
+                vec!["join".to_string()],
+                None,
+                &peer,
+                now,
+            )
+        };
+
+        // Three live tokens exhaust the ordinary member allowance.
+        let first = mint(&mut conn).expect("mint 1");
+        let second = mint(&mut conn).expect("mint 2");
+        let third = mint(&mut conn).expect("mint 3");
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 3);
+        let err = mint(&mut conn).unwrap_err();
+        assert!(err.contains("quota exhausted"), "unexpected: {}", err);
+
+        // A revoked *used* token keeps its slot: real admissions were made.
+        consume_token(&mut conn, &first.nonce, "did:key:z6Mkchild").expect("consume");
+        revoke_invite_nonce(&mut conn, &first.nonce, &kp.did).expect("revoke");
+        assert_eq!(
+            quota_used_last_30d(&conn, &kp.did, now),
+            3,
+            "a revoked token that carried admissions must not be refunded"
+        );
+        assert!(mint(&mut conn).is_err(), "quota must still be exhausted");
+
+        // A revoked *unused* token returns its slot: it never admitted anyone.
+        revoke_invite_nonce(&mut conn, &second.nonce, &kp.did).expect("revoke");
+        assert_eq!(
+            quota_used_last_30d(&conn, &kp.did, now),
+            2,
+            "revoking an unused token must decrement the active quota count"
+        );
+
+        // The refunded slot is immediately usable.
+        let replacement = mint(&mut conn)
+            .expect("the refunded slot must be mintable again");
+        assert!(verify_token_signature(&replacement).is_ok());
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 3);
+        assert!(mint(&mut conn).is_err(), "quota is full again");
+
+        // Revoking the last unused token leaves exactly the two tokens that
+        // still count: the used-and-revoked one (no refund) and the live
+        // replacement. The ledger still shows all four rows — revocation is a
+        // tombstone, not a deletion.
+        revoke_invite_nonce(&mut conn, &third.nonce, &kp.did).expect("revoke");
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 2);
+        assert_eq!(list_invite_records(&conn, now).expect("list").len(), 4);
+    }
+
+    #[test]
+    fn quota_refund_is_scoped_to_the_revoked_unused_token() {
+        let mut conn = mem_db();
+        let signing_key = test_signing_key();
+        let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
+        let now = now();
+        let genesis = VettingSnapshot { is_genesis: true, ..Default::default() };
+
+        let other = "did:key:z6Mkotherissuer";
+        let a = mint_token_core(
+            &mut conn, &signing_key, &kp.did, "member", 1, 30, vec!["join".to_string()], None,
+            &genesis, now,
+        )
+        .expect("mint a");
+        let b = mint_token_core(
+            &mut conn, &signing_key, &kp.did, "member", 1, 30, vec!["join".to_string()], None,
+            &genesis, now,
+        )
+        .expect("mint b");
+        // A second issuer's token must be untouched by the first's revocation.
+        mint_token_core(
+            &mut conn, &signing_key, other, "member", 1, 30, vec!["join".to_string()], None,
+            &genesis, now,
+        )
+        .expect("mint other");
+
+        revoke_invite_nonce(&mut conn, &a.nonce, &kp.did).expect("revoke a");
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 1);
+        assert_eq!(
+            quota_used_last_30d(&conn, other, now),
+            1,
+            "another issuer's window is unaffected"
+        );
+
+        // Double revocation is idempotent and does not double-refund.
+        revoke_invite_nonce(&mut conn, &a.nonce, &kp.did).expect("re-revoke a");
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 1);
+        assert!(verify_token_signature(&b).is_ok());
+    }
+
+    #[test]
+    fn quota_refund_does_not_reach_back_outside_the_window() {
+        let mut conn = mem_db();
+        let signing_key = test_signing_key();
+        let kp = crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1);
+        let now = now();
+        let genesis = VettingSnapshot { is_genesis: true, ..Default::default() };
+        let long_ago = now - 40 * 86_400;
+
+        let stale = mint_token_core(
+            &mut conn, &signing_key, &kp.did, "member", 1, 30, vec!["join".to_string()], None,
+            &genesis, long_ago,
+        )
+        .expect("mint stale");
+        assert_eq!(
+            quota_used_last_30d(&conn, &kp.did, now),
+            0,
+            "a token older than 30 days is outside the window regardless of state"
+        );
+        // Revoking it changes nothing: it was never counted.
+        revoke_invite_nonce(&mut conn, &stale.nonce, &kp.did).expect("revoke");
+        assert_eq!(quota_used_last_30d(&conn, &kp.did, now), 0);
+    }
+
+    #[test]
+    fn admin_and_genesis_report_no_quota_limit() {
+        let now = now();
+        let peer = VettingSnapshot {
+            joined_unix: (now as i64) - 60 * 86_400,
+            contact_count: 5,
+            ..Default::default()
+        };
+        let genesis = VettingSnapshot { is_genesis: true, ..peer };
+
+        // Ordinary member: the RFC-002 bound.
+        assert_eq!(
+            issuance_quota_limit(InviteTier::Member, &peer),
+            Some(MEMBER_MONTHLY_QUOTA)
+        );
+        // Genesis member identity: uncapped.
+        assert_eq!(issuance_quota_limit(InviteTier::Member, &genesis), None);
+        // Admin registry entry: uncapped at any vetting standing.
+        assert_eq!(issuance_quota_limit(InviteTier::Admin, &peer), None);
+        assert_eq!(issuance_quota_limit(InviteTier::Admin, &genesis), None);
+        // A guest is rejected before the quota is ever consulted.
+        assert!(enforce_issuance_policy(
+            InviteTier::Guest,
+            InviteTier::Member,
+            0,
+            issuance_quota_limit(InviteTier::Guest, &peer),
+            &peer,
+            now
+        )
+        .is_err());
+
+        // The predicate itself: `None` is unlimited, `Some(n)` trips at n.
+        assert!(check_issuance_quota(u32::MAX, None).is_ok());
+        assert!(check_issuance_quota(2, Some(3)).is_ok());
+        assert!(check_issuance_quota(3, Some(3)).is_err());
+        assert!(check_issuance_quota(4, Some(3)).is_err());
     }
 
     #[test]

@@ -181,14 +181,27 @@ The `>= 5 mutual contacts` gate is an anti-Sybil control aimed at *ordinary peer
 
 | Issuer | Account age | Mutual contacts | Moderation flags | Tier choice | `max_uses` | Quota |
 |:---|:---|:---|:---|:---|:---|:---|
-| **Genesis / Operator** (current L1 Public Persona) | waived | **waived** | **enforced** | member only | **100** | enforced (3 / 30 d) |
+| **Genesis / Operator** (current L1 Public Persona) | waived | **waived** | **enforced** | member only | **100** | **waived (unlimited)** |
 | **Admin** (`issuers` registry) | waived | waived | **enforced** | any | 4 | unlimited |
 | **Member** (ordinary) | enforced | enforced | **enforced** | member only | 4 | enforced (3 / 30 d) |
 | **Guest** | — | — | — | **cannot mint** | — | — |
 
 **Resolution.** `is_genesis_identity` matches the issuer DID against a profile in the *local* vault and requires `profile_id == "primary"`, `level == 1`, and `!is_system_reserved`. The check deliberately does not pin `derivation_index`, so genesis standing survives `rotate_primary_persona` (the break-glass successor keeps the exemption; the tombstoned `retired_primary_*` does not). Level 0 Anchor personas are excluded — the air-gapped sanctum never mints. Because the DID is matched against a local vault profile, the signal cannot be forged by a peer asserting a DID.
 
-**Never waived.** The moderation-flag gate applies to *every* issuer including Genesis and Admin. Genesis status also confers no tier escalation (admin-tier tokens still require an `Admin` registry entry) and no quota relief.
+**Never waived.** The moderation-flag gate applies to *every* issuer including Genesis and Admin. Genesis status also confers no tier escalation (admin-tier tokens still require an `Admin` registry entry). The moderation gate is the one thing that survives every waiver, including the quota relief below.
+
+#### 4.3.1a Rolling Quota: Genesis Waiver & Unused-Revoke Refund
+
+Two gaps in the original §5.2 quota made the operator's own bootstrap path unusable, and both are closed at the single authority `invites::issuance_quota_limit`:
+
+**1. Genesis / Operator is exempt from the 3-token rolling cap.** The rolling quota is a Sybil control aimed at *ordinary peers*, and it deadlocks the operator for the same reason mutual vetting did: the root identity is precisely the party that has to keep onboarding people, so a 3-token cap locks it out of its own community's onboarding run. `issuance_quota_limit` returns `None` (the one "unlimited" signal, shared with `Admin`) for any snapshot with `is_genesis`, and `enforce_issuance_policy` additionally gates the check on `!vetting.is_genesis` so the waiver holds even against a caller passing a stale `Some(3)`. The tier restriction (member only) and the moderation gate are untouched.
+
+`IssuerStatus` now carries `issuance_quota_limit: Option<u32>` so the frontend never assumes a ceiling of 3 — the modal reads the enclave's own number, and `quotaStanding` in `inviteVetting.ts` mirrors the Rust predicate for older backends that omit the field. The legacy numeric `quota_limit` is retained (0 = unlimited) and is now derived from `issuance_quota_limit.unwrap_or(0)`, so the two can never drift.
+
+**2. Revoking an unused token refunds its slot.** `quota_used_last_30d` excludes tokens where `revoked_at IS NOT NULL AND uses_count = 0`: a token revoked before it was ever redeemed held no admission value, so the slot returns to the window and a mistaken or superseded invite is not a permanent quota charge. A token that carried real admissions (`uses_count > 0`) **keeps** its slot, so revoking a used token cannot launder Sybil volume back into a fresh budget. Live and expired tokens are both counted — an expired invite was still issued volume. Revocation remains a tombstone, not a deletion, and re-revoking is idempotent.
+
+The UI reflects the refund path: an exhausted capped member sees *"Rolling 30-day issuance quota exhausted (3 of 3 used). Revoke an unused invite to refund a slot."*, while an uncapped issuer sees a positive `Genesis / Operator — no 30-day issuance quota limit` note and no exhaustion banner.
+
 
 **Configurable threshold.** `invite_min_contacts` is an *operator preference* read back by the enclave at enforcement time — never a per-request client argument, so a member cannot weaken the gate for themselves by passing a lower value to `create_invite_token`. It is clamped to `[MIN_CONTACTS_THRESHOLD_FLOOR = 1, MAX_CONTACTS_THRESHOLD_CEILING = 50]`, and is derived in the UI by `src/components/invites/inviteVetting.ts`, which mirrors the Rust predicate and fails **closed** when issuer standing has not loaded.
 

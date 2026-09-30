@@ -22,9 +22,11 @@ import {
   MAX_CONTACTS_CEILING,
   MEMBER_MAX_USES,
   MIN_CONTACTS_FLOOR,
+  MEMBER_MONTHLY_QUOTA,
   clampThreshold,
   deriveInviteStanding,
   maxUsesLimit,
+  quotaStanding,
 } from "../components/invites/inviteVetting";
 import type { IssuerStatus } from "../lib/types";
 
@@ -34,6 +36,7 @@ function issuer(overrides: Partial<IssuerStatus> = {}, vetting: Partial<IssuerSt
     role: "member",
     quota_used_last_30d: 0,
     quota_limit: 3,
+    issuance_quota_limit: MEMBER_MONTHLY_QUOTA,
     max_uses_limit: MEMBER_MAX_USES,
     vetting: {
       account_age_days: 60,
@@ -152,7 +155,7 @@ describe("deriveInviteStanding — Genesis / Operator bypass", () => {
 
   it("treats an Admin issuer as bypassed", () => {
     const standing = deriveInviteStanding({
-      issuer: issuer({ role: "admin", quota_limit: 0 }, { contacts_ok: false }),
+      issuer: issuer({ role: "admin", quota_limit: 0, issuance_quota_limit: null }, { contacts_ok: false }),
       devMode: false,
       contactCount: 0,
     });
@@ -160,6 +163,84 @@ describe("deriveInviteStanding — Genesis / Operator bypass", () => {
     expect(standing.bypassed).toBe(true);
     expect(standing.tier_label).toBe("Admin");
     expect(standing.can_mint).toBe(true);
+  });
+});
+
+describe("quotaStanding — rolling 30-day issuance quota", () => {
+  const peer = deriveInviteStanding({ issuer: issuer(), devMode: false, contactCount: 6 });
+  const genesis = deriveInviteStanding({
+    issuer: issuer({}, { is_genesis: true }),
+    devMode: false,
+    contactCount: 6,
+  });
+  const admin = deriveInviteStanding({
+    issuer: issuer({ role: "admin", issuance_quota_limit: null }),
+    devMode: false,
+    contactCount: 6,
+  });
+
+  it("cancels the ceiling for Genesis even when a legacy limit is still reported", () => {
+    // A `null` from the enclave is authoritative: no cap, and never exhausted.
+    const quota = quotaStanding(
+      genesis,
+      issuer({ quota_used_last_30d: 42, issuance_quota_limit: null }, { is_genesis: true }),
+    );
+    expect(quota.limit).toBeNull();
+    expect(quota.exhausted).toBe(false);
+    expect(quota.label).toBe("42 issued (Unlimited)");
+  });
+
+  it("treats Genesis as uncapped against a backend that predates the field", () => {
+    // `issuance_quota_limit` absent and `quota_limit` still 3: the local mirror
+    // of `invites::issuance_quota_limit` wins, so the pill never reads 3 / 3.
+    const stale = { ...issuer({ quota_used_last_30d: 7 }), issuance_quota_limit: undefined as never };
+    const quota = quotaStanding(
+      genesis,
+      { ...stale, vetting: { ...issuer().vetting, is_genesis: true } },
+    );
+    expect(quota.limit).toBeNull();
+    expect(quota.exhausted).toBe(false);
+    expect(quota.label).toBe("7 issued (Unlimited)");
+  });
+
+  it("reads Unlimited for an Admin issuer at any usage", () => {
+    const quota = quotaStanding(admin, issuer({ role: "admin", quota_used_last_30d: 7, issuance_quota_limit: null }));
+    expect(quota.limit).toBeNull();
+    expect(quota.exhausted).toBe(false);
+    expect(quota.label).toBe("Unlimited");
+  });
+
+  it("trips only at the enclave-reported ceiling for an ordinary member", () => {
+    const under = quotaStanding(peer, issuer({ quota_used_last_30d: 2 }));
+    expect(under).toMatchObject({ used: 2, limit: MEMBER_MONTHLY_QUOTA, exhausted: false });
+    expect(under.label).toBe("2 / 3 used");
+
+    const at = quotaStanding(peer, issuer({ quota_used_last_30d: MEMBER_MONTHLY_QUOTA }));
+    expect(at.exhausted).toBe(true);
+
+    // ...and past it.
+    expect(quotaStanding(peer, issuer({ quota_used_last_30d: 9 })).exhausted).toBe(true);
+  });
+
+  it("prefers a raised enclave ceiling over the local mirror of 3", () => {
+    // The enclave is the authority: a member tuned to 10 must not be told 3.
+    const quota = quotaStanding(peer, issuer({ quota_used_last_30d: 5, issuance_quota_limit: 10 }));
+    expect(quota.limit).toBe(10);
+    expect(quota.exhausted).toBe(false);
+    expect(quota.label).toBe("5 / 10 used");
+  });
+
+  it("fails closed on junk rather than reporting a bogus exhaustion", () => {
+    const quota = quotaStanding(peer, issuer({ quota_used_last_30d: Number.NaN, issuance_quota_limit: 0 }));
+    expect(quota.used).toBe(0);
+    // 0 encodes "unlimited" in the legacy numeric field.
+    expect(quota.limit).toBeNull();
+    expect(quota.exhausted).toBe(false);
+  });
+
+  it("does not invent standing before the enclave has reported", () => {
+    const quota = quotaStanding(peer, null);
+    expect(quota).toMatchObject({ used: 0, limit: MEMBER_MONTHLY_QUOTA, exhausted: false });
   });
 });
 

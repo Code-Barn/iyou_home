@@ -33,6 +33,12 @@
  *   | `vetting.is_genesis`       | Rust (vault lookup)      |
  *   | dev build                  | frontend only, advisory  |
  *
+ * The same signal also waives the rolling 30-day issuance quota: a 3-token cap
+ * deadlocks the operator out of its own onboarding run, the same way mutual
+ * vetting would. `quotaStanding` reads the enclave's own
+ * `issuance_quota_limit` so a raised or lifted ceiling is never hard-coded
+ * here.
+ *
  * The anti-Sybil gate remains fully in force for every non-Genesis, non-Admin
  * issuer, and the moderation-flag gate is never waived at any tier.
  *
@@ -55,6 +61,8 @@ export const MEMBER_MAX_USES = 4;
  * the family-token bound of 4 applied to ordinary peers.
  */
 export const GENESIS_MAX_USES = 100;
+/** Mirrors `invites::MEMBER_MONTHLY_QUOTA` — the ordinary member issuance cap. */
+export const MEMBER_MONTHLY_QUOTA = 3;
 
 /** Copy shown whenever the mutual-vetting gate is waived. */
 export const BOOTSTRAP_NOTICE = "Operator bootstrap mode: mutual vetting bypassed";
@@ -88,6 +96,64 @@ export function maxUsesLimit(standing: InviteIssuanceStanding, issuer: IssuerSta
     return Math.trunc(reported);
   }
   return standing.is_genesis || standing.is_admin ? GENESIS_MAX_USES : MEMBER_MAX_USES;
+}
+
+/**
+ * Rolling-window quota standing, projected from the enclave's own
+ * `issuance_quota_limit` so the pill can never assume a fixed ceiling of 3.
+ *
+ * `limit === null` means no cap is in force (Admin registry entries and the
+ * Genesis / Operator identity) and `exhausted` is therefore always `false`.
+ */
+export interface QuotaStanding {
+  used: number;
+  /** `null` = unlimited. */
+  limit: number | null;
+  exhausted: boolean;
+  /** Ready-to-render label for the quota pill. */
+  label: string;
+}
+
+/**
+ * Resolve the rolling 30-day issuance standing.
+ *
+ * The enclave is the authority: `issuance_quota_limit` wins whenever it is
+ * present, and a `null` there means the account genuinely has no cap. Older
+ * backends omit the field, so the fallback mirrors
+ * `invites::issuance_quota_limit` locally — Genesis / Operator and Admin are
+ * uncapped, and only an ordinary member falls back to the legacy numeric
+ * `quota_limit` (0 = unlimited).
+ */
+export function quotaStanding(standing: InviteIssuanceStanding, issuer: IssuerStatus | null): QuotaStanding {
+  // A junk count reads as 0 rather than NaN, so it can never be compared into a
+  // spurious "exhausted".
+  const raw = issuer?.quota_used_last_30d;
+  const used = typeof raw === "number" && Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : 0;
+
+  const reported = issuer?.issuance_quota_limit;
+  let limit: number | null;
+  if (typeof reported === "number" && Number.isFinite(reported)) {
+    limit = reported >= 1 ? Math.trunc(reported) : null;
+  } else if (standing.is_genesis || standing.is_admin) {
+    limit = null;
+  } else {
+    const legacy = issuer?.quota_limit;
+    limit =
+      typeof legacy === "number" && Number.isFinite(legacy) && legacy >= 1
+        ? Math.trunc(legacy)
+        : MEMBER_MONTHLY_QUOTA;
+  }
+
+  // Only a capped issuer can be exhausted: with no limit in force the predicate
+  // is vacuously satisfied, so the mint button stays enabled.
+  const exhausted = limit !== null && used >= limit;
+  const label =
+    limit === null
+      ? standing.is_genesis
+        ? `${used} issued (Unlimited)`
+        : "Unlimited"
+      : `${used} / ${limit} used`;
+  return { used, limit, exhausted, label };
 }
 
 /**

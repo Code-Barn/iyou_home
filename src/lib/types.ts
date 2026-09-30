@@ -392,8 +392,19 @@ export interface IssuerStatus {
   did: string;
   role: InviteTier;
   quota_used_last_30d: number;
-  /** 0 = unlimited (admin). */
+  /**
+   * Legacy numeric projection of `issuance_quota_limit`, where 0 encodes
+   * "unlimited" (Admin and Genesis / Operator). Prefer `issuance_quota_limit`.
+   */
   quota_limit: number;
+  /**
+   * Rolling 30-day issuance cap for this issuer, or `null` when no cap is in
+   * force. `3` for an ordinary member; `null` for `Admin` registry entries
+   * and for the Genesis / Operator identity. Mirrors
+   * `invites::issuance_quota_limit`, so the UI never assumes a fixed ceiling
+   * of 3 and the enclave and the modal cannot disagree.
+   */
+  issuance_quota_limit: number | null;
   /**
    * Effective `max_uses` ceiling for this issuer: 4 for ordinary members, 100
    * for Genesis / Operator. Mirrors `invites::max_uses_limit_for` so the modal
