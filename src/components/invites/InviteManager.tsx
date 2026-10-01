@@ -46,7 +46,9 @@ import {
   clampThreshold,
   deriveInviteStanding,
   maxUsesLimit,
+  memberRequirements,
   quotaStanding,
+  standingBadge,
 } from "./inviteVetting";
 
 const SCOPE_OPTIONS = ["relay:read", "relay:write"] as const;
@@ -58,27 +60,58 @@ const SCOPE_OPTIONS = ["relay:read", "relay:write"] as const;
  */
 const isDevMode = (): boolean => Boolean(import.meta.env?.DEV);
 
+/**
+ * Palette accessor for the invite surface.
+ *
+ * The panel is styled inline (no CSS modules in this view), so every colour is
+ * pulled from an `--iv-*` custom property that flips under
+ * `prefers-color-scheme` in `App.css`. The literal second argument is the
+ * light-theme value, used as a fallback when the stylesheet is absent — the
+ * same defensive pattern already used elsewhere in `App.css`.
+ */
+function tone(name: string, light: string): string {
+  return `var(--iv-${name}, ${light})`;
+}
+
+function badgeTone(kind: "ok" | "info" | "accent" | "warn" | "danger" | "genesis" | "neutral"): CSSProperties {
+  const fallback: Record<typeof kind, [string, string, string]> = {
+    ok: ["#ecfdf5", "#047857", "#a7f3d0"],
+    info: ["#eff6ff", "#1d4ed8", "#bfdbfe"],
+    accent: ["#eef2ff", "#3730a3", "#c7d2fe"],
+    warn: ["#fffbeb", "#92400e", "#fde68a"],
+    danger: ["#fef2f2", "#b91c1c", "#fecaca"],
+    genesis: ["#4c1d95", "#ffffff", "#ddd6fe"],
+    neutral: ["#f3f4f6", "#374151", "#d1d5db"],
+  };
+  const [bg, fg, border] = fallback[kind];
+  return {
+    background: `var(--iv-${kind}-bg, ${bg})`,
+    color: `var(--iv-${kind}-fg, ${fg})`,
+    border: `1px solid var(--iv-${kind}-border, ${border})`,
+  };
+}
+
+/** Inline banner/pill chrome shared by every notice in this view. */
+const NOTICE_STYLE: CSSProperties = {
+  padding: "0.5rem 0.8rem",
+  borderRadius: "6px",
+  fontSize: "0.8rem",
+  marginBottom: "0.85rem",
+};
+
+/** Status pill copy. `used` means the token was claimed by a recipient. */
+const STATUS_LABEL: Record<InviteRecord["status"], string> = {
+  live: "Live",
+  used: "Exhausted",
+  revoked: "Revoked",
+  expired: "Expired",
+};
+
 const STATUS_STYLE: Record<InviteRecord["status"], CSSProperties> = {
-  live: {
-    background: "#ecfdf5",
-    color: "#047857",
-    border: "1px solid #a7f3d0",
-  },
-  used: {
-    background: "#eff6ff",
-    color: "#1d4ed8",
-    border: "1px solid #bfdbfe",
-  },
-  revoked: {
-    background: "#fef2f2",
-    color: "#b91c1c",
-    border: "1px solid #fecaca",
-  },
-  expired: {
-    background: "#fffbeb",
-    color: "#92400e",
-    border: "1px solid #fde68a",
-  },
+  live: badgeTone("ok"),
+  used: badgeTone("info"),
+  revoked: badgeTone("danger"),
+  expired: badgeTone("warn"),
 };
 
 const ROLE_LABEL: Record<InviteTier, string> = {
@@ -88,28 +121,13 @@ const ROLE_LABEL: Record<InviteTier, string> = {
 };
 
 const ROLE_STYLE: Record<InviteTier, CSSProperties> = {
-  admin: {
-    background: "#312e81",
-    color: "#ffffff",
-  },
-  member: {
-    background: "#ecfdf5",
-    color: "#047857",
-    border: "1px solid #a7f3d0",
-  },
-  guest: {
-    background: "#f3f4f6",
-    color: "#374151",
-    border: "1px solid #d1d5db",
-  },
+  admin: badgeTone("genesis"),
+  member: badgeTone("ok"),
+  guest: badgeTone("neutral"),
 };
 
 /** Genesis / Operator badge — the root network identity. */
-const GENESIS_STYLE: CSSProperties = {
-  background: "#4c1d95",
-  color: "#ffffff",
-  border: "1px solid #ddd6fe",
-};
+const GENESIS_STYLE: CSSProperties = badgeTone("genesis");
 
 function formatDate(ts: number): string {
   if (!ts) return "—";
@@ -145,7 +163,9 @@ export default function InviteManager() {
 
   const [revokingNonce, setRevokingNonce] = useState<string | null>(null);
 
-  // Genesis / Admin bypass state.
+  // Issuer standing inputs: contact book size and the operator-tunable
+  // threshold. None of this is a developer affordance — the enclave enforces
+  // the real policy; this only decides what the panel has to show.
   const [contacts, setContacts] = useState<{ peer_id: string }[]>([]);
   const [thresholdDraft, setThresholdDraft] = useState<number | null>(null);
   const [thresholdSaved, setThresholdSaved] = useState<number | null>(null);
@@ -167,6 +187,15 @@ export default function InviteManager() {
   // means no cap is in force, so the pill reads "Unlimited" and minting is
   // never blocked by quota.
   const quota = useMemo(() => quotaStanding(standing, issuer), [standing, issuer]);
+
+  // Capability badge for a waived issuer (Genesis / Admin / dev build), or null
+  // for an ordinary member — whose standing is stated as plain requirements
+  // instead. Never a banner: a granted capability is not an error state.
+  const badge = useMemo(() => standingBadge(standing), [standing]);
+
+  // The plain-language eligibility line for an ordinary member. Null for a
+  // waived issuer, whose requirements are summarised by the badge tooltip.
+  const requirements = standing.bypassed ? null : memberRequirements(issuer);
 
   // Clamp a draft `max_uses` into the current ceiling. Applied on read so a
   // standing change (e.g. rotating away from Genesis) can never leave a
@@ -349,21 +378,20 @@ export default function InviteManager() {
     if (!issuer) return null;
     const v = issuer.vetting;
     const required = v.min_contacts_required ?? 5;
-    // Under a Genesis/Admin bypass the age and contact chips describe state
-    // that is explicitly not gating issuance, so mark them waived rather than
-    // failing. The moderation-flag chip is never waived and always reflects the
-    // real gate.
-    const waived = standing.bypassed;
-    const chips: { ok: boolean; label: string; waived?: boolean }[] = [
+    // For a waived issuer the age and contact chips describe state that is not
+    // gating issuance, so mark them exempt rather than failing. The
+    // moderation-flag chip is never exempt and always reflects the real gate.
+    const exempt = standing.bypassed;
+    const chips: { ok: boolean; label: string; exempt?: boolean }[] = [
       {
         ok: v.account_age_ok,
         label: `Account ${v.account_age_days}d`,
-        waived: waived && !v.account_age_ok,
+        exempt: exempt && !v.account_age_ok,
       },
       {
         ok: v.contacts_ok,
         label: `${v.contact_count}/${required} contacts`,
-        waived: waived && !v.contacts_ok,
+        exempt: exempt && !v.contacts_ok,
       },
       { ok: v.flags_ok, label: `${v.active_moderation_flags} mod flags` },
     ];
@@ -376,22 +404,20 @@ export default function InviteManager() {
           title={
             passing
               ? "Requirement met"
-              : c.waived
-                ? "Waived — Genesis / Operator bypass"
+              : c.exempt
+                ? "Not required for this issuer"
                 : "Requirement not yet met"
           }
           style={{
             fontSize: "0.72rem",
             padding: "0.15rem 0.5rem",
             borderRadius: "999px",
-            background: passing ? "#ecfdf5" : c.waived ? "#eef2ff" : "#fffbeb",
-            color: passing ? "#047857" : c.waived ? "#3730a3" : "#92400e",
-            border: `1px solid ${passing ? "#a7f3d0" : c.waived ? "#c7d2fe" : "#fde68a"}`,
+            ...badgeTone(passing ? "ok" : c.exempt ? "accent" : "warn"),
             fontWeight: 600,
-            textDecoration: c.waived ? "line-through" : "none",
+            textDecoration: c.exempt ? "line-through" : "none",
           }}
         >
-          {passing ? "✓" : c.waived ? "⊘" : "✗"} {c.label}
+          {passing ? "✓" : c.exempt ? "⊘" : "✗"} {c.label}
         </span>
       );
     });
@@ -411,13 +437,13 @@ export default function InviteManager() {
         }}
       >
         <div>
-          <h3 style={{ fontSize: "1.05rem", fontWeight: 700, color: "#0f172a", margin: 0 }}>
+          <h3 style={{ fontSize: "1.05rem", fontWeight: 700, color: tone("text", "#0f172a"), margin: 0 }}>
             {"\uD83D\uDCE8"} Invite Capability Tokens
           </h3>
           <div
             style={{
               fontSize: "0.8rem",
-              color: "#6b7280",
+              color: tone("text-muted", "#6b7280"),
               marginTop: "0.25rem",
               display: "flex",
               alignItems: "center",
@@ -447,6 +473,22 @@ export default function InviteManager() {
             >
               {"\uD83D\uDCC5"} {quotaLabel()}
             </span>
+            {badge && (
+              <span
+                data-testid={badge.testId}
+                title={badge.tooltip}
+                style={{
+                  ...badgeTone("genesis"),
+                  fontSize: "0.72rem",
+                  padding: "0.15rem 0.55rem",
+                  borderRadius: "999px",
+                  fontWeight: 700,
+                  cursor: "help",
+                }}
+              >
+                {"\u2726"} {badge.label}
+              </span>
+            )}
             {vettingChips()}
           </div>
         </div>
@@ -455,36 +497,10 @@ export default function InviteManager() {
         </button>
       </div>
 
-      {standing.notice && (
-        <div
-          data-testid="invite-bypass-notice"
-          role="status"
-          style={{
-            padding: "0.5rem 0.8rem",
-            borderRadius: "6px",
-            background: "#eef2ff",
-            border: "1px solid #c7d2fe",
-            color: "#3730a3",
-            fontSize: "0.8rem",
-            marginBottom: "0.75rem",
-          }}
-        >
-          {"\u2299\uFE0F"} {standing.notice}
-        </div>
-      )}
-
       {error && (
         <div
           data-testid="invite-error"
-          style={{
-            padding: "0.6rem 0.9rem",
-            borderRadius: "6px",
-            background: "#fef2f2",
-            border: "1px solid #fecaca",
-            color: "#b91c1c",
-            fontSize: "0.82rem",
-            marginBottom: "0.75rem",
-          }}
+          style={{ ...NOTICE_STYLE, ...badgeTone("danger") }}
         >
           {error}
         </div>
@@ -494,7 +510,13 @@ export default function InviteManager() {
       <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.84rem" }}>
           <thead>
-            <tr style={{ textAlign: "left", color: "#6b7280", borderBottom: "2px solid #e5e7eb" }}>
+            <tr
+              style={{
+                textAlign: "left",
+                color: tone("heading", "#6b7280"),
+                borderBottom: `2px solid ${tone("border", "#e5e7eb")}`,
+              }}
+            >
               <th style={{ padding: "0.4rem 0.6rem" }}>Nonce</th>
               <th style={{ padding: "0.4rem 0.6rem" }}>Tier</th>
               <th style={{ padding: "0.4rem 0.6rem" }}>Status</th>
@@ -507,13 +529,17 @@ export default function InviteManager() {
           <tbody>
             {invites.length === 0 && (
               <tr>
-                <td colSpan={7} style={{ padding: "1rem 0.6rem", color: "#9ca3af" }}>
+                <td colSpan={7} style={{ padding: "1rem 0.6rem", color: tone("text-muted", "#9ca3af") }}>
                   {loading ? "Loading invites…" : "No invites issued yet."}
                 </td>
               </tr>
             )}
             {invites.map((inv) => (
-              <tr key={inv.nonce} data-testid={`invite-row-${inv.nonce}`} style={{ borderBottom: "1px solid #f3f4f6" }}>
+              <tr
+                key={inv.nonce}
+                data-testid={`invite-row-${inv.nonce}`}
+                style={{ borderBottom: `1px solid ${tone("border-row", "#f3f4f6")}` }}
+              >
                 <td style={{ padding: "0.5rem 0.6rem", fontFamily: "monospace", fontSize: "0.78rem" }}>
                   {shortNonce(inv.nonce)}
                 </td>
@@ -527,10 +553,9 @@ export default function InviteManager() {
                       padding: "0.15rem 0.55rem",
                       borderRadius: "999px",
                       fontWeight: 600,
-                      textTransform: "capitalize",
                     }}
                   >
-                    {inv.status}
+                    {STATUS_LABEL[inv.status] ?? inv.status}
                   </span>
                 </td>
                 <td style={{ padding: "0.5rem 0.6rem", fontFamily: "monospace", fontSize: "0.75rem" }}>
@@ -547,7 +572,12 @@ export default function InviteManager() {
                       data-testid={`invite-revoke-${inv.nonce}`}
                       onClick={() => handleRevoke(inv.nonce)}
                       disabled={revokingNonce === inv.nonce}
-                      style={{ fontSize: "0.75rem", color: "#b91c1c", borderRadius: "6px", padding: "0.25rem 0.6rem" }}
+                      style={{
+                        fontSize: "0.75rem",
+                        color: tone("danger-fg", "#b91c1c"),
+                        borderRadius: "6px",
+                        padding: "0.25rem 0.6rem",
+                      }}
                     >
                       {revokingNonce === inv.nonce ? "…" : "Revoke"}
                     </button>
@@ -566,7 +596,7 @@ export default function InviteManager() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(15,23,42,0.45)",
+            background: tone("overlay", "rgba(15,23,42,0.45)"),
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -579,7 +609,8 @@ export default function InviteManager() {
             aria-label="Issue invite"
             onClick={(e) => e.stopPropagation()}
             style={{
-              background: "#ffffff",
+              background: tone("surface", "#ffffff"),
+              color: tone("text", "#0f172a"),
               borderRadius: "12px",
               padding: "1.5rem",
               maxWidth: 520,
@@ -593,11 +624,11 @@ export default function InviteManager() {
               <>
                 <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.85rem" }}>
                   <span style={{ fontSize: "1.25rem" }}>{"\u2705"}</span>
-                  <h3 style={{ margin: 0, fontSize: "1.05rem", color: "#0f172a" }}>
+                  <h3 style={{ margin: 0, fontSize: "1.05rem", color: tone("text", "#0f172a") }}>
                     Invite minted and signed
                   </h3>
                 </div>
-                <p style={{ fontSize: "0.82rem", color: "#6b7280", marginTop: 0 }}>
+                <p style={{ fontSize: "0.82rem", color: tone("text-muted", "#6b7280"), marginTop: 0 }}>
                   Share the link below (or scan the QR) with the person you are
                   inviting. Scanning opens the airlock page, which decodes the
                   token and validates it against your DID.
@@ -622,9 +653,9 @@ export default function InviteManager() {
                         fontSize: "0.68rem",
                         padding: "0.5rem",
                         borderRadius: "6px",
-                        border: "1px solid #d1d5db",
-                        background: "#f9fafb",
-                        color: "#0f172a",
+                        border: `1px solid ${tone("border", "#d1d5db")}`,
+                        background: tone("surface-sunken", "#f9fafb"),
+                        color: tone("text", "#0f172a"),
                       }}
                     />
                     <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.5rem" }}>
@@ -654,9 +685,18 @@ export default function InviteManager() {
                         data-testid="invite-qr-image"
                         src={qrUrl}
                         alt="Invite link QR code"
-                        style={{ width: 180, height: 180, borderRadius: 8, border: "1px solid #e5e7eb" }}
+                        // The QR image keeps a light backdrop in BOTH themes on purpose: a QR code is
+                        // only scannable as dark modules on a light field, so
+                        // inverting it for dark mode would break redemption.
+                        style={{
+                          width: 180,
+                          height: 180,
+                          borderRadius: 8,
+                          background: "#ffffff",
+                          border: `1px solid ${tone("border", "#e5e7eb")}`,
+                        }}
                       />
-                      <span style={{ fontSize: "0.72rem", color: "#6b7280" }}>
+                      <span style={{ fontSize: "0.72rem", color: tone("text-muted", "#6b7280") }}>
                         Scan to open invite link
                       </span>
                     </div>
@@ -670,31 +710,48 @@ export default function InviteManager() {
               </>
             ) : (
               <>
-                <h3 style={{ margin: "0 0 0.25rem", fontSize: "1.05rem", color: "#0f172a" }}>
+                <h3 style={{ margin: "0 0 0.25rem", fontSize: "1.05rem", color: tone("text", "#0f172a") }}>
                   Issue Invite
                 </h3>
-                <p style={{ fontSize: "0.8rem", color: "#6b7280", margin: "0 0 1rem" }}>
+                <p style={{ fontSize: "0.8rem", color: tone("text-muted", "#6b7280"), margin: "0 0 1rem" }}>
                   Mint a signed capability token bound to your Level 1 identity.
                   {quota.limit === null
                     ? " No 30-day issuance quota applies to you."
                     : ` Members: ≤ ${quota.limit} per rolling 30 days, member tier only.`}
                 </p>
 
-                {standing.notice && (
+                {/* Standing summary. A waived issuer gets a capability badge; an
+                    ordinary member gets a plain requirements line. Neither is a
+                    banner: neither is an error state. */}
+                {badge && (
+                  <div style={{ marginBottom: "0.9rem" }}>
+                    <span
+                      data-testid="invite-modal-standing-badge"
+                      title={badge.tooltip}
+                      style={{
+                        ...badgeTone("genesis"),
+                        display: "inline-block",
+                        fontSize: "0.78rem",
+                        padding: "0.25rem 0.65rem",
+                        borderRadius: "999px",
+                        fontWeight: 700,
+                        cursor: "help",
+                      }}
+                    >
+                      {"\u2726"} {badge.label}
+                    </span>
+                  </div>
+                )}
+                {requirements && (
                   <div
-                    data-testid="invite-modal-bypass-notice"
-                    role="status"
+                    data-testid="invite-member-requirements"
                     style={{
-                      padding: "0.5rem 0.8rem",
-                      borderRadius: "6px",
-                      background: "#eef2ff",
-                      border: "1px solid #c7d2fe",
-                      color: "#3730a3",
-                      fontSize: "0.8rem",
+                      ...NOTICE_STYLE,
+                      ...badgeTone("accent"),
                       marginBottom: "0.9rem",
                     }}
                   >
-                    {"\u2299\uFE0F"} {standing.notice}
+                    {"\u2139\uFE0F"} {requirements}
                   </div>
                 )}
 
@@ -715,94 +772,108 @@ export default function InviteManager() {
                   </select>
                 </label>
 
-                {/* Operator-tunable RFC-002 §5.2 mutual-contact threshold.
-                    Persisted enclave-side via `set_vetting_threshold`; it tunes
-                    the gate for ordinary members and never disables it. */}
-                <label
-                  data-testid="invite-threshold-label"
-                  style={{ display: "block", marginBottom: "0.9rem", fontSize: "0.85rem", fontWeight: 600 }}
-                >
-                  Member vetting: need {">="}{" "}
-                  <input
-                    data-testid="invite-threshold"
-                    type="number"
-                    min={MIN_CONTACTS_FLOOR}
-                    max={MAX_CONTACTS_CEILING}
-                    value={thresholdDraft ?? threshold}
-                    onChange={(e) => setThresholdDraft(Number(e.target.value))}
-                    style={{
-                      display: "inline-block",
-                      width: "5rem",
-                      margin: "0 0.25rem",
-                      fontSize: "0.85rem",
-                      fontWeight: 600,
-                    }}
-                  />{" "}
-                  mutual contacts (have {contactCount})
-                  <span style={{ display: "block", fontWeight: 400, fontSize: "0.75rem", color: "#6b7280", marginTop: "0.25rem" }}>
-                    {standing.bypassed
-                      ? "Not applied to you: Genesis / Operator bypass. This threshold still applies to ordinary member issuers."
-                      : `Applies to ordinary member issuers. Range ${MIN_CONTACTS_FLOOR}–${MAX_CONTACTS_CEILING}.`}
-                  </span>
-                </label>
-                {thresholdDraft !== null ? (
-                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "-0.5rem", marginBottom: "0.9rem" }}>
-                    <button
-                      type="button"
-                      onClick={handleSaveThreshold}
-                      disabled={savingThreshold}
-                      data-testid="invite-threshold-save"
-                      style={{ fontSize: "0.78rem" }}
-                    >
-                      {savingThreshold ? "Saving…" : "Save threshold"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setThresholdDraft(null);
-                        setThresholdError(null);
-                      }}
-                      data-testid="invite-threshold-cancel"
-                      style={{ fontSize: "0.78rem" }}
-                    >
-                      Reset
-                    </button>
-                  </div>
-                ) : (
-                  thresholdSaved !== null && (
-                    <div
-                      data-testid="invite-threshold-saved"
+                {/* RFC-002 §5.2 mutual-contact threshold.
+                    Hidden entirely for a waived issuer: the gate does not apply
+                    to them, so a numeric control over it would be noise. Shown
+                    to ordinary members behind a disclosure, because the enclave
+                    does let an operator tune the gate for them (never disable
+                    it), and that needs a home. */}
+                {!standing.bypassed && (
+                  <details data-testid="invite-threshold-details" style={{ marginBottom: "0.9rem" }}>
+                    <summary
+                      data-testid="invite-threshold-summary"
                       style={{
-                        padding: "0.4rem 0.7rem",
-                        borderRadius: "6px",
-                        background: "#ecfdf5",
-                        border: "1px solid #a7f3d0",
-                        color: "#047857",
-                        fontSize: "0.78rem",
-                        marginTop: "-0.5rem",
-                        marginBottom: "0.9rem",
+                        cursor: "pointer",
+                        fontSize: "0.8rem",
+                        fontWeight: 600,
+                        color: tone("text-muted", "#6b7280"),
                       }}
                     >
-                      ✓ Threshold applied: need {"≥"} {thresholdSaved} mutual contacts
+                      Network policy — mutual-contact threshold
+                    </summary>
+                    <div style={{ marginTop: "0.6rem" }}>
+                      <label
+                        data-testid="invite-threshold-label"
+                        style={{ display: "block", fontSize: "0.85rem", fontWeight: 600 }}
+                      >
+                        Mutual contacts required {">="}{" "}
+                        <input
+                          data-testid="invite-threshold"
+                          type="number"
+                          min={MIN_CONTACTS_FLOOR}
+                          max={MAX_CONTACTS_CEILING}
+                          value={thresholdDraft ?? threshold}
+                          onChange={(e) => setThresholdDraft(Number(e.target.value))}
+                          style={{
+                            display: "inline-block",
+                            width: "5rem",
+                            margin: "0 0.25rem",
+                            fontSize: "0.85rem",
+                            fontWeight: 600,
+                          }}
+                        />{" "}
+                        <span style={{ fontWeight: 400, color: tone("text-muted", "#6b7280") }}>
+                          (current: {contactCount})
+                        </span>
+                        <span
+                          style={{
+                            display: "block",
+                            fontWeight: 400,
+                            fontSize: "0.75rem",
+                            color: tone("text-muted", "#6b7280"),
+                            marginTop: "0.25rem",
+                          }}
+                        >
+                          {`Applies to ordinary member issuers. Range ${MIN_CONTACTS_FLOOR}–${MAX_CONTACTS_CEILING}.`}
+                        </span>
+                      </label>
+                      {thresholdDraft !== null && (
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.5rem" }}>
+                          <button
+                            type="button"
+                            onClick={handleSaveThreshold}
+                            disabled={savingThreshold}
+                            data-testid="invite-threshold-save"
+                            style={{ fontSize: "0.78rem" }}
+                          >
+                            {savingThreshold ? "Saving…" : "Save threshold"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setThresholdDraft(null);
+                              setThresholdError(null);
+                            }}
+                            data-testid="invite-threshold-cancel"
+                            style={{ fontSize: "0.78rem" }}
+                          >
+                            Reset
+                          </button>
+                        </div>
+                      )}
+                      {thresholdDraft === null && thresholdSaved !== null && (
+                        <div
+                          data-testid="invite-threshold-saved"
+                          style={{
+                            ...NOTICE_STYLE,
+                            ...badgeTone("ok"),
+                            marginTop: "0.5rem",
+                            marginBottom: 0,
+                          }}
+                        >
+                          ✓ Threshold applied: need {"≥"} {thresholdSaved} mutual contacts
+                        </div>
+                      )}
+                      {thresholdError && (
+                        <div
+                          data-testid="invite-threshold-error"
+                          style={{ ...NOTICE_STYLE, ...badgeTone("danger"), marginTop: "0.5rem", marginBottom: 0 }}
+                        >
+                          {thresholdError}
+                        </div>
+                      )}
                     </div>
-                  )
-                )}
-                {thresholdError && (
-                  <div
-                    data-testid="invite-threshold-error"
-                    style={{
-                      padding: "0.5rem 0.8rem",
-                      borderRadius: "6px",
-                      background: "#fef2f2",
-                      border: "1px solid #fecaca",
-                      color: "#b91c1c",
-                      fontSize: "0.8rem",
-                      marginTop: "-0.5rem",
-                      marginBottom: "0.9rem",
-                    }}
-                  >
-                    {thresholdError}
-                  </div>
+                  </details>
                 )}
 
                 <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.9rem" }}>
@@ -825,7 +896,12 @@ export default function InviteManager() {
                   {(standing.is_genesis || standing.is_admin) && maxUsesLimitValue > 4 && (
                     <span
                       data-testid="invite-max-uses-hint"
-                      style={{ alignSelf: "flex-end", fontSize: "0.74rem", color: "#6b7280", marginBottom: "1.35rem" }}
+                      style={{
+                        alignSelf: "flex-end",
+                        fontSize: "0.74rem",
+                        color: tone("text-muted", "#6b7280"),
+                        marginBottom: "1.35rem",
+                      }}
                     >
                       Community-scale codes enabled for Genesis / Operator
                     </span>
@@ -879,16 +955,7 @@ export default function InviteManager() {
                 {mintError && (
                   <div
                     data-testid="invite-mint-error"
-                    style={{
-                      padding: "0.5rem 0.8rem",
-                      borderRadius: "6px",
-                      background: "#fef2f2",
-                      border: "1px solid #fecaca",
-                      color: "#b91c1c",
-                      fontSize: "0.8rem",
-                      marginBottom: "0.85rem",
-                      whiteSpace: "pre-wrap",
-                    }}
+                    style={{ ...NOTICE_STYLE, ...badgeTone("danger"), whiteSpace: "pre-wrap" }}
                   >
                     {mintError}
                   </div>
@@ -897,15 +964,7 @@ export default function InviteManager() {
                 {standing.blocked_reason && (
                   <div
                     data-testid="invite-blocked-reason"
-                    style={{
-                      padding: "0.5rem 0.8rem",
-                      borderRadius: "6px",
-                      background: "#fffbeb",
-                      border: "1px solid #fde68a",
-                      color: "#92400e",
-                      fontSize: "0.8rem",
-                      marginBottom: "0.85rem",
-                    }}
+                    style={{ ...NOTICE_STYLE, ...badgeTone("warn") }}
                   >
                     {"\u26A0\uFE0F"} {standing.blocked_reason}
                   </div>
@@ -917,15 +976,7 @@ export default function InviteManager() {
                 {quota.limit === null && (
                   <div
                     data-testid="invite-quota-waived"
-                    style={{
-                      padding: "0.5rem 0.8rem",
-                      borderRadius: "6px",
-                      background: "#ecfdf5",
-                      border: "1px solid #a7f3d0",
-                      color: "#047857",
-                      fontSize: "0.8rem",
-                      marginBottom: "0.85rem",
-                    }}
+                    style={{ ...NOTICE_STYLE, ...badgeTone("ok") }}
                   >
                     {"\u2713"} {standing.is_genesis ? "Genesis / Operator" : "Admin"} — no 30-day
                     issuance quota limit. {quota.used} issued in the current window.
@@ -938,15 +989,7 @@ export default function InviteManager() {
                 {quota.exhausted && (
                   <div
                     data-testid="invite-quota-exhausted"
-                    style={{
-                      padding: "0.5rem 0.8rem",
-                      borderRadius: "6px",
-                      background: "#fef2f2",
-                      border: "1px solid #fecaca",
-                      color: "#b91c1c",
-                      fontSize: "0.8rem",
-                      marginBottom: "0.85rem",
-                    }}
+                    style={{ ...NOTICE_STYLE, ...badgeTone("danger") }}
                   >
                     {"\u26A0\uFE0F"} {blockedReason}
                   </div>
@@ -964,11 +1007,7 @@ export default function InviteManager() {
                     title={blockedReason ?? undefined}
                     style={{ opacity: minting || !standing.can_mint || quota.exhausted ? 0.6 : 1 }}
                   >
-                    {minting
-                      ? "\u23F3 Minting…"
-                      : standing.bypassed
-                        ? "\u2709\uFE0F Mint & Sign (bypassed)"
-                        : "\u2709\uFE0F Mint & Sign"}
+                    {minting ? "\u23F3 Minting…" : "\u2709\uFE0F Mint & Sign Invite"}
                   </button>
                 </div>
               </>

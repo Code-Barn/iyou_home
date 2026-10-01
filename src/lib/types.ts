@@ -445,9 +445,7 @@ export interface InviteIssuanceStanding {
   dev_bypass: boolean;
   /** Tier label to render: "Genesis / Operator", "Admin", or the raw role. */
   tier_label: string;
-  /** Status notice explaining the bypass, or null when ordinary vetting applies. */
-  notice: string | null;
-  /** True when the "Mint & Sign" button should be enabled. */
+  /** True when the "Mint & Sign Invite" button should be enabled. */
   can_mint: boolean;
   /** Blocked reason, or null when minting is permitted. */
   blocked_reason: string | null;

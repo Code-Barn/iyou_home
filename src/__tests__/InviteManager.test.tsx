@@ -275,7 +275,7 @@ describe("InviteManager (RFC-002)", () => {
     });
 
     const row = await screen.findByTestId("invite-row-aa11bb22cc33dd44ee55ff6677889900");
-    expect(row).toHaveTextContent("live");
+    expect(row).toHaveTextContent("Live");
 
     fireEvent.click(screen.getByTestId("invite-revoke-aa11bb22cc33dd44ee55ff6677889900"));
     await waitFor(() => {
@@ -285,7 +285,7 @@ describe("InviteManager (RFC-002)", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByTestId("invite-status-aa11bb22cc33dd44ee55ff6677889900")).toHaveTextContent("revoked");
+      expect(screen.getByTestId("invite-status-aa11bb22cc33dd44ee55ff6677889900")).toHaveTextContent("Revoked");
     });
   });
 
@@ -375,10 +375,98 @@ describe("InviteManager (RFC-002)", () => {
       expect(screen.getByTestId("invite-role")).toHaveTextContent("Admin");
     });
     expect(screen.getByTestId("invite-quota")).toHaveTextContent("Unlimited");
-    expect(screen.getByTestId("invite-status-00000000000000000000000000000001")).toHaveTextContent("live");
-    expect(screen.getByTestId("invite-status-00000000000000000000000000000002")).toHaveTextContent("used");
-    expect(screen.getByTestId("invite-status-00000000000000000000000000000003")).toHaveTextContent("revoked");
-    expect(screen.getByTestId("invite-status-00000000000000000000000000000004")).toHaveTextContent("expired");
+    // Status pills are title-cased product copy, not raw enum values.
+    expect(screen.getByTestId("invite-status-00000000000000000000000000000001")).toHaveTextContent("Live");
+    expect(screen.getByTestId("invite-status-00000000000000000000000000000002")).toHaveTextContent("Exhausted");
+    expect(screen.getByTestId("invite-status-00000000000000000000000000000003")).toHaveTextContent("Revoked");
+    expect(screen.getByTestId("invite-status-00000000000000000000000000000004")).toHaveTextContent("Expired");
+  });
+
+  it("routes every panel colour through a theme-aware CSS variable", async () => {
+    // The panel is built from inline styles, so a hard-coded hex would render a
+    // light-only surface in dark mode. Everything except the QR backdrop (which
+    // must stay light in both themes so the code stays scannable) has to resolve
+    // through an `--iv-*` custom property that flips under prefers-color-scheme.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    await screen.findByTestId("invite-role");
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+    expect(screen.getByTestId("invite-modal")).toBeInTheDocument();
+
+    // The modal surface and its text colour must both be variables, otherwise
+    // the dialog stays white-on-white / black-on-black under a dark theme.
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.style.background).toContain("var(--iv-surface");
+    expect(dialog.style.color).toContain("var(--iv-text");
+
+    // Sweep every element inside the panel for a stray hex literal.
+    const offenders: string[] = [];
+    for (const el of Array.from(
+      screen.getByTestId("invite-manager").querySelectorAll<HTMLElement>("*"),
+    )) {
+      const css = el.getAttribute("style") ?? "";
+      for (const prop of ["color", "background"]) {
+        const match = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*([^;]+)`).exec(css);
+        const value = match?.[1]?.trim();
+        if (value && /^#[0-9a-f]{3,8}$/i.test(value)) {
+          offenders.push(`${el.tagName.toLowerCase()}[${el.dataset.testid ?? "?"}].${prop}=${value}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("renders a known --iv-* token set so the dark palette stays in sync", async () => {
+    // Paired with the "no stray hex" test above, this pins the exact token set
+    // the panel depends on. Both names must exist in the `:root` *and* the
+    // `prefers-color-scheme: dark` blocks of App.css; a token defined in only
+    // one of them silently falls back to its light literal at runtime.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
+      if (cmd === "list_contacts") return Promise.resolve([]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    await screen.findByTestId("invite-role");
+    fireEvent.click(screen.getByTestId("invite-issue-button"));
+
+    const used = new Set<string>();
+    for (const el of Array.from(
+      screen.getByTestId("invite-manager").querySelectorAll<HTMLElement>("*"),
+    )) {
+      for (const m of (el.getAttribute("style") ?? "").matchAll(/var\(--iv-([a-z0-9-]+)/g)) {
+        used.add(m[1]);
+      }
+    }
+
+    // Every colour-bearing token the Genesis panel path touches.
+    expect([...used].sort()).toEqual(
+      [
+        "accent-bg",
+        "accent-border",
+        "accent-fg",
+        "border",
+        "border-row",
+        "danger-fg",
+        "genesis-bg",
+        "genesis-border",
+        "genesis-fg",
+        "heading",
+        "ok-bg",
+        "ok-border",
+        "ok-fg",
+        "overlay",
+        "surface",
+        "text",
+        "text-muted",
+      ].sort(),
+    );
   });
 
   it("lets admins choose any tier and skips the quota", async () => {
@@ -454,7 +542,7 @@ function genesisStatus(vettingOverrides: Record<string, unknown> = {}): IssuerSt
   };
 }
 
-describe("InviteManager — Genesis / Operator bypass", () => {
+describe("InviteManager — Genesis / Operator standing", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(defaultHandler);
@@ -482,21 +570,29 @@ describe("InviteManager — Genesis / Operator bypass", () => {
       expect(screen.getByTestId("invite-role")).toHaveTextContent("Genesis / Operator");
     });
 
-    // The bypass notice carries the exact required wording.
-    expect(screen.getByTestId("invite-bypass-notice")).toHaveTextContent(
-      "Operator bootstrap mode: mutual vetting bypassed",
+    // A capability badge, in both the panel header and the modal.
+    const panelBadge = screen.getByTestId("invite-genesis-badge");
+    expect(panelBadge).toHaveTextContent("Genesis Cohort Sponsor");
+    expect(panelBadge).toHaveAttribute(
+      "title",
+      "Unlimited token creation enabled for root network seeding.",
     );
+
+    // No developer-facing banner anywhere.
+    expect(screen.queryByTestId("invite-bypass-notice")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("bypass");
 
     fireEvent.click(screen.getByTestId("invite-issue-button"));
     expect(screen.getByTestId("invite-modal")).toBeInTheDocument();
-    expect(screen.getByTestId("invite-modal-bypass-notice")).toHaveTextContent(
-      "Operator bootstrap mode: mutual vetting bypassed",
+    expect(screen.getByTestId("invite-modal-standing-badge")).toHaveTextContent(
+      "Genesis Cohort Sponsor",
     );
 
-    // Mint & Sign is ENABLED despite 0 contacts, and the mint round-trips.
+    // Mint & Sign Invite is ENABLED despite 0 contacts, and the mint round-trips.
     const submit = screen.getByTestId("invite-submit");
     expect(submit).not.toBeDisabled();
-    expect(submit).toHaveTextContent("Mint & Sign (bypassed)");
+    expect(submit).toHaveTextContent("Mint & Sign Invite");
+    expect(submit).not.toHaveTextContent("(bypassed)");
     expect(screen.queryByTestId("invite-blocked-reason")).not.toBeInTheDocument();
 
     fireEvent.click(submit);
@@ -507,7 +603,7 @@ describe("InviteManager — Genesis / Operator bypass", () => {
     );
   });
 
-  it("shows the honest 0-contact counter while waiving the threshold", async () => {
+  it("hides the raw mutual-contact threshold selector for a waived issuer", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
       if (cmd === "list_contacts") return Promise.resolve([]);
@@ -517,35 +613,14 @@ describe("InviteManager — Genesis / Operator bypass", () => {
     render(<InviteManager />);
     fireEvent.click(await screen.findByTestId("invite-issue-button"));
 
-    expect(screen.getByTestId("invite-threshold")).toHaveValue(5);
-    expect(screen.getByTestId("invite-threshold-label")).toHaveTextContent(
-      "mutual contacts (have 0)",
-    );
-    expect(screen.getByTestId("invite-threshold-label")).toHaveTextContent(
-      "Not applied to you: Genesis / Operator bypass",
-    );
-  });
-
-  it("persists a lowered threshold through set_vetting_threshold", async () => {
-    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "get_issuer_status") return Promise.resolve(genesisStatus());
-      if (cmd === "list_contacts") return Promise.resolve([]);
-      if (cmd === "set_vetting_threshold") return Promise.resolve(args?.minContacts);
-      return defaultHandler(cmd, args);
-    });
-
-    render(<InviteManager />);
-    fireEvent.click(await screen.findByTestId("invite-issue-button"));
-
-    fireEvent.change(screen.getByTestId("invite-threshold"), { target: { value: "2" } });
-    fireEvent.click(screen.getByTestId("invite-threshold-save"));
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("set_vetting_threshold", {
-        minContacts: 2,
-      });
-    });
-    await screen.findByTestId("invite-threshold-saved");
+    // The numeric selector is gone entirely — not merely disabled or relocated.
+    expect(screen.queryByTestId("invite-threshold")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("invite-threshold-label")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("invite-threshold-summary")).not.toBeInTheDocument();
+    // ...and no member requirements line, which would imply the gate applies.
+    expect(screen.queryByTestId("invite-member-requirements")).not.toBeInTheDocument();
+    // The honest 0-contact chip still reports real state in the header.
+    expect(screen.getByTestId("invite-role")).toBeInTheDocument();
   });
 
   it("keeps Mint disabled and explains the block for an ordinary member", async () => {
@@ -569,15 +644,99 @@ describe("InviteManager — Genesis / Operator bypass", () => {
     await waitFor(() => {
       expect(screen.getByTestId("invite-role")).toHaveTextContent("Member");
     });
-    // No bypass notice for an ordinary peer.
-    expect(screen.queryByTestId("invite-bypass-notice")).not.toBeInTheDocument();
+    // No capability badge for an ordinary peer.
+    expect(screen.queryByTestId("invite-genesis-badge")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("invite-dev-badge")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("invite-issue-button"));
 
     expect(screen.getByTestId("invite-blocked-reason")).toHaveTextContent(
-      "Member vetting: need >= 5 mutual contacts (have 0).",
+      "Issuer needs 5 mutual contacts before it can issue invites (currently 0).",
     );
     expect(screen.getByTestId("invite-submit")).toBeDisabled();
+  });
+
+  it("shows a clean requirements line instead of a raw selector for a member", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_issuer_status") {
+        return Promise.resolve(
+          genesisStatus({
+            is_genesis: false,
+            account_age_days: 90,
+            account_age_ok: true,
+            contact_count: 7,
+            contacts_ok: true,
+            eligible: true,
+            bypass_reason: null,
+          }),
+        );
+      }
+      if (cmd === "list_contacts") {
+        return Promise.resolve(
+          Array.from({ length: 7 }, (_, i) => ({ peer_id: `peer-${i}` })),
+        );
+      }
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    // The plain-language summary is the headline requirement display.
+    expect(screen.getByTestId("invite-member-requirements")).toHaveTextContent(
+      "Requires account age ≥ 14d and ≥ 5 mutual contacts.",
+    );
+    // The numeric control is retained, but tucked behind a disclosure rather
+    // than dominating the mint form.
+    expect(screen.getByTestId("invite-threshold-summary")).toBeInTheDocument();
+    expect(screen.getByTestId("invite-threshold")).toHaveValue(5);
+    expect(screen.getByTestId("invite-threshold-label")).toHaveTextContent(
+      "Mutual contacts required >=",
+    );
+    expect(screen.getByTestId("invite-threshold-label")).toHaveTextContent(
+      "current: 7",
+    );
+    // No raw developer copy anywhere in the modal.
+    expect(screen.getByTestId("invite-modal").textContent).not.toContain("bypass");
+    expect(screen.getByTestId("invite-modal").textContent).not.toContain("Member vetting:");
+  });
+
+  it("persists a lowered threshold through set_vetting_threshold", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_issuer_status") {
+        return Promise.resolve(
+          genesisStatus({
+            is_genesis: false,
+            account_age_days: 90,
+            account_age_ok: true,
+            contact_count: 7,
+            contacts_ok: true,
+            eligible: true,
+            bypass_reason: null,
+          }),
+        );
+      }
+      if (cmd === "list_contacts") {
+        return Promise.resolve(
+          Array.from({ length: 7 }, (_, i) => ({ peer_id: `peer-${i}` })),
+        );
+      }
+      if (cmd === "set_vetting_threshold") return Promise.resolve(args?.minContacts);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+    fireEvent.click(await screen.findByTestId("invite-issue-button"));
+
+    fireEvent.change(screen.getByTestId("invite-threshold"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("invite-threshold-save"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_vetting_threshold", {
+        minContacts: 2,
+      });
+    });
+    await screen.findByTestId("invite-threshold-saved");
   });
 
   it("raises the max_uses ceiling to 100 for a community-scale code", async () => {
@@ -615,7 +774,7 @@ describe("InviteManager — Genesis / Operator bypass", () => {
     expect(screen.getByTestId("invite-max-uses")).toHaveValue(100);
   });
 
-  it("blocks a flagged Genesis issuer — the bypass never waives moderation flags", async () => {
+  it("blocks a flagged Genesis issuer — no waiver overrides moderation flags", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "get_issuer_status") {
         return Promise.resolve(
@@ -699,7 +858,7 @@ describe("InviteManager — rolling quota waiver and refund", () => {
 
     const submit = screen.getByTestId("invite-submit");
     expect(submit).not.toBeDisabled();
-    expect(submit).toHaveTextContent("Mint & Sign (bypassed)");
+    expect(submit).toHaveTextContent("Mint & Sign Invite");
 
     // The 4th-and-beyond mint actually reaches the enclave.
     fireEvent.click(submit);
@@ -799,7 +958,7 @@ describe("InviteManager — rolling quota waiver and refund", () => {
   });
 });
 
-describe("InviteManager — dev fallback bypass", () => {
+describe("InviteManager — dev build affordance", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(defaultHandler);
@@ -821,11 +980,15 @@ describe("InviteManager — dev fallback bypass", () => {
 
     render(<InviteManager />);
     await waitFor(() => {
-      expect(screen.getByTestId("invite-bypass-notice")).toHaveTextContent(
-        "Operator bootstrap mode: mutual vetting bypassed",
-      );
+      expect(screen.getByTestId("invite-dev-badge")).toBeInTheDocument();
     });
-    expect(screen.getByTestId("invite-bypass-notice")).toHaveTextContent("frontend dev build");
+    expect(screen.getByTestId("invite-dev-badge")).toHaveTextContent("Development Build");
+    expect(screen.getByTestId("invite-dev-badge")).toHaveAttribute(
+      "title",
+      expect.stringContaining("enclave still enforces its own issuance policy"),
+    );
+    expect(screen.queryByTestId("invite-genesis-badge")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("bypass");
 
     fireEvent.click(screen.getByTestId("invite-issue-button"));
     expect(screen.getByTestId("invite-submit")).not.toBeDisabled();

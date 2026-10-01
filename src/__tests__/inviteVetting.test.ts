@@ -17,7 +17,12 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  BOOTSTRAP_NOTICE,
+  ADMIN_BADGE_LABEL,
+  ADMIN_BADGE_TOOLTIP,
+  DEV_BADGE_LABEL,
+  DEV_BADGE_TOOLTIP,
+  GENESIS_BADGE_LABEL,
+  GENESIS_BADGE_TOOLTIP,
   GENESIS_MAX_USES,
   MAX_CONTACTS_CEILING,
   MEMBER_MAX_USES,
@@ -26,7 +31,9 @@ import {
   clampThreshold,
   deriveInviteStanding,
   maxUsesLimit,
+  memberRequirements,
   quotaStanding,
+  standingBadge,
 } from "../components/invites/inviteVetting";
 import type { IssuerStatus } from "../lib/types";
 
@@ -108,7 +115,7 @@ describe("maxUsesLimit", () => {
   });
 });
 
-describe("deriveInviteStanding — Genesis / Operator bypass", () => {
+describe("deriveInviteStanding — Genesis / Operator standing", () => {
   it("reports Genesis / Operator tier and lifts the bootstrap contact gate", () => {
     // The chicken-and-egg case: root identity, empty contact book, no account age.
     const standing = deriveInviteStanding({
@@ -119,7 +126,6 @@ describe("deriveInviteStanding — Genesis / Operator bypass", () => {
         account_age_days: 0,
         account_age_ok: false,
         is_genesis: true,
-        bypass_reason: `${BOOTSTRAP_NOTICE} (Genesis / Operator identity, 0 contact(s) — threshold 5 not applied)`,
       }),
       devMode: false,
       contactCount: 0,
@@ -130,30 +136,38 @@ describe("deriveInviteStanding — Genesis / Operator bypass", () => {
     expect(standing.tier_label).toBe("Genesis / Operator");
     expect(standing.can_mint).toBe(true);
     expect(standing.blocked_reason).toBeNull();
-    expect(standing.notice).toContain("Operator bootstrap mode: mutual vetting bypassed");
+    expect(standingBadge(standing)).toEqual({
+      label: GENESIS_BADGE_LABEL,
+      tooltip: GENESIS_BADGE_TOOLTIP,
+      testId: "invite-genesis-badge",
+    });
   });
 
-  it("prefers the enclave-supplied bypass reason verbatim", () => {
-    const supplied = `${BOOTSTRAP_NOTICE} (from the enclave)`;
+  it("ignores any enclave-supplied bypass_reason — the badge is the only copy", () => {
+    // The enclave's `bypass_reason` is internal diagnostic text ("threshold 5 not
+    // applied"). It must never reach the production UI verbatim.
     const standing = deriveInviteStanding({
-      issuer: issuer({}, { is_genesis: true, bypass_reason: supplied }),
+      issuer: issuer({}, {
+        is_genesis: true,
+        bypass_reason: "Operator bootstrap mode: mutual vetting bypassed (threshold 5 not applied)",
+      }),
       devMode: false,
       contactCount: 0,
     });
-    expect(standing.notice).toBe(supplied);
+    expect(standingBadge(standing)?.label).toBe(GENESIS_BADGE_LABEL);
+    expect(standingBadge(standing)?.tooltip).toBe(GENESIS_BADGE_TOOLTIP);
+    // No field of the returned standing carries the enclave's diagnostic copy.
+    expect(Object.values(standing).join(" ")).not.toContain("bypass");
   });
 
-  it("synthesises a notice when the enclave supplies none", () => {
-    const standing = deriveInviteStanding({
-      issuer: issuer({}, { is_genesis: true, bypass_reason: null }),
-      devMode: false,
-      contactCount: 0,
-    });
-    expect(standing.notice).toContain(BOOTSTRAP_NOTICE);
-    expect(standing.notice).toContain("empty contact book");
+  it("carries the exact required badge label and tooltip", () => {
+    expect(GENESIS_BADGE_LABEL).toBe("Genesis Cohort Sponsor");
+    expect(GENESIS_BADGE_TOOLTIP).toBe(
+      "Unlimited token creation enabled for root network seeding.",
+    );
   });
 
-  it("treats an Admin issuer as bypassed", () => {
+  it("treats an Admin issuer as waived and badges it separately", () => {
     const standing = deriveInviteStanding({
       issuer: issuer({ role: "admin", quota_limit: 0, issuance_quota_limit: null }, { contacts_ok: false }),
       devMode: false,
@@ -163,6 +177,40 @@ describe("deriveInviteStanding — Genesis / Operator bypass", () => {
     expect(standing.bypassed).toBe(true);
     expect(standing.tier_label).toBe("Admin");
     expect(standing.can_mint).toBe(true);
+    expect(standingBadge(standing)).toEqual({
+      label: ADMIN_BADGE_LABEL,
+      tooltip: ADMIN_BADGE_TOOLTIP,
+      testId: "invite-admin-badge",
+    });
+  });
+
+  it("gives no badge to an ordinary member", () => {
+    const standing = deriveInviteStanding({
+      issuer: issuer(),
+      devMode: false,
+      contactCount: 6,
+    });
+    expect(standingBadge(standing)).toBeNull();
+  });
+});
+
+describe("memberRequirements", () => {
+  it("states age and contact requirements in plain language", () => {
+    expect(memberRequirements(issuer())).toBe(
+      "Requires account age ≥ 14d and ≥ 5 mutual contacts.",
+    );
+  });
+
+  it("reflects an operator-tuned contact threshold instead of the default", () => {
+    expect(
+      memberRequirements(issuer({}, { min_contacts_required: 9, contacts_ok: false })),
+    ).toBe("Requires account age ≥ 14d and ≥ 9 mutual contacts.");
+  });
+
+  it("falls back to the default threshold while issuer status is still null", () => {
+    expect(memberRequirements(null)).toBe(
+      "Requires account age ≥ 14d and ≥ 5 mutual contacts.",
+    );
   });
 });
 
@@ -254,9 +302,8 @@ describe("deriveInviteStanding — ordinary peers stay gated", () => {
 
     expect(standing.bypassed).toBe(false);
     expect(standing.can_mint).toBe(false);
-    expect(standing.notice).toBeNull();
     expect(standing.blocked_reason).toBe(
-      "Member vetting: need >= 5 mutual contacts (have 2).",
+      "Issuer needs 5 mutual contacts before it can issue invites (currently 2).",
     );
   });
 
@@ -289,7 +336,7 @@ describe("deriveInviteStanding — ordinary peers stay gated", () => {
     });
     expect(standing.can_mint).toBe(false);
     expect(standing.blocked_reason).toBe(
-      "Member vetting: need >= 10 mutual contacts (have 6).",
+      "Issuer needs 10 mutual contacts before it can issue invites (currently 6).",
     );
   });
 
@@ -310,7 +357,9 @@ describe("deriveInviteStanding — ordinary peers stay gated", () => {
       devMode: false,
       contactCount: 6,
     });
-    expect(standing.blocked_reason).toContain("Account age 3d must exceed 14d");
+    expect(standing.blocked_reason).toBe(
+      "Account must be older than 14 days before it can issue invites (currently 3d).",
+    );
   });
 });
 
@@ -341,8 +390,8 @@ describe("deriveInviteStanding — safety gates are never waived", () => {
   });
 });
 
-describe("deriveInviteStanding — dev bypass", () => {
-  it("marks a dev build as bypassing the display gate only", () => {
+describe("deriveInviteStanding — dev build", () => {
+  it("marks a dev build as waiving the display gate only", () => {
     const standing = deriveInviteStanding({
       issuer: issuer({}, { contacts_ok: false, contact_count: 0 }),
       devMode: true,
@@ -351,9 +400,14 @@ describe("deriveInviteStanding — dev bypass", () => {
     expect(standing.dev_bypass).toBe(true);
     expect(standing.bypassed).toBe(true);
     expect(standing.can_mint).toBe(true);
-    expect(standing.notice).toContain("frontend dev build");
-    // Honest about the fact that the enclave still enforces its own policy.
-    expect(standing.notice).toContain("the enclave still enforces its own policy");
+    // Honest that the enclave still enforces its own policy — the badge must
+    // not read like a real capability.
+    expect(standingBadge(standing)).toEqual({
+      label: DEV_BADGE_LABEL,
+      tooltip: DEV_BADGE_TOOLTIP,
+      testId: "invite-dev-badge",
+    });
+    expect(DEV_BADGE_TOOLTIP).toContain("enclave still enforces its own issuance policy");
   });
 
   it("does not claim a dev bypass for a genuine Genesis identity", () => {
@@ -363,6 +417,18 @@ describe("deriveInviteStanding — dev bypass", () => {
       contactCount: 0,
     });
     expect(standing.dev_bypass).toBe(false);
+    // Genesis outranks the dev affordance.
+    expect(standingBadge(standing)?.testId).toBe("invite-genesis-badge");
+  });
+
+  it("does not claim a dev bypass for an Admin issuer", () => {
+    const standing = deriveInviteStanding({
+      issuer: issuer({ role: "admin" }, { contacts_ok: false }),
+      devMode: true,
+      contactCount: 0,
+    });
+    expect(standing.dev_bypass).toBe(false);
+    expect(standingBadge(standing)?.testId).toBe("invite-admin-badge");
   });
 });
 

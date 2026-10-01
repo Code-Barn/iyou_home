@@ -16,7 +16,7 @@
  */
 
 /**
- * Invite issuance standing — RFC-002 §5.2 Genesis / Admin bypass.
+ * Invite issuance standing — RFC-002 §5.2 Genesis / Admin standing.
  *
  * The mutual-contact gate (>= N contacts in `contacts.json`) is an anti-Sybil
  * control aimed at *ordinary peers*. Applied literally it deadlocks the very
@@ -29,7 +29,7 @@
  *
  *   | Signal                     | Enforced by              |
  *   |----------------------------|--------------------------|
- *   | `role === "admin"`         | Rust (already bypassed)  |
+ *   | `role === "admin"`         | Rust (already exempt)    |
  *   | `vetting.is_genesis`       | Rust (vault lookup)      |
  *   | dev build                  | frontend only, advisory  |
  *
@@ -42,9 +42,14 @@
  * The anti-Sybil gate remains fully in force for every non-Genesis, non-Admin
  * issuer, and the moderation-flag gate is never waived at any tier.
  *
- * Note the dev bypass is a *display* affordance: the enclave is the enforcing
+ * Note the dev build is a *display* affordance: the enclave is the enforcing
  * authority, so a dev build with no Genesis identity still surfaces the
  * backend's denial rather than pretending the mint succeeded.
+ *
+ * All user-facing copy for these states lives here, in the badge and
+ * requirements constants below. The UI must never describe a waived gate as a
+ * "bypass": an operator's standing is a granted capability, and the enclave's
+ * internal gate names are not product copy.
  */
 
 import type { InviteIssuanceStanding, IssuerStatus } from "../../lib/types";
@@ -63,9 +68,70 @@ export const MEMBER_MAX_USES = 4;
 export const GENESIS_MAX_USES = 100;
 /** Mirrors `invites::MEMBER_MONTHLY_QUOTA` — the ordinary member issuance cap. */
 export const MEMBER_MONTHLY_QUOTA = 3;
+/** Mirrors `invites::MEMBER_ACCOUNT_AGE_DAYS`. */
+export const MEMBER_MIN_ACCOUNT_AGE_DAYS = 14;
 
-/** Copy shown whenever the mutual-vetting gate is waived. */
-export const BOOTSTRAP_NOTICE = "Operator bootstrap mode: mutual vetting bypassed";
+// ---------- Presentation labels ----------
+//
+// The modal is a production surface, so the standing of an uncapped issuer is
+// presented as a capability badge rather than as a debugging banner. Nothing
+// here describes *how* the gate is skipped ("bypassed", "not applied to you");
+// the badge states what the account can do, and the tooltip explains why it
+// legitimately can.
+
+/** Badge shown to the vault's root / Genesis identity. */
+export const GENESIS_BADGE_LABEL = "Genesis Cohort Sponsor";
+export const GENESIS_BADGE_TOOLTIP =
+  "Unlimited token creation enabled for root network seeding.";
+/** Badge shown to an RFC-002 registry admin. */
+export const ADMIN_BADGE_LABEL = "Network Administrator";
+export const ADMIN_BADGE_TOOLTIP =
+  "Registry-managed issuer — unrestricted creation across all tiers.";
+/** Badge shown only in a `vite dev` build with no waived standing of its own. */
+export const DEV_BADGE_LABEL = "Development Build";
+export const DEV_BADGE_TOOLTIP =
+  "Local build. The enclave still enforces its own issuance policy.";
+
+export interface StandingBadge {
+  label: string;
+  tooltip: string;
+  /** `data-testid` for the rendered pill. */
+  testId: string;
+}
+
+/**
+ * The badge describing an issuer's standing, or `null` for an ordinary member
+ * whose standing is described by the plain requirements line instead.
+ *
+ * Genesis wins over Admin: the root identity is a sponsor first, and an Admin
+ * registry role is an implementation detail of how it got there.
+ */
+export function standingBadge(standing: InviteIssuanceStanding): StandingBadge | null {
+  if (standing.is_genesis) {
+    return { label: GENESIS_BADGE_LABEL, tooltip: GENESIS_BADGE_TOOLTIP, testId: "invite-genesis-badge" };
+  }
+  if (standing.is_admin) {
+    return { label: ADMIN_BADGE_LABEL, tooltip: ADMIN_BADGE_TOOLTIP, testId: "invite-admin-badge" };
+  }
+  // A dev build only claims the badge when nothing stronger applies, so it can
+  // never be mistaken for a real standing.
+  if (standing.dev_bypass) {
+    return { label: DEV_BADGE_LABEL, tooltip: DEV_BADGE_TOOLTIP, testId: "invite-dev-badge" };
+  }
+  return null;
+}
+
+/**
+ * The one-line eligibility summary for an ordinary member, e.g.
+ * `"Requires account age ≥ 14d and ≥ 5 mutual contacts."`
+ *
+ * Values are read from the enclave rather than hard-coded, so an operator-tuned
+ * contact threshold is reflected the moment it is applied.
+ */
+export function memberRequirements(issuer: IssuerStatus | null): string {
+  const required = issuer?.vetting?.min_contacts_required ?? 5;
+  return `Requires account age ≥ ${MEMBER_MIN_ACCOUNT_AGE_DAYS}d and ≥ ${required} mutual contacts.`;
+}
 
 export interface StandingInput {
   /** Issuer standing from `get_issuer_status`, or null while loading. */
@@ -162,6 +228,10 @@ export function quotaStanding(standing: InviteIssuanceStanding, issuer: IssuerSt
  * `bypassed` is the union of every waiver the enclave honours plus the
  * frontend-only dev affordance. `can_mint` additionally refuses a flagged
  * issuer, because moderation flags are never waived.
+ *
+ * No free-text banner is produced here: `standingBadge` and
+ * `memberRequirements` cover every case, and neither can describe a waiver as
+ * a bypass — that framing is an implementation detail, not user-facing copy.
  */
 export function deriveInviteStanding({
   issuer,
@@ -175,21 +245,7 @@ export function deriveInviteStanding({
 
   // A root identity bootstrapping an empty contact book is the canonical
   // chicken-and-egg case: the gate is not merely unmet, it is unsatisfiable.
-  const genesis_bootstrap = is_genesis && contactCount === 0;
   const bypassed = is_admin || is_genesis || devMode;
-
-  let notice: string | null = null;
-  if (is_admin) {
-    notice = `${BOOTSTRAP_NOTICE} (Admin issuer — unlimited issuance, any tier).`;
-  } else if (is_genesis) {
-    notice =
-      vetting?.bypass_reason ??
-      (genesis_bootstrap
-        ? `${BOOTSTRAP_NOTICE} (Genesis / Operator identity with an empty contact book).`
-        : "Genesis / Operator identity — mutual-contact threshold not applied.");
-  } else if (devMode) {
-    notice = `${BOOTSTRAP_NOTICE} (frontend dev build — the enclave still enforces its own policy).`;
-  }
 
   const tier_label = is_genesis ? "Genesis / Operator" : is_admin ? "Admin" : null;
 
@@ -204,9 +260,9 @@ export function deriveInviteStanding({
     } else if (is_flagged) {
       blocked_reason = `Issuer carries ${vetting.active_moderation_flags} active moderation flag(s).`;
     } else if (!vetting.account_age_ok) {
-      blocked_reason = `Account age ${vetting.account_age_days}d must exceed 14d before issuance.`;
+      blocked_reason = `Account must be older than ${MEMBER_MIN_ACCOUNT_AGE_DAYS} days before it can issue invites (currently ${vetting.account_age_days}d).`;
     } else if (!vetting.contacts_ok) {
-      blocked_reason = `Member vetting: need >= ${required} mutual contacts (have ${contactCount}).`;
+      blocked_reason = `Issuer needs ${required} mutual contacts before it can issue invites (currently ${contactCount}).`;
     }
   } else if (is_flagged) {
     // A waiver never overrides a safety gate.
@@ -219,7 +275,6 @@ export function deriveInviteStanding({
     is_admin,
     dev_bypass: devMode && !is_admin && !is_genesis,
     tier_label: tier_label ?? (issuer?.role ?? "member"),
-    notice,
     can_mint: blocked_reason === null,
     blocked_reason,
   };

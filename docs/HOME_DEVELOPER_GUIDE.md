@@ -205,7 +205,9 @@ The UI reflects the refund path: an exhausted capped member sees *"Rolling 30-da
 
 **Configurable threshold.** `invite_min_contacts` is an *operator preference* read back by the enclave at enforcement time — never a per-request client argument, so a member cannot weaken the gate for themselves by passing a lower value to `create_invite_token`. It is clamped to `[MIN_CONTACTS_THRESHOLD_FLOOR = 1, MAX_CONTACTS_THRESHOLD_CEILING = 50]`, and is derived in the UI by `src/components/invites/inviteVetting.ts`, which mirrors the Rust predicate and fails **closed** when issuer standing has not loaded.
 
-**Dev affordance.** A `import.meta.env.DEV` build waives the *displayed* gate and labels itself `Operator bootstrap mode: mutual vetting bypassed (frontend dev build — the enclave still enforces its own policy)`. It is presentation-only: the enclave remains the enforcing authority, and a dev build without Genesis standing still surfaces the backend denial.
+**Presentation.** The Issue Invite modal states a waived issuer's standing as a *capability badge*, never as a debugging banner: the vault's root identity renders `Genesis Cohort Sponsor`, a registry `Admin` renders `Network Administrator`, and each carries a tooltip explaining the grant. An ordinary member instead gets the plain requirements line `Requires account age ≥ 14d and ≥ N mutual contacts.` with the raw numeric threshold control collapsed behind a `Network policy` disclosure (it is never shown at all for a waived issuer, where the gate does not apply). Internal gate names such as `bypass_reason` are enclave diagnostics and are never surfaced verbatim in the UI.
+
+**Dev affordance.** A `import.meta.env.DEV` build waives the *displayed* gate and labels itself `Development Build` with the tooltip "Local build. The enclave still enforces its own issuance policy." It is presentation-only: the enclave remains the enforcing authority, and a dev build without Genesis standing still surfaces the backend denial. A dev build never claims the Genesis or Admin badge, so it cannot be mistaken for a real standing.
 
 #### 4.3.2 Invite Links & Community-Scale Tokens
 
