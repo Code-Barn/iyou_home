@@ -77,7 +77,7 @@ Edit tasks here first, then propagate to the satellite repos via their agents.
 | Ticket | Target Repo | Status | Notes |
 |:---|:---|:---|:---|
 | SEC-001 | iyou_idp | Open | Tier 3 emergency bypass lockdown. Require manual infrastructure flag. |
-| SEC-002 | iyou_home | Resolved | Bundled Let's Encrypt private key purged. Zero compile-time key material; runtime provisioning from `{app_data}/certs/` or ephemeral in-memory `rcgen` authority (see HOME_DEVELOPER_GUIDE §5.1.5). |
+| SEC-002 | iyou_home | Open | Remove bundled Let's Encrypt private key. Replace with ephemeral self-signed certs. |
 | SEC-003 | iyou_idp, iyou_home, did_rust, iyou_mobile | Open | did_rust submodule commit-hash alignment enforcement. |
 | SEC-004 | iyou_idp, iyou_home | Open | Central SPOF mitigation — offline auth fallback. |
 | SEC-005 | iyou_home | Open | Polling → Push migration (WebSocket/SSE). |

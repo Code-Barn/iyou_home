@@ -310,7 +310,7 @@ New implementations MUST emit only canonical names.
 
 | Concern | Disposition |
 |:---|:---|
-| Bundled Let's Encrypt key in app bundle | SEC-002 **RESOLVED** — zero compile-time key material; operator-provisioned `{app_data}/certs/` or ephemeral in-memory self-signed certs |
+| Bundled Let's Encrypt key in app bundle | Tracked as SEC-002 (Critical) — replace with ephemeral self-signed certs |
 | DNS hijack / loopback interception of :9001 | Cert pinning evaluation — SEC-006; global DNS resolves `home.iyou.me` → `127.0.0.1` |
 | Polling → push migration on the bridge | SEC-005 |
 | did_rust serialization drift across consumers | Commit-hash pinning — SEC-003 |
