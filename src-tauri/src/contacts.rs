@@ -35,6 +35,18 @@ use crate::vault;
 /// Upper bound on keys per RESOLVE_PEER_ALIASES query (harvesting guard).
 pub const MAX_RESOLVE_KEYS: usize = 256;
 
+/// Default `display_name` for an auto-peered sponsor.
+pub const SPONSOR_DEFAULT_LABEL: &str = "Sponsor / Inviter";
+
+/// Role marker stamped on a sponsor contact created by invite redemption.
+///
+/// The trust *tier* is `Level0_5` ("Trusted Alliance") — a sponsor introduced
+/// the invitee but is not yet an Inner-Circle peer, and must be able to earn
+/// that later. `badge` records the provenance ("Sponsor") separately so the
+/// UI can distinguish *how* the edge was established without inventing a fourth
+/// trust tier.
+pub const SPONSOR_BADGE: &str = "Sponsor";
+
 // ---------- Schema ----------
 
 /// Peer trust tier. Wire/storage values are the variant names verbatim:
@@ -78,6 +90,19 @@ pub struct PeerContact {
     /// Optional raw signed VC / presentation backing the introduction.
     #[serde(default)]
     pub attestation_receipt: Option<String>,
+    /// How this edge came to exist, e.g. `"Sponsor"` when auto-peered from an
+    /// invite redemption. `None` for a manually added contact, where
+    /// `trust_level` is the only provenance. Independent of the trust tier:
+    /// deriving provenance from the tier would conflate "who introduced you"
+    /// with "how much you trust them".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+    /// True once the relationship is reciprocal. Invite auto-peering sets this
+    /// because the sponsor is guaranteed to already hold the invitee's DID in
+    /// its own graph — the edge is one-sided only in the sense that the
+    /// invitee's acknowledgement has not yet been sent.
+    #[serde(default)]
+    pub is_mutual: bool,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -226,6 +251,115 @@ pub fn remove_contact(store: &mut ContactStore, peer_id: &str) -> Result<(), Str
     Ok(())
 }
 
+// ---------- Sponsor Auto-Peering (RFC-002 invite redemption) ----------
+
+/// Reject anything that is not a `did:key:z…` Ed25519 DID.
+///
+/// Strict on purpose. This value is written into `contacts.json` on the
+/// strength of a redemption event alone, and the alias lens matches `peer_id`
+/// verbatim — an unvalidated string here would let a malformed or hostile
+/// identifier become a permanent, silently-trusted local record. We delegate
+/// the full parse to `invites::did_to_verifying_key`, so the DID grammar has
+/// exactly one authority in the crate (a base58btc `did:key` carrying the
+/// Ed25519 `0xed01` multicodec and a parseable key).
+pub fn validate_sponsor_did(sponsor_did: &str) -> Result<String, String> {
+    let trimmed = sponsor_did.trim();
+    if trimmed.is_empty() {
+        return Err("sponsor_did must not be empty".to_string());
+    }
+    if !trimmed.starts_with("did:key:") {
+        return Err(format!(
+            "sponsor_did must be a did:key URI (got '{}')",
+            trimmed
+        ));
+    }
+    crate::invites::did_to_verifying_key(trimmed).map_err(|e| {
+        format!("sponsor_did is not a valid Ed25519 did:key ({}): {}", trimmed, e)
+    })?;
+    Ok(trimmed.to_string())
+}
+
+/// Record `sponsor_did` as the invitee's first local contact.
+///
+/// The invite token *is* the Web-of-Trust edge: its `issuer_did` is a
+/// cryptographic statement by the sponsor that they vouched for the invitee.
+/// Rather than requiring the invitee to manually re-enter the inviter's DID —
+/// or standing up a server-side relational store to model "who invited whom" —
+/// redemption writes that edge straight into `contacts.json`, which is the
+/// only place the relationship needs to exist.
+///
+/// **Idempotent, and deliberately non-destructive.** A second redemption (the
+/// same invite presented twice, or a second invite from the same sponsor) is a
+/// no-op on every user-owned field: the existing `display_name`, trust tier,
+/// aliases, receipt, and `created_at` are all preserved. A bootstrap must never
+/// clobber a petname the invitee chose by hand or a trust tier they set
+/// deliberately; only genuinely-absent provenance (`badge`) is filled in.
+/// `updated_at` still advances so the write is observable.
+///
+/// Returns the stored record.
+pub fn bootstrap_sponsor_contact_in_store(
+    store: &mut ContactStore,
+    sponsor_did: &str,
+    label: Option<String>,
+) -> Result<PeerContact, String> {
+    let peer_id = validate_sponsor_did(sponsor_did)?;
+    let now = unix_now();
+
+    // Already known: backfill provenance only, preserving everything the
+    // invitee (or a prior `upsert_contact`) has since set.
+    if let Some(existing) = store
+        .contacts
+        .iter_mut()
+        .find(|c| c.peer_id == peer_id)
+    {
+        if existing.badge.is_none() {
+            existing.badge = Some(SPONSOR_BADGE.to_string());
+        }
+        if !existing.is_mutual {
+            existing.is_mutual = true;
+        }
+        let stored = existing.clone();
+        existing.updated_at = now;
+        let mut result = stored;
+        result.updated_at = now;
+        return Ok(result);
+    }
+
+    let display_name = label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| SPONSOR_DEFAULT_LABEL.to_string());
+
+    let contact = PeerContact {
+        peer_id,
+        display_name,
+        trust_level: TrustLevel::Level0_5,
+        disclosed_aliases: Vec::new(),
+        attestation_receipt: None,
+        badge: Some(SPONSOR_BADGE.to_string()),
+        is_mutual: true,
+        created_at: now,
+        updated_at: now,
+    };
+    store.contacts.push(contact.clone());
+    Ok(contact)
+}
+
+/// Load → bootstrap → save, atomically persisting the sponsor edge.
+pub fn bootstrap_sponsor_contact(
+    app: &AppHandle,
+    sponsor_did: &str,
+    label: Option<String>,
+) -> Result<PeerContact, String> {
+    // Validate *before* touching disk so a malformed DID can never partially
+    // mutate the store.
+    let peer_id = validate_sponsor_did(sponsor_did)?;
+    let mut store = load_contact_store(app)?;
+    let stored = bootstrap_sponsor_contact_in_store(&mut store, &peer_id, label)?;
+    save_contact_store(app, &store)?;
+    Ok(stored)
+}
+
 // ---------- Alias Resolution Engine ----------
 
 /// Privacy-safe projection returned to bridge / IPC consumers. Never
@@ -308,6 +442,8 @@ mod tests {
                 "@alice:example.org".to_string(),
             ],
             attestation_receipt: None,
+            badge: None,
+            is_mutual: false,
             created_at: 1000,
             updated_at: 1000,
         }
@@ -321,9 +457,17 @@ mod tests {
             trust_level: TrustLevel::Level0_5,
             disclosed_aliases: vec![],
             attestation_receipt: None,
+            badge: None,
+            is_mutual: false,
             created_at: 2000,
             updated_at: 2000,
         }
+    }
+
+    /// A real, well-formed Ed25519 `did:key` (the deterministic test identity
+    /// from the vault derivation path, index 1 = L1 public persona).
+    fn valid_sponsor_did() -> String {
+        crate::vault::derive_deterministic_keypair(&[0x5e; 32], 1).did
     }
 
     #[test]
@@ -498,6 +642,250 @@ mod tests {
 
         remove_contact(&mut store, &bob().peer_id).expect("Existing contact should delete");
         assert!(store.contacts.is_empty());
+    }
+
+    // ---------- Sponsor auto-peering ----------
+
+    #[test]
+    fn test_bootstrap_sponsor_creates_a_valid_contact_entry() {
+        let mut store = ContactStore::default();
+        let sponsor = valid_sponsor_did();
+
+        let stored = bootstrap_sponsor_contact_in_store(&mut store, &sponsor, None)
+            .expect("A well-formed sponsor DID must be accepted");
+
+        // The spec's default label and the full sponsor provenance.
+        assert_eq!(stored.peer_id, sponsor);
+        assert_eq!(stored.display_name, SPONSOR_DEFAULT_LABEL);
+        assert_eq!(stored.trust_level, TrustLevel::Level0_5);
+        assert_eq!(stored.badge.as_deref(), Some(SPONSOR_BADGE));
+        assert!(stored.is_mutual, "an auto-peered sponsor is reciprocal");
+        // Timestamps stamped from the clock, not left at zero.
+        assert!(stored.created_at > 0, "created_at must be stamped");
+        assert_eq!(stored.updated_at, stored.created_at);
+        // Nothing else is invented.
+        assert!(stored.disclosed_aliases.is_empty());
+        assert!(stored.attestation_receipt.is_none());
+
+        // Exactly one record, and it is discoverable through the alias lens.
+        assert_eq!(store.contacts.len(), 1);
+        let resolved =
+            resolve_peer_aliases_in_store(&store, &[sponsor.clone()]);
+        assert_eq!(resolved.matches.len(), 1);
+        let hit = resolved.matches.get(&sponsor).expect("sponsor resolves");
+        assert_eq!(hit.nickname, SPONSOR_DEFAULT_LABEL);
+        assert_eq!(hit.trust_level, TrustLevel::Level0_5);
+        assert_eq!(hit.badge, "Trusted Alliance");
+
+        // An explicit label wins over the default.
+        let mut named = ContactStore::default();
+        let labeled = bootstrap_sponsor_contact_in_store(
+            &mut named,
+            &sponsor,
+            Some("Campus Admin".to_string()),
+        )
+        .expect("labelled bootstrap");
+        assert_eq!(labeled.display_name, "Campus Admin");
+        // ...but a blank or whitespace-only label falls back rather than
+        // producing an unnamed contact that `upsert_contact` would reject.
+        let mut blank = ContactStore::default();
+        let fallback = bootstrap_sponsor_contact_in_store(&mut blank, &sponsor, Some("   ".to_string()))
+            .expect("blank label falls back");
+        assert_eq!(fallback.display_name, SPONSOR_DEFAULT_LABEL);
+    }
+
+    #[test]
+    fn test_bootstrap_sponsor_is_idempotent_and_preserves_custom_nickname() {
+        let mut store = ContactStore::default();
+        let sponsor = valid_sponsor_did();
+
+        bootstrap_sponsor_contact_in_store(&mut store, &sponsor, None).expect("first bootstrap");
+        let original_created = store.contacts[0].created_at;
+
+        // The invitee renames the sponsor and promotes them by hand, replacing
+        // the bootstrap record wholesale (as a manual edit would).
+        let mut renamed = store
+            .contacts
+            .iter()
+            .find(|c| c.peer_id == sponsor)
+            .expect("sponsor present")
+            .clone();
+        renamed.display_name = "Dr. Vasquez".to_string();
+        renamed.trust_level = TrustLevel::Level0;
+        renamed.disclosed_aliases = vec!["did:key:z6MkVasquezSock".to_string()];
+        upsert_contact(&mut store, renamed).expect("manual rename");
+
+        // Re-bootstrapping (second invite redemption, or a retried write)
+        // must not clobber any of that.
+        let again = bootstrap_sponsor_contact_in_store(
+            &mut store,
+            &sponsor,
+            Some("Should Not Apply".to_string()),
+        )
+        .expect("second bootstrap is a no-op");
+
+        assert_eq!(store.contacts.len(), 1, "must never append a duplicate");
+        assert_eq!(again.display_name, "Dr. Vasquez", "custom nickname preserved");
+        assert_eq!(again.trust_level, TrustLevel::Level0, "manual trust tier preserved");
+        assert_eq!(
+            again.disclosed_aliases,
+            vec!["did:key:z6MkVasquezSock".to_string()],
+            "manually added aliases preserved"
+        );
+        assert_eq!(again.created_at, original_created, "created_at preserved");
+        // Provenance is backfilled because the manual upsert cleared it.
+        assert_eq!(again.badge.as_deref(), Some(SPONSOR_BADGE));
+        assert!(again.is_mutual);
+        // The store on disk holds the same preserved record.
+        assert_eq!(store.contacts[0].display_name, "Dr. Vasquez");
+
+        // A third call is equally inert, and never overwrites the badge either.
+        let third = bootstrap_sponsor_contact_in_store(&mut store, &sponsor, None)
+            .expect("third bootstrap is a no-op");
+        assert_eq!(third.display_name, "Dr. Vasquez");
+        assert_eq!(third.badge.as_deref(), Some(SPONSOR_BADGE));
+        assert_eq!(store.contacts.len(), 1);
+    }
+
+    #[test]
+    fn test_bootstrap_sponsor_stamps_level0_5_trust() {
+        let mut store = ContactStore::default();
+        let sponsor = valid_sponsor_did();
+
+        let stored =
+            bootstrap_sponsor_contact_in_store(&mut store, &sponsor, None).expect("bootstrap");
+
+        // "Trusted Alliance" — not Inner Circle. A sponsor vouched for the
+        // invitee; that is a weaker claim than chosen trust, and the tier must
+        // be able to move up later.
+        assert_eq!(stored.trust_level, TrustLevel::Level0_5);
+        assert_ne!(stored.trust_level, TrustLevel::Level0);
+        assert_eq!(stored.trust_level.badge(), "Trusted Alliance");
+
+        // The wire/storage value is the variant name verbatim.
+        let json = serde_json::to_value(&stored).expect("serialize");
+        assert_eq!(json["trust_level"], "Level0_5");
+        assert_eq!(json["badge"], SPONSOR_BADGE);
+        assert_eq!(json["is_mutual"], true);
+        assert_eq!(json["display_name"], SPONSOR_DEFAULT_LABEL);
+    }
+
+    #[test]
+    fn test_bootstrap_sponsor_rejects_malformed_dids_without_mutating_the_store() {
+        let sponsor = valid_sponsor_did();
+
+        // Rejected: wrong scheme, wrong key type, truncated, empty, non-base58.
+        for bad in [
+            "not-a-did",
+            "did:web:example.org",
+            "",
+            "   ",
+            "did:key:",
+            "did:key:z6MkTooShort",
+            "did:key:zzzz!!!not-base58!!!",
+            // secp256k1 did:key (0xe7 0x01) — the invite chain is Ed25519-only.
+            "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCJvUV4h8z55xBGaSsfpQZXCr7E1of3MdSxDhkmS3goGgC1aL51WyxQDCkB5dW4c8nRSLnEWkVJTFvpAqh2Vs4z8xw",
+        ] {
+            let mut store = ContactStore::default();
+            let err = bootstrap_sponsor_contact_in_store(&mut store, bad, None)
+                .expect_err("malformed sponsor DID must be rejected");
+            assert!(
+                err.contains("sponsor_did"),
+                "error should name the field for '{}': {}",
+                bad,
+                err
+            );
+            assert!(
+                store.contacts.is_empty(),
+                "rejected bootstrap must not write a record for '{}'",
+                bad
+            );
+        }
+
+        // A valid DID is still accepted after all those rejections — the
+        // validator is not left in a poisoned state.
+        let mut store = ContactStore::default();
+        assert!(bootstrap_sponsor_contact_in_store(&mut store, &sponsor, None).is_ok());
+        assert_eq!(store.contacts.len(), 1);
+
+        // Surrounding whitespace is trimmed, and the trimmed form is stored
+        // so a padded caller cannot create a second, distinct record.
+        let mut padded = ContactStore::default();
+        let trimmed = bootstrap_sponsor_contact_in_store(
+            &mut padded,
+            &format!("  {}  ", sponsor),
+            None,
+        )
+        .expect("whitespace-padded DID is normalized");
+        assert_eq!(trimmed.peer_id, sponsor);
+        bootstrap_sponsor_contact_in_store(&mut padded, &sponsor, None).expect("idempotent");
+        assert_eq!(padded.contacts.len(), 1, "padding must not fork the record");
+    }
+
+    #[test]
+    fn test_bootstrap_sponsor_persists_and_preserves_other_contacts() {
+        let dir = temp_dir();
+        let path = dir.join(format!("test_contacts_sponsor_{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let sponsor = valid_sponsor_did();
+
+        // A pre-existing contact must survive the sponsor write.
+        let mut store = ContactStore::default();
+        upsert_contact(&mut store, alice()).expect("seed alice");
+        save_contact_store_to_path(&path, &store).expect("seed save");
+
+        let mut loaded = load_contact_store_from_path(&path).expect("reload");
+        bootstrap_sponsor_contact_in_store(&mut loaded, &sponsor, Some("Inviter".into()))
+            .expect("bootstrap");
+        save_contact_store_to_path(&path, &loaded).expect("save");
+
+        let reloaded = load_contact_store_from_path(&path).expect("reload after save");
+        assert_eq!(reloaded.contacts.len(), 2);
+        assert_eq!(reloaded.contacts[0].peer_id, alice().peer_id);
+
+        let found = reloaded
+            .contacts
+            .iter()
+            .find(|c| c.peer_id == sponsor)
+            .expect("sponsor persisted");
+        assert_eq!(found.display_name, "Inviter");
+        assert_eq!(found.trust_level, TrustLevel::Level0_5);
+        assert_eq!(found.badge.as_deref(), Some(SPONSOR_BADGE));
+        assert!(found.is_mutual);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_legacy_contacts_json_without_new_fields_still_parses() {
+        // Older `contacts.json` files have no `badge` / `is_mutual` keys. The
+        // `#[serde(default)]` on both must make them deserialize as
+        // "no provenance, not mutual" rather than failing and quarantining a
+        // user's whole contact book.
+        let dir = temp_dir();
+        let path = dir.join(format!("test_contacts_legacy_{}.json", std::process::id()));
+        let legacy = r#"{
+          "contacts": [
+            {
+              "peer_id": "did:key:z6MkLegacyPeer",
+              "display_name": "Legacy",
+              "trust_level": "Level1",
+              "disclosed_aliases": ["@legacy:example.org"],
+              "created_at": 42,
+              "updated_at": 42
+            }
+          ]
+        }"#;
+        fs::write(&path, legacy).expect("write legacy store");
+
+        let store = load_contact_store_from_path(&path).expect("legacy store must parse");
+        assert_eq!(store.contacts.len(), 1);
+        assert_eq!(store.contacts[0].display_name, "Legacy");
+        assert_eq!(store.contacts[0].badge, None);
+        assert!(!store.contacts[0].is_mutual);
+        assert!(path.exists(), "a parseable legacy file must not be quarantined");
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -82,6 +82,14 @@ export interface PeerContact {
   trust_level: TrustLevel;
   disclosed_aliases: string[];
   attestation_receipt?: string;
+  /**
+   * How this edge came to exist — `"Sponsor"` when auto-peered from an invite
+   * redemption, absent for a manually added contact. Independent of
+   * `trust_level`: provenance is not the same as trust.
+   */
+  badge?: string;
+  /** True when the relationship is reciprocal. Set by invite auto-peering. */
+  is_mutual?: boolean;
   created_at: number;
   updated_at: number;
 }

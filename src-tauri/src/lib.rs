@@ -2441,6 +2441,24 @@ fn delete_contact(app: AppHandle, peer_id: String) -> Result<(), String> {
     contacts::save_contact_store(&app, &store)
 }
 
+/// Record the sponsor (inviter) of a redeemed invite as the caller's first
+/// local contact — the client-side Web-of-Trust edge, with no server-side
+/// relational store anywhere in the path.
+///
+/// The sponsor DID is validated as an Ed25519 `did:key` before anything is
+/// written. The call is idempotent: re-bootstrapping an existing sponsor
+/// preserves a custom `display_name`, trust tier, aliases, and `created_at`,
+/// filling in only absent provenance. Resolves to the stored record so the
+/// caller can render the resulting contact immediately.
+#[tauri::command]
+fn bootstrap_sponsor_contact(
+    app: AppHandle,
+    sponsor_did: String,
+    label: Option<String>,
+) -> Result<contacts::PeerContact, String> {
+    contacts::bootstrap_sponsor_contact(&app, &sponsor_did, label)
+}
+
 #[tauri::command]
 fn generate_disclosure_card(
     app: AppHandle,
@@ -2556,6 +2574,10 @@ fn import_disclosure_card(
         trust_level,
         disclosed_aliases,
         attestation_receipt: Some(raw),
+        // A disclosure card is a manual, operator-driven introduction, not an
+        // invite redemption, so it carries no sponsor provenance.
+        badge: None,
+        is_mutual: false,
         created_at: 0,
         updated_at: 0,
     };
@@ -4020,6 +4042,7 @@ pub fn run() {
             list_contacts,
             upsert_contact,
             delete_contact,
+            bootstrap_sponsor_contact,
             import_disclosure_card,
             generate_disclosure_card,
             resolve_peer_aliases,

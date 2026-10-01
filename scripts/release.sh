@@ -60,6 +60,14 @@
 #
 set -euo pipefail
 
+# This script is non-interactive by contract (CI, pipes, `nohup` runs). Git
+# defaults to a pager whenever stdout is a TTY, so a plain `git diff` blocks
+# forever waiting for the operator to press `q`. Neutralize the pager globally;
+# individual read-only inspection commands additionally pass `--no-pager` so
+# they stay safe even if this guard is ever dropped.
+export GIT_PAGER=cat
+export PAGER=cat
+
 # ---------------------------------------------------------------- helpers & tools
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '\n[WARN] %s\n' "$*" >&2; }
@@ -360,10 +368,13 @@ if js_path and os.path.isfile(js_path) and magnet_uri and "magnet:?xt=urn:btih:"
             print(f"[OK] MAGNET_FALLBACK_URI in {js_path} is already up-to-date.")
 PYEOF
 
-  # If git repo exists in ../iyou_idp, display git diff
+  # If git repo exists in ../iyou_idp, display git diff.
+  # `--no-pager` is essential: this script runs non-interactively (CI, pipes,
+  # subshells), and a default-pager `git diff` blocks forever waiting for the
+  # operator to press `q`.
   if [[ -d "$ROOT/../iyou_idp/.git" && "${DRY_RUN:-0}" != "1" ]]; then
     log "Git diff in iyou_idp:"
-    git -C "$ROOT/../iyou_idp" diff -U1 "$modal_file" ${js_file:+"$js_file"} || true
+    git -C "$ROOT/../iyou_idp" --no-pager diff -U1 "$modal_file" ${js_file:+"$js_file"} || true
   fi
 }
 
