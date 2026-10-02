@@ -234,20 +234,27 @@ pub fn append_action(
     Ok(conn.last_insert_rowid())
 }
 
-// ---------- access control (admin_dids mirror) ----------
-
 /// True when `actor_did` is registered as an `admin` role in the RFC-002
-/// `issuers` registry — the local mirror of the node-side `admin_dids` list.
-pub fn is_authorized_admin(invite_conn: &Connection, actor_did: &str) -> bool {
-    crate::invites::resolve_issuer_role(invite_conn, actor_did) == crate::invites::InviteTier::Admin
+/// `issuers` registry or corresponds to the enclave's primary Genesis identity
+/// (`profile_id == "primary"`).
+pub fn is_authorized_admin(invite_conn: &Connection, actor_did: &str, is_genesis: bool) -> bool {
+    if crate::invites::resolve_issuer_role(invite_conn, actor_did) == crate::invites::InviteTier::Admin {
+        return true;
+    }
+    if is_genesis {
+        return true;
+    }
+    false
 }
 
 /// Resolve the active Level 1 DID and fail closed with `403 Forbidden` unless
-/// it is an authorized `admin_dids` entry. Returns the admin DID on success.
+/// it is an authorized `admin_dids` entry or the enclave's primary Genesis identity.
+/// Returns the admin DID on success.
 pub fn require_admin(app: &AppHandle) -> Result<String, String> {
     let (_, did) = crate::resolve_profile_keypair(app, None)?;
     let invite_conn = crate::invites::invites_connection(app)?;
-    if is_authorized_admin(&invite_conn, &did) {
+    let is_genesis = crate::invites::is_genesis_identity(app, &did);
+    if is_authorized_admin(&invite_conn, &did, is_genesis) {
         Ok(did)
     } else {
         Err("403 Forbidden: active L1 DID is not an authorized admin_did".to_string())
@@ -905,18 +912,23 @@ mod tests {
     #[test]
     fn test_authz_gate_uses_admin_role_registry() {
         let conn = test_invite_conn();
-        assert!(!is_authorized_admin(&conn, "did:key:z6Mkmember"));
+        assert!(!is_authorized_admin(&conn, "did:key:z6Mkmember", false));
         invites::set_issuer_role_in_db(&conn, "did:key:z6Mkmember", invites::InviteTier::Member)
             .expect("member role");
-        assert!(!is_authorized_admin(&conn, "did:key:z6Mkmember"));
+        assert!(!is_authorized_admin(&conn, "did:key:z6Mkmember", false));
 
         invites::set_issuer_role_in_db(&conn, "did:key:z6Mkadmin", invites::InviteTier::Admin)
             .expect("admin role");
-        assert!(is_authorized_admin(&conn, "did:key:z6Mkadmin"));
-        // Guests never pass.
+        assert!(is_authorized_admin(&conn, "did:key:z6Mkadmin", false));
+        // Guests never pass when not genesis.
         invites::set_issuer_role_in_db(&conn, "did:key:z6Mkguest", invites::InviteTier::Guest)
             .expect("guest role");
-        assert!(!is_authorized_admin(&conn, "did:key:z6Mkguest"));
+        assert!(!is_authorized_admin(&conn, "did:key:z6Mkguest", false));
+
+        // Genesis identities inherit admin authority over node moderation regardless of issuer role.
+        assert!(is_authorized_admin(&conn, "did:key:z6Mkgenesis", true));
+        assert!(is_authorized_admin(&conn, "did:key:z6Mkmember", true));
+        assert!(is_authorized_admin(&conn, "did:key:z6Mkguest", true));
     }
 
     #[test]

@@ -41,6 +41,7 @@ import type {
   IssuerStatus,
 } from "../../lib/types";
 import {
+  GENESIS_BADGE_TOOLTIP,
   MAX_CONTACTS_CEILING,
   MIN_CONTACTS_FLOOR,
   clampThreshold,
@@ -374,53 +375,52 @@ export default function InviteManager() {
     return quota.label;
   };
 
-  const vettingChips = () => {
+  const standingBadgeGroup = () => {
     if (!issuer) return null;
     const v = issuer.vetting;
     const required = v.min_contacts_required ?? 5;
-    // For a waived issuer the age and contact chips describe state that is not
-    // gating issuance, so mark them exempt rather than failing. The
-    // moderation-flag chip is never exempt and always reflects the real gate.
-    const exempt = standing.bypassed;
-    const chips: { ok: boolean; label: string; exempt?: boolean }[] = [
-      {
-        ok: v.account_age_ok,
-        label: `Account ${v.account_age_days}d`,
-        exempt: exempt && !v.account_age_ok,
-      },
-      {
-        ok: v.contacts_ok,
-        label: `${v.contact_count}/${required} contacts`,
-        exempt: exempt && !v.contacts_ok,
-      },
-      { ok: v.flags_ok, label: `${v.active_moderation_flags} mod flags` },
-    ];
-    return chips.map((c) => {
-      const passing = c.ok;
-      return (
-        <span
-          key={c.label}
-          data-testid={`vetting-chip-${c.label.replace(/[^a-z0-9]+/gi, "-")}`}
-          title={
-            passing
-              ? "Requirement met"
-              : c.exempt
-                ? "Not required for this issuer"
-                : "Requirement not yet met"
-          }
-          style={{
-            fontSize: "0.72rem",
-            padding: "0.15rem 0.5rem",
-            borderRadius: "999px",
-            ...badgeTone(passing ? "ok" : c.exempt ? "accent" : "warn"),
-            fontWeight: 600,
-            textDecoration: c.exempt ? "line-through" : "none",
-          }}
-        >
-          {passing ? "✓" : c.exempt ? "⊘" : "✗"} {c.label}
-        </span>
-      );
-    });
+    const isFullyVetted = standing.bypassed || (v.account_age_ok && v.contacts_ok && v.flags_ok);
+    const isFlagged = !v.flags_ok;
+
+    let icon = "✓";
+    let statusText = "Fully Vetted";
+    let toneKind: "ok" | "warn" | "danger" = "ok";
+
+    if (isFlagged) {
+      icon = "✗";
+      statusText = "Moderation Flagged";
+      toneKind = "danger";
+    } else if (!isFullyVetted) {
+      icon = "✗";
+      statusText = "Under-Vetted";
+      toneKind = "warn";
+    }
+
+    const contactsLabel = isFullyVetted
+      ? `${v.contact_count} mutuals`
+      : `${v.contact_count}/${required} mutuals`;
+
+    return (
+      <span
+        data-testid="invite-standing"
+        title={
+          isFullyVetted
+            ? "All vetting requirements satisfied"
+            : isFlagged
+              ? `${v.active_moderation_flags} active moderation flags`
+              : "Account age or mutual contacts threshold pending"
+        }
+        style={{
+          ...badgeTone(toneKind),
+          fontSize: "0.72rem",
+          padding: "0.15rem 0.55rem",
+          borderRadius: "999px",
+          fontWeight: 700,
+        }}
+      >
+        {icon} {statusText} ({v.account_age_days}d · {contactsLabel} · {v.active_moderation_flags} flags)
+      </span>
+    );
   };
 
   return (
@@ -451,29 +451,38 @@ export default function InviteManager() {
               flexWrap: "wrap",
             }}
           >
-            <span
-              data-testid="invite-role"
-              style={{
-                ...(standing.is_genesis ? GENESIS_STYLE : ROLE_STYLE[issuer?.role ?? "member"]),
-                fontSize: "0.72rem",
-                padding: "0.15rem 0.55rem",
-                borderRadius: "999px",
-                fontWeight: 700,
-              }}
-            >
-              {standing.is_genesis ? "Genesis / Operator" : ROLE_LABEL[issuer?.role ?? "member"]}
-            </span>
-            <span
-              data-testid="invite-quota"
-              title={
-                quota.limit === null
-                  ? "Rolling 30-day issuance window — no quota limit in force"
-                  : `Rolling 30-day issuance window — ${quota.used} of ${quota.limit} used`
-              }
-            >
-              {"\uD83D\uDCC5"} {quotaLabel()}
-            </span>
-            {badge && (
+            {/* 1. Capability Badge (Consolidates Genesis Cohort Sponsor, removes redundant Genesis/Operator duplicate) */}
+            {standing.is_genesis ? (
+              <span
+                data-testid="invite-genesis-badge"
+                title={badge?.tooltip ?? GENESIS_BADGE_TOOLTIP}
+                style={{
+                  ...GENESIS_STYLE,
+                  fontSize: "0.72rem",
+                  padding: "0.15rem 0.55rem",
+                  borderRadius: "999px",
+                  fontWeight: 700,
+                  cursor: "help",
+                }}
+              >
+                Genesis Cohort Sponsor
+              </span>
+            ) : (
+              <span
+                data-testid="invite-role"
+                style={{
+                  ...ROLE_STYLE[issuer?.role ?? "member"],
+                  fontSize: "0.72rem",
+                  padding: "0.15rem 0.55rem",
+                  borderRadius: "999px",
+                  fontWeight: 700,
+                }}
+              >
+                {ROLE_LABEL[issuer?.role ?? "member"]}
+              </span>
+            )}
+
+            {badge && !standing.is_genesis && (
               <span
                 data-testid={badge.testId}
                 title={badge.tooltip}
@@ -486,10 +495,24 @@ export default function InviteManager() {
                   cursor: "help",
                 }}
               >
-                {"\u2726"} {badge.label}
+                {badge.label}
               </span>
             )}
-            {vettingChips()}
+
+            {/* 2. Issuance Quota Badge */}
+            <span
+              data-testid="invite-quota"
+              title={
+                quota.limit === null
+                  ? "Rolling 30-day issuance window — no quota limit in force"
+                  : `Rolling 30-day issuance window — ${quota.used} of ${quota.limit} used`
+              }
+            >
+              {"\uD83D\uDCC5"} {quotaLabel()}
+            </span>
+
+            {/* 3. Standing Badge */}
+            {standingBadgeGroup()}
           </div>
         </div>
         <button type="button" onClick={openModal} data-testid="invite-issue-button">

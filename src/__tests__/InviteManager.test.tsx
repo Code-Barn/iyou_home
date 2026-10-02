@@ -148,9 +148,7 @@ describe("InviteManager (RFC-002)", () => {
       expect(screen.getByTestId("invite-role")).toHaveTextContent("Member");
     });
     expect(screen.getByTestId("invite-quota")).toHaveTextContent("2 / 3 used");
-    expect(screen.getByTestId("vetting-chip-Account-60d")).toHaveTextContent("✓ Account 60d");
-    expect(screen.getByTestId("vetting-chip-6-5-contacts")).toHaveTextContent("✓ 6/5 contacts");
-    expect(screen.getByTestId("vetting-chip-0-mod-flags")).toHaveTextContent("✓ 0 mod flags");
+    expect(screen.getByTestId("invite-standing")).toHaveTextContent("✓ Fully Vetted (60d · 6 mutuals · 0 flags)");
     expect(screen.getByText(/No invites issued yet/)).toBeInTheDocument();
   });
 
@@ -394,7 +392,7 @@ describe("InviteManager (RFC-002)", () => {
     });
 
     render(<InviteManager />);
-    await screen.findByTestId("invite-role");
+    await screen.findByTestId("invite-genesis-badge");
     fireEvent.click(screen.getByTestId("invite-issue-button"));
     expect(screen.getByTestId("invite-modal")).toBeInTheDocument();
 
@@ -433,7 +431,7 @@ describe("InviteManager (RFC-002)", () => {
     });
 
     render(<InviteManager />);
-    await screen.findByTestId("invite-role");
+    await screen.findByTestId("invite-genesis-badge");
     fireEvent.click(screen.getByTestId("invite-issue-button"));
 
     const used = new Set<string>();
@@ -448,9 +446,6 @@ describe("InviteManager (RFC-002)", () => {
     // Every colour-bearing token the Genesis panel path touches.
     expect([...used].sort()).toEqual(
       [
-        "accent-bg",
-        "accent-border",
-        "accent-fg",
         "border",
         "border-row",
         "danger-fg",
@@ -565,12 +560,12 @@ describe("InviteManager — Genesis / Operator standing", () => {
 
     render(<InviteManager />);
 
-    // Tier reads "Genesis / Operator", not the raw registry role.
+    // Capability badge reads "Genesis Cohort Sponsor", removing redundant "Genesis / Operator".
     await waitFor(() => {
-      expect(screen.getByTestId("invite-role")).toHaveTextContent("Genesis / Operator");
+      expect(screen.getByTestId("invite-genesis-badge")).toHaveTextContent("Genesis Cohort Sponsor");
     });
+    expect(screen.queryByText("Genesis / Operator")).not.toBeInTheDocument();
 
-    // A capability badge, in both the panel header and the modal.
     const panelBadge = screen.getByTestId("invite-genesis-badge");
     expect(panelBadge).toHaveTextContent("Genesis Cohort Sponsor");
     expect(panelBadge).toHaveAttribute(
@@ -619,8 +614,8 @@ describe("InviteManager — Genesis / Operator standing", () => {
     expect(screen.queryByTestId("invite-threshold-summary")).not.toBeInTheDocument();
     // ...and no member requirements line, which would imply the gate applies.
     expect(screen.queryByTestId("invite-member-requirements")).not.toBeInTheDocument();
-    // The honest 0-contact chip still reports real state in the header.
-    expect(screen.getByTestId("invite-role")).toBeInTheDocument();
+    // The Genesis capability badge still reports in the header.
+    expect(screen.getByTestId("invite-genesis-badge")).toBeInTheDocument();
   });
 
   it("keeps Mint disabled and explains the block for an ordinary member", async () => {
@@ -823,7 +818,7 @@ describe("InviteManager — rolling quota waiver and refund", () => {
 
     render(<InviteManager />);
     await waitFor(() => {
-      expect(screen.getByTestId("invite-role")).toHaveTextContent("Genesis / Operator");
+      expect(screen.getByTestId("invite-genesis-badge")).toHaveTextContent("Genesis Cohort Sponsor");
     });
 
     // Past the old 3-token ceiling and still uncapped.

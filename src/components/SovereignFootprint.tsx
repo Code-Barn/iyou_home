@@ -44,10 +44,31 @@ function formatBytes(bytes: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
+const FOOTPRINT_COLLAPSED_KEY = "iyou_footprint_collapsed";
+
 export default function SovereignFootprint() {
   const [footprint, setFootprint] = useState<EcosystemFootprint | null>(null);
   const [loading, setLoading] = useState(false);
   const [showExtended, setShowExtended] = useState(false);
+  const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(FOOTPRINT_COLLAPSED_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleCollapse = () => {
+    setIsCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(FOOTPRINT_COLLAPSED_KEY, String(next));
+      } catch {
+        // localStorage unavailable
+      }
+      return next;
+    });
+  };
 
   const fetchFootprint = useCallback(async () => {
     setLoading(true);
@@ -216,6 +237,9 @@ export default function SovereignFootprint() {
     },
   ];
 
+  const allCards = [...coreCards, ...extendedCards];
+  const activeSatellites = allCards.filter((c) => c.count > 0);
+
   return (
     <div style={{ marginTop: "1.5rem" }}>
       {/* Header bar */}
@@ -241,21 +265,42 @@ export default function SovereignFootprint() {
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
           <button
             type="button"
-            onClick={() => setShowExtended(!showExtended)}
+            data-testid="footprint-collapse-toggle"
+            onClick={toggleCollapse}
             style={{
-              background: showExtended ? "#e0e7ff" : "#f1f5f9",
+              background: isCollapsed ? "#e0e7ff" : "#f1f5f9",
               border: "1px solid #cbd5e1",
               borderRadius: "6px",
               padding: "0.35rem 0.75rem",
               fontSize: "0.8rem",
               fontWeight: 600,
-              color: showExtended ? "#3730a3" : "#475569",
+              color: isCollapsed ? "#3730a3" : "#475569",
               cursor: "pointer",
               transition: "all 0.15s",
             }}
           >
-            {showExtended ? "▴ Collapse Extended Mesh" : "▾ Extended Mesh (+5)"}
+            {isCollapsed ? "▼ Expand" : "▲ Collapse"}
           </button>
+
+          {!isCollapsed && (
+            <button
+              type="button"
+              onClick={() => setShowExtended(!showExtended)}
+              style={{
+                background: showExtended ? "#e0e7ff" : "#f1f5f9",
+                border: "1px solid #cbd5e1",
+                borderRadius: "6px",
+                padding: "0.35rem 0.75rem",
+                fontSize: "0.8rem",
+                fontWeight: 600,
+                color: showExtended ? "#3730a3" : "#475569",
+                cursor: "pointer",
+                transition: "all 0.15s",
+              }}
+            >
+              {showExtended ? "▴ Collapse Extended Mesh" : "▾ Extended Mesh (+5)"}
+            </button>
+          )}
 
           <button
             type="button"
@@ -276,100 +321,62 @@ export default function SovereignFootprint() {
         </div>
       </div>
 
-      {/* Core 8 Grid (2x4) */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-          gap: "0.85rem",
-        }}
-      >
-        {coreCards.map((c) => (
-          <div
-            key={c.app}
-            style={{
-              background: c.bg,
-              border: `1px solid ${c.border}`,
-              borderRadius: "10px",
-              padding: "1rem",
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "space-between",
-              transition: "transform 0.15s, box-shadow 0.15s",
-            }}
-          >
-            <div>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  marginBottom: "0.5rem",
-                }}
-              >
-                <span style={{ fontSize: "1.3rem" }}>{c.icon}</span>
-                <span
-                  style={{
-                    fontSize: "0.72rem",
-                    fontWeight: 700,
-                    textTransform: "uppercase",
-                    letterSpacing: "0.05em",
-                    color: c.color,
-                    background: "rgba(255,255,255,0.7)",
-                    padding: "0.15rem 0.45rem",
-                    borderRadius: "4px",
-                  }}
-                >
-                  {c.app}
-                </span>
-              </div>
-              <div style={{ fontWeight: 700, fontSize: "0.92rem", color: "#1e293b" }}>
-                {c.title}
-              </div>
-              <div style={{ fontSize: "1.4rem", fontWeight: 800, color: c.color, margin: "0.35rem 0" }}>
-                {c.count}
-              </div>
-              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>{c.label}</div>
-            </div>
-
-            <div style={{ marginTop: "0.85rem", paddingTop: "0.65rem", borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-              <a
-                href={c.url}
-                target="_blank"
-                rel="noreferrer"
+      {isCollapsed ? (
+        /* Compact single-line horizontal strip showing mini-badges for satellites with non-zero counters */
+        <div
+          data-testid="footprint-compact-strip"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.5rem",
+            overflowX: "auto",
+            whiteSpace: "nowrap",
+            padding: "0.5rem 0.75rem",
+            border: "1px solid #e2e8f0",
+            borderRadius: "8px",
+            background: "#f8fafc",
+            minHeight: "2.4rem",
+          }}
+        >
+          {activeSatellites.length > 0 ? (
+            activeSatellites.map((c) => (
+              <span
+                key={c.app}
+                data-testid={`footprint-mini-badge-${c.app}`}
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
-                  gap: "0.3rem",
-                  fontSize: "0.78rem",
-                  fontWeight: 600,
+                  gap: "0.35rem",
+                  background: c.bg,
+                  border: `1px solid ${c.border}`,
                   color: c.color,
-                  textDecoration: "none",
+                  padding: "0.2rem 0.6rem",
+                  borderRadius: "999px",
+                  fontSize: "0.78rem",
+                  fontWeight: 700,
+                  flexShrink: 0,
                 }}
               >
-                Launch Satellite Portal ↗
-              </a>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Expandable Extended Mesh Drawer */}
-      {showExtended && (
-        <div
-          style={{
-            marginTop: "1.25rem",
-            paddingTop: "1rem",
-            borderTop: "1px dashed #cbd5e1",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem" }}>
-            <span style={{ fontSize: "1.1rem" }}>🌌</span>
-            <span style={{ fontWeight: 700, fontSize: "0.95rem", color: "#334155" }}>
-              Extended Mesh Ecosystem (+5 Satellites)
+                <span>{c.icon}</span>
+                <span>{c.app}:</span>
+                <span>{c.count}</span>
+              </span>
+            ))
+          ) : (
+            <span
+              style={{
+                fontSize: "0.8rem",
+                color: "#64748b",
+                fontStyle: "italic",
+              }}
+            >
+              All satellites idle (0 records)
             </span>
-          </div>
-
+          )}
+        </div>
+      ) : (
+        <>
+          {/* Core 8 Grid (2x4) */}
           <div
             style={{
               display: "grid",
@@ -377,7 +384,7 @@ export default function SovereignFootprint() {
               gap: "0.85rem",
             }}
           >
-            {extendedCards.map((c) => (
+            {coreCards.map((c) => (
               <div
                 key={c.app}
                 style={{
@@ -446,7 +453,102 @@ export default function SovereignFootprint() {
               </div>
             ))}
           </div>
-        </div>
+
+          {/* Expandable Extended Mesh Drawer */}
+          {showExtended && (
+            <div
+              style={{
+                marginTop: "1.25rem",
+                paddingTop: "1rem",
+                borderTop: "1px dashed #cbd5e1",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem" }}>
+                <span style={{ fontSize: "1.1rem" }}>🌌</span>
+                <span style={{ fontWeight: 700, fontSize: "0.95rem", color: "#334155" }}>
+                  Extended Mesh Ecosystem (+5 Satellites)
+                </span>
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                  gap: "0.85rem",
+                }}
+              >
+                {extendedCards.map((c) => (
+                  <div
+                    key={c.app}
+                    style={{
+                      background: c.bg,
+                      border: `1px solid ${c.border}`,
+                      borderRadius: "10px",
+                      padding: "1rem",
+                      display: "flex",
+                      flexDirection: "column",
+                      justifyContent: "space-between",
+                      transition: "transform 0.15s, box-shadow 0.15s",
+                    }}
+                  >
+                    <div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          marginBottom: "0.5rem",
+                        }}
+                      >
+                        <span style={{ fontSize: "1.3rem" }}>{c.icon}</span>
+                        <span
+                          style={{
+                            fontSize: "0.72rem",
+                            fontWeight: 700,
+                            textTransform: "uppercase",
+                            letterSpacing: "0.05em",
+                            color: c.color,
+                            background: "rgba(255,255,255,0.7)",
+                            padding: "0.15rem 0.45rem",
+                            borderRadius: "4px",
+                          }}
+                        >
+                          {c.app}
+                        </span>
+                      </div>
+                      <div style={{ fontWeight: 700, fontSize: "0.92rem", color: "#1e293b" }}>
+                        {c.title}
+                      </div>
+                      <div style={{ fontSize: "1.4rem", fontWeight: 800, color: c.color, margin: "0.35rem 0" }}>
+                        {c.count}
+                      </div>
+                      <div style={{ fontSize: "0.78rem", color: "#64748b" }}>{c.label}</div>
+                    </div>
+
+                    <div style={{ marginTop: "0.85rem", paddingTop: "0.65rem", borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+                      <a
+                        href={c.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "0.3rem",
+                          fontSize: "0.78rem",
+                          fontWeight: 600,
+                          color: c.color,
+                          textDecoration: "none",
+                        }}
+                      >
+                        Launch Satellite Portal ↗
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

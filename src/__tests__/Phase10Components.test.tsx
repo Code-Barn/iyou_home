@@ -438,5 +438,76 @@ describe("SovereignFootprint Core 8 & Extended Mesh", () => {
 
     expect(screen.queryByText("Extended Mesh Ecosystem (+5 Satellites)")).not.toBeInTheDocument();
   });
+
+  it("toggles footprint collapse, persists to localStorage, and renders compact strip with active mini-badges", async () => {
+    localStorage.clear();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_ecosystem_footprint") {
+        return Promise.resolve({
+          social_notes_count: 28,
+          governance_ballots_count: 6,
+          evidence_records_count: 15,
+          kinship_entries_count: 4,
+          media_blobs_count: 9,
+          media_storage_bytes: 2097152,
+          registered_ledgers_count: 7,
+          safe_beacons_count: 0,
+          talk_rooms_count: 0,
+          clar_entries_count: 0,
+          draw_manifests_count: 0,
+          ride_ledger_count: 0,
+          stay_manifests_count: 0,
+          farm_ledger_count: 0,
+          blog_posts_count: 0,
+        });
+      }
+      return Promise.resolve();
+    });
+
+    const { unmount } = render(<SovereignFootprint />);
+
+    expect(await screen.findByText("Social Footprint")).toBeInTheDocument();
+    const toggleBtn = screen.getByTestId("footprint-collapse-toggle");
+    expect(toggleBtn).toHaveTextContent("▲ Collapse");
+    expect(screen.queryByTestId("footprint-compact-strip")).not.toBeInTheDocument();
+
+    // Click collapse
+    await act(async () => {
+      fireEvent.click(toggleBtn);
+    });
+
+    expect(toggleBtn).toHaveTextContent("▼ Expand");
+    expect(localStorage.getItem("iyou_footprint_collapsed")).toBe("true");
+
+    // Full grid is hidden, compact strip is visible
+    expect(screen.queryByText("Social Footprint")).not.toBeInTheDocument();
+    const compactStrip = screen.getByTestId("footprint-compact-strip");
+    expect(compactStrip).toBeInTheDocument();
+
+    // Mini badges for active satellites (non-zero counters)
+    expect(screen.getByTestId("footprint-mini-badge-iyou_wun")).toHaveTextContent("iyou_wun:28");
+    expect(screen.getByTestId("footprint-mini-badge-iyou_poly")).toHaveTextContent("iyou_poly:6");
+    expect(screen.getByTestId("footprint-mini-badge-iyou_hive")).toHaveTextContent("iyou_hive:15");
+    expect(screen.getByTestId("footprint-mini-badge-iyou_name")).toHaveTextContent("iyou_name:4");
+    expect(screen.getByTestId("footprint-mini-badge-Blossom (BUD-01)")).toHaveTextContent("Blossom (BUD-01):9");
+
+    // Satellites with 0 count are omitted from compact strip
+    expect(screen.queryByTestId("footprint-mini-badge-iyou_safe")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("footprint-mini-badge-iyou_draw")).not.toBeInTheDocument();
+
+    // Unmount and re-render to verify persistence from localStorage
+    unmount();
+    render(<SovereignFootprint />);
+    expect(await screen.findByTestId("footprint-compact-strip")).toBeInTheDocument();
+    expect(screen.getByTestId("footprint-collapse-toggle")).toHaveTextContent("▼ Expand");
+
+    // Expand again
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("footprint-collapse-toggle"));
+    });
+    expect(localStorage.getItem("iyou_footprint_collapsed")).toBe("false");
+    expect(screen.getByText("Social Footprint")).toBeInTheDocument();
+    expect(screen.queryByTestId("footprint-compact-strip")).not.toBeInTheDocument();
+  });
 });
 

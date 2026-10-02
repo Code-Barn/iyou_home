@@ -575,6 +575,16 @@ pub fn enforce_issuance_policy(
 
 /// Resolve whether `did` is the vault's root / Genesis (operator) identity.
 ///
+/// Check if a DID matches the enclave's primary Genesis identity (`profile_id == "primary"`).
+pub fn is_genesis_identity_in_vault(vault: &crate::vault::VaultStore, did: &str) -> bool {
+    vault.profiles.iter().any(|p| {
+        p.did == did
+            && p.profile_id == crate::vault::DEFAULT_PERSONA_PROFILE_ID
+            && p.level == 1
+            && !p.is_system_reserved
+    })
+}
+
 /// Genesis is defined *structurally* — the DID must be a profile that actually
 /// exists in this vault and be the current Level 1 Public Persona:
 ///   * `profile_id == "primary"`, which also excludes break-glass tombstoned
@@ -594,12 +604,7 @@ pub fn is_genesis_identity(app: &AppHandle, did: &str) -> bool {
     let Ok(vault) = crate::vault::load_vault(app) else {
         return false;
     };
-    vault.profiles.iter().any(|p| {
-        p.did == did
-            && p.profile_id == crate::vault::DEFAULT_PERSONA_PROFILE_ID
-            && p.level == 1
-            && !p.is_system_reserved
-    })
+    is_genesis_identity_in_vault(&vault, did)
 }
 
 /// Build the local standing snapshot. Contacts come from `contacts.json`; the
@@ -2235,5 +2240,45 @@ mod tests {
         assert_eq!(child, "did:key:z6Mkchild");
         let err = validate_token(&token, now + 10, false, Some(uses), Some(&child), "did:key:z6Mkchild").unwrap_err();
         assert_eq!(err, DenialReason::Used);
+    }
+
+    #[test]
+    fn test_is_genesis_identity_in_vault_checks_primary_profile() {
+        let seed = [0x5eu8; 32];
+        let mut profiles = crate::vault::initial_profiles(&seed);
+        let anchor_did = profiles[0].did.clone();
+        let genesis_did = profiles[1].did.clone();
+
+        // Add a burner (level 2)
+        let mut burner = profiles[1].clone();
+        burner.profile_id = "burner_test".to_string();
+        burner.did = "did:key:z6MkburnerTwo".to_string();
+        burner.level = 2;
+        let burner_did = burner.did.clone();
+        profiles.push(burner);
+
+        // Add a retired primary (level 2)
+        let mut retired = profiles[1].clone();
+        retired.profile_id = "retired_primary_1".to_string();
+        retired.did = "did:key:z6MkretiredPrimary".to_string();
+        retired.level = 2;
+        let retired_did = retired.did.clone();
+        profiles.push(retired);
+
+        let vault = crate::vault::VaultStore {
+            root_seed_base58: bs58::encode(seed).into_string(),
+            profiles,
+            sovereign_identities: Vec::new(),
+            dependents: Vec::new(),
+            roles: Vec::new(),
+            businesses: Vec::new(),
+            child_pods: Vec::new(),
+        };
+
+        assert!(is_genesis_identity_in_vault(&vault, &genesis_did));
+        assert!(!is_genesis_identity_in_vault(&vault, &anchor_did));
+        assert!(!is_genesis_identity_in_vault(&vault, &burner_did));
+        assert!(!is_genesis_identity_in_vault(&vault, &retired_did));
+        assert!(!is_genesis_identity_in_vault(&vault, "did:key:z6Mkunknown"));
     }
 }
