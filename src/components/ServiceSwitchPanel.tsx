@@ -23,6 +23,7 @@ import SovereignFootprint from "./SovereignFootprint";
 import SovereigntyStatusPanel from "./SovereigntyStatusPanel";
 import InviteManager from "./invites/InviteManager";
 import AdminPanel from "./admin/AdminPanel";
+import { checkAndBootstrapSponsor } from "../lib/authBridge";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -133,6 +134,7 @@ export default function ServiceSwitchPanel() {
     setSyncing(true);
     try {
       await invoke("trigger_manual_sync");
+      void checkAndBootstrapSponsor();
       const status = await invoke<SyncStatus>("get_sync_status");
       setSyncStatus(status);
     } catch (error) {

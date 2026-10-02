@@ -337,6 +337,18 @@ describe("InviteManager (RFC-002)", () => {
         max_uses: 1,
         status: "expired",
       },
+      {
+        nonce: "00000000000000000000000000000005",
+        token_json: "{}",
+        issuer_did: "did:key:z6Mkprimary",
+        tier: "member",
+        created_at: 1700000000,
+        expires_at: 1710000000,
+        child_did: "did:key:z6Mkchild2",
+        uses_count: 1,
+        max_uses: 4,
+        status: "used",
+      },
     ];
 
     mockInvoke.mockImplementation((cmd: string) => {
@@ -378,6 +390,33 @@ describe("InviteManager (RFC-002)", () => {
     expect(screen.getByTestId("invite-status-00000000000000000000000000000002")).toHaveTextContent("Exhausted");
     expect(screen.getByTestId("invite-status-00000000000000000000000000000003")).toHaveTextContent("Revoked");
     expect(screen.getByTestId("invite-status-00000000000000000000000000000004")).toHaveTextContent("Expired");
+    // Partial-use token (1 of 4 uses) displays "Claimed" rather than "Exhausted"
+    expect(screen.getByTestId("invite-status-00000000000000000000000000000005")).toHaveTextContent("Claimed");
+  });
+
+  it("renders 'Claimed' for tokens with partial redemptions (e.g. 1 of 4 uses) instead of 'Exhausted'", async () => {
+    const partialRecord: InviteRecord = {
+      nonce: "11111111111111111111111111111111",
+      token_json: "{}",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: "did:key:z6Mkrecipient",
+      uses_count: 1,
+      max_uses: 4,
+      status: "used",
+    };
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_invites") return Promise.resolve([partialRecord]);
+      return defaultHandler(cmd);
+    });
+
+    render(<InviteManager />);
+    const statusPill = await screen.findByTestId("invite-status-11111111111111111111111111111111");
+    expect(statusPill).toHaveTextContent("Claimed");
+    expect(statusPill).not.toHaveTextContent("Exhausted");
   });
 
   it("routes every panel colour through a theme-aware CSS variable", async () => {

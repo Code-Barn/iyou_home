@@ -100,20 +100,33 @@ const NOTICE_STYLE: CSSProperties = {
   marginBottom: "0.85rem",
 };
 
-/** Status pill copy. `used` means the token was claimed by a recipient. */
-const STATUS_LABEL: Record<InviteRecord["status"], string> = {
-  live: "Live",
-  used: "Exhausted",
-  revoked: "Revoked",
-  expired: "Expired",
-};
-
-const STATUS_STYLE: Record<InviteRecord["status"], CSSProperties> = {
-  live: badgeTone("ok"),
-  used: badgeTone("info"),
-  revoked: badgeTone("danger"),
-  expired: badgeTone("warn"),
-};
+/**
+ * Resolves the visual status label and tone for an invite token based on
+ * its lifecycle state and redemption count:
+ * - If token.status === 'revoked': render "Revoked" (red/rose badge).
+ * - If token.uses_count >= token.max_uses: render "Exhausted" (slate/gray badge).
+ * - If token.uses_count > 0 && token.uses_count < token.max_uses: render "Claimed" (amber/sky badge).
+ * - Otherwise: render "Live" (emerald/green badge).
+ * - Expired tokens without redemptions render "Expired" (amber badge).
+ */
+export function resolveInviteStatus(token: Pick<InviteRecord, "status" | "uses_count" | "max_uses">): {
+  label: string;
+  style: CSSProperties;
+} {
+  if (token.status === "revoked") {
+    return { label: "Revoked", style: badgeTone("danger") };
+  }
+  if (token.status === "expired") {
+    return { label: "Expired", style: badgeTone("warn") };
+  }
+  if (token.uses_count >= token.max_uses) {
+    return { label: "Exhausted", style: badgeTone("neutral") };
+  }
+  if (token.uses_count > 0 && token.uses_count < token.max_uses) {
+    return { label: "Claimed", style: badgeTone("info") };
+  }
+  return { label: "Live", style: badgeTone("ok") };
+}
 
 const ROLE_LABEL: Record<InviteTier, string> = {
   admin: "Admin",
@@ -568,18 +581,23 @@ export default function InviteManager() {
                 </td>
                 <td style={{ padding: "0.5rem 0.6rem" }}>{ROLE_LABEL[inv.tier] ?? inv.tier}</td>
                 <td style={{ padding: "0.5rem 0.6rem" }}>
-                  <span
-                    data-testid={`invite-status-${inv.nonce}`}
-                    style={{
-                      ...STATUS_STYLE[inv.status],
-                      fontSize: "0.72rem",
-                      padding: "0.15rem 0.55rem",
-                      borderRadius: "999px",
-                      fontWeight: 600,
-                    }}
-                  >
-                    {STATUS_LABEL[inv.status] ?? inv.status}
-                  </span>
+                  {(() => {
+                    const st = resolveInviteStatus(inv);
+                    return (
+                      <span
+                        data-testid={`invite-status-${inv.nonce}`}
+                        style={{
+                          ...st.style,
+                          fontSize: "0.72rem",
+                          padding: "0.15rem 0.55rem",
+                          borderRadius: "999px",
+                          fontWeight: 600,
+                        }}
+                      >
+                        {st.label}
+                      </span>
+                    );
+                  })()}
                 </td>
                 <td style={{ padding: "0.5rem 0.6rem", fontFamily: "monospace", fontSize: "0.75rem" }}>
                   {inv.child_did ? shortNonce(inv.child_did) : "—"}

@@ -20,6 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ChatPeerTarget, PersonaProfile, UserPreferences, VaultStatus } from "./lib/types";
 import { inactivityMinutesToMs, loadUserPreferences } from "./lib/appLock";
+import { checkAndBootstrapSponsor } from "./lib/authBridge";
 import AppLockOverlay from "./components/auth/AppLockOverlay";
 import FirstRunSeedGate from "./components/auth/FirstRunSeedGate";
 import FirstRunGateway from "./components/onboarding/FirstRunGateway";
@@ -119,6 +120,7 @@ function App() {
       // Daemons are best-effort and must never block navigation.
     }
     await checkVaultStatus();
+    void checkAndBootstrapSponsor();
   }, [checkVaultStatus]);
 
   const unlockApp = useCallback(() => {
@@ -166,6 +168,7 @@ function App() {
         const active = await invoke<PersonaProfile>("get_active_profile");
         if (mounted && active) {
           setActiveProfile(active);
+          void checkAndBootstrapSponsor();
           return;
         }
       } catch {
@@ -180,6 +183,7 @@ function App() {
             null;
           if (active) {
             setActiveProfile(active);
+            void checkAndBootstrapSponsor();
           }
         } catch {
           // best-effort
