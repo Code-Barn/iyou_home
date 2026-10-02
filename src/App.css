@@ -888,3 +888,116 @@ textarea {
     box-shadow: 0 0 8px rgba(16, 185, 129, 0.5);
     text-transform: uppercase;
 }
+
+/* ============================================
+   Settings & Security Normalized Design Tokens
+   ============================================ */
+.btn-primary,
+.bg-violet-600 {
+    background-color: #7c3aed !important;
+    color: #ffffff !important;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background-color 0.15s ease-in-out, border-color 0.15s ease-in-out;
+}
+.btn-primary:hover,
+.bg-violet-600:hover,
+.hover\:bg-violet-700:hover {
+    background-color: #6d28d9 !important;
+}
+
+.btn-secondary,
+.bg-slate-100 {
+    background-color: #f1f5f9 !important;
+    color: #334155 !important;
+    border: 1px solid #cbd5e1 !important;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: background-color 0.15s ease-in-out, border-color 0.15s ease-in-out;
+}
+.btn-secondary:hover,
+.bg-slate-100:hover,
+.hover\:bg-slate-200:hover {
+    background-color: #e2e8f0 !important;
+}
+
+.btn-destructive,
+.bg-rose-50 {
+    background-color: #fff1f2 !important;
+    color: #e11d48 !important;
+    border: 1px solid #fecdd3 !important;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: background-color 0.15s ease-in-out, border-color 0.15s ease-in-out;
+}
+.btn-destructive:hover,
+.bg-rose-50:hover,
+.hover\:bg-rose-100:hover {
+    background-color: #ffe4e6 !important;
+}
+
+@media (prefers-color-scheme: dark) {
+    .btn-secondary,
+    .dark\:bg-slate-800 {
+        background-color: #1e293b !important;
+        color: #e2e8f0 !important;
+        border-color: #334155 !important;
+    }
+    .btn-secondary:hover,
+    .dark\:hover\:bg-slate-700:hover {
+        background-color: #334155 !important;
+    }
+
+    .btn-destructive,
+    .dark\:bg-rose-950\/30 {
+        background-color: rgba(76, 5, 25, 0.3) !important;
+        color: #fb7185 !important;
+        border-color: #881337 !important;
+    }
+    .btn-destructive:hover {
+        background-color: rgba(76, 5, 25, 0.5) !important;
+    }
+}
+
+.settings-pillar {
+    border: 1px solid var(--color-surface-border, #e5e7eb);
+    background: var(--color-surface, #f9fafb);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+}
+
+.settings-pillar-header {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--color-surface-border, #e5e7eb);
+}
+
+.settings-pillar-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--color-text-primary, #0f172a);
+    margin: 0;
+}
+
+.settings-pillar-badge {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.15rem 0.55rem;
+    border-radius: 9999px;
+    background: #ede9fe;
+    color: #6d28d9;
+    border: 1px solid #ddd6fe;
+}
+

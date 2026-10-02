@@ -15,7 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -88,6 +88,37 @@ export default function KeysManager({
   const [showRollbackConfirm, setShowRollbackConfirm] = useState(false);
   const [rollbackStatusMessage, setRollbackStatusMessage] = useState<string | null>(null);
 
+  // Hardened Master Seed Reveal
+  const [showSeedModal, setShowSeedModal] = useState(false);
+  const [seedPin, setSeedPin] = useState("");
+  const [seedPinError, setSeedPinError] = useState<string | null>(null);
+  const [seedConfirmText, setSeedConfirmText] = useState("");
+  const [revealedSeed, setRevealedSeed] = useState<string | null>(null);
+  const [seedCopied, setSeedCopied] = useState(false);
+  const [seedRemainingSeconds, setSeedRemainingSeconds] = useState(30);
+  const [seedAutoDismiss, setSeedAutoDismiss] = useState<ReturnType<typeof setTimeout> | null>(null);
+  const seedTimerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Backup Password Modal
+  const [showBackupPassword, setShowBackupPassword] = useState(false);
+  const [backupPassword, setBackupPassword] = useState("");
+  const [backupLoading, setBackupLoading] = useState(false);
+
+  // Restore flow
+  const [showRestorePassword, setShowRestorePassword] = useState(false);
+  const [restorePassword, setRestorePassword] = useState("");
+  const [restoreLoading, setRestoreLoading] = useState(false);
+  const [pendingRestoreBytes, setPendingRestoreBytes] = useState<number[] | null>(null);
+
+  // Advanced / Legacy import
+  const [importDid, setImportDid] = useState("");
+  const [importKey, setImportKey] = useState("");
+
+  // Global Session Revocation
+  const [showRevokeModal, setShowRevokeModal] = useState(false);
+  const [revokeLoading, setRevokeLoading] = useState(false);
+  const [revokeSuccessMsg, setRevokeSuccessMsg] = useState<string | null>(null);
+
   useEffect(() => {
     invoke<UpdatePreferences>("get_update_preferences")
       .then((p) => {
@@ -99,59 +130,6 @@ export default function KeysManager({
       .catch(() => {});
   }, []);
 
-  const handleUpdatePolicyChange = async (policy: UpdatePolicy) => {
-    const next: UpdatePreferences = { ...updatePrefs, policy };
-    setUpdatePrefs(next);
-    try {
-      await invoke("set_update_preferences", { prefs: next });
-    } catch (e) {
-      console.error("Failed to save update policy:", e);
-    }
-  };
-
-  const handleReleaseChannelChange = async (release_channel: string) => {
-    const next: UpdatePreferences = { ...updatePrefs, release_channel };
-    setUpdatePrefs(next);
-    try {
-      await invoke("set_update_preferences", { prefs: next });
-    } catch (e) {
-      console.error("Failed to save release channel:", e);
-    }
-  };
-
-  const handleCheckUpdates = async () => {
-    setUpdateChecking(true);
-    setUpdateStatusMessage(null);
-    try {
-      const meta = await invoke<UpdateMetadata | null>("check_for_update_vetting", { force: true });
-      if (meta) {
-        setVettedUpdate(meta);
-        setShowVettingModal(true);
-      } else {
-        setUpdateStatusMessage("✓ Your sovereign node is up to date.");
-        setTimeout(() => setUpdateStatusMessage(null), 4000);
-      }
-    } catch (err: any) {
-      setUpdateStatusMessage(`Check failed: ${err?.toString() || "Network unreachable"}`);
-    } finally {
-      setUpdateChecking(false);
-    }
-  };
-
-  const handleExecuteRollback = async () => {
-    setRollbackLoading(true);
-    setRollbackStatusMessage(null);
-    try {
-      await invoke("rollback_to_previous_binary");
-      setRollbackStatusMessage("✅ Binary rolled back successfully! Please restart iyou_home.");
-      setShowRollbackConfirm(false);
-    } catch (err: any) {
-      setRollbackStatusMessage(`Rollback failed: ${err?.toString()}`);
-    } finally {
-      setRollbackLoading(false);
-    }
-  };
-
   useEffect(() => {
     if (propPrefs !== undefined) {
       setAppPrefs(propPrefs);
@@ -159,34 +137,6 @@ export default function KeysManager({
       loadUserPreferences().then(setAppPrefs);
     }
   }, [propPrefs]);
-
-  // Seed reveal modal
-  const [showSeedModal, setShowSeedModal] = useState(false);
-  const [seedConfirmText, setSeedConfirmText] = useState("");
-  const [seedCountdown, setSeedCountdown] = useState(10);
-  const [revealedSeed, setRevealedSeed] = useState<string | null>(null);
-  const [seedAutoDismiss, setSeedAutoDismiss] = useState<number | null>(null);
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Backup password prompt
-  const [showBackupPassword, setShowBackupPassword] = useState(false);
-  const [backupPassword, setBackupPassword] = useState("");
-  const [backupLoading, setBackupLoading] = useState(false);
-
-  // Restore flow
-  const [showRestorePassword, setShowRestorePassword] = useState(false);
-  const [restorePassword, setRestorePassword] = useState("");
-  const [restoreLoading, setRestoreLoading] = useState(false);
-  const [pendingRestoreBytes, setPendingRestoreBytes] = useState<number[] | null>(null);
-
-  // Advanced import
-  const [importDid, setImportDid] = useState("");
-  const [importKey, setImportKey] = useState("");
-
-  // Global Session Revocation
-  const [showRevokeModal, setShowRevokeModal] = useState(false);
-  const [revokeLoading, setRevokeLoading] = useState(false);
-  const [revokeSuccessMsg, setRevokeSuccessMsg] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -215,10 +165,10 @@ export default function KeysManager({
     fetchData();
   }, [fetchData]);
 
-  // Cleanup countdown on unmount
+  // Clean up timers on unmount
   useEffect(() => {
     return () => {
-      if (countdownRef.current) clearInterval(countdownRef.current);
+      if (seedTimerIntervalRef.current) clearInterval(seedTimerIntervalRef.current);
       if (seedAutoDismiss) clearTimeout(seedAutoDismiss);
     };
   }, [seedAutoDismiss]);
@@ -260,51 +210,97 @@ export default function KeysManager({
     }
   };
 
-  // --- Seed Reveal ---
+  // --- Seed Reveal (Hardened) ---
   const openSeedModal = () => {
+    setSeedPin("");
+    setSeedPinError(null);
     setSeedConfirmText("");
-    setSeedCountdown(10);
     setRevealedSeed(null);
+    setSeedCopied(false);
+    setSeedRemainingSeconds(30);
     setShowSeedModal(true);
-
-    // Start 10-second countdown
-    if (countdownRef.current) clearInterval(countdownRef.current);
-    countdownRef.current = setInterval(() => {
-      setSeedCountdown((prev) => {
-        if (prev <= 1) {
-          if (countdownRef.current) clearInterval(countdownRef.current);
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-  };
-
-  const handleRevealSeed = async () => {
-    try {
-      const hex = await invoke<string>("reveal_master_seed");
-      setRevealedSeed(hex);
-
-      // Auto-dismiss after 30 seconds
-      const timer = setTimeout(() => {
-        setShowSeedModal(false);
-        setRevealedSeed(null);
-        setSeedAutoDismiss(null);
-      }, 30_000);
-      setSeedAutoDismiss(timer);
-    } catch (err: any) {
-      setError(err.toString());
-      setShowSeedModal(false);
-    }
   };
 
   const closeSeedModal = () => {
-    if (countdownRef.current) clearInterval(countdownRef.current);
+    if (seedTimerIntervalRef.current) clearInterval(seedTimerIntervalRef.current);
     if (seedAutoDismiss) clearTimeout(seedAutoDismiss);
     setSeedAutoDismiss(null);
     setShowSeedModal(false);
     setRevealedSeed(null);
+    setSeedPin("");
+    setSeedPinError(null);
     setSeedConfirmText("");
+    setSeedCopied(false);
+  };
+
+  const executeRevealSeed = async () => {
+    try {
+      const hex = await invoke<string>("reveal_master_seed");
+      setRevealedSeed(hex);
+      setSeedRemainingSeconds(30);
+
+      if (seedTimerIntervalRef.current) clearInterval(seedTimerIntervalRef.current);
+      seedTimerIntervalRef.current = setInterval(() => {
+        setSeedRemainingSeconds((prev) => {
+          if (prev <= 1) {
+            if (seedTimerIntervalRef.current) clearInterval(seedTimerIntervalRef.current);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+
+      if (seedAutoDismiss) clearTimeout(seedAutoDismiss);
+      const timer = setTimeout(() => {
+        closeSeedModal();
+      }, 30_000);
+      setSeedAutoDismiss(timer);
+    } catch (err: any) {
+      setError(err.toString());
+      closeSeedModal();
+    }
+  };
+
+  const handleVerifyPinAndReveal = async () => {
+    if (!seedPin || seedPin.length !== 6) return;
+    try {
+      const pinHash = await sha256Hex(seedPin);
+      if (pinHash !== appPrefs?.app_lock_pin_hash) {
+        setSeedPinError("Incorrect PIN.");
+        return;
+      }
+      setSeedPin("");
+      setSeedPinError(null);
+      await executeRevealSeed();
+    } catch (err: any) {
+      setSeedPinError(`Verification failed: ${err.toString()}`);
+    }
+  };
+
+  const handleVerifyBiometricsAndReveal = async () => {
+    try {
+      const ok = await invoke<boolean>("verify_biometric_auth", {
+        reason: "Verify biometrics to reveal master seed",
+      });
+      if (ok) {
+        await executeRevealSeed();
+      }
+    } catch {
+      setSeedPinError("Biometric verification failed.");
+    }
+  };
+
+  const handleCopyMasterSeed = async () => {
+    if (!revealedSeed) return;
+    try {
+      await writeText(revealedSeed);
+    } catch {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(revealedSeed);
+      }
+    }
+    setSeedCopied(true);
+    setTimeout(() => setSeedCopied(false), 2500);
   };
 
   // --- Backup Export ---
@@ -322,7 +318,6 @@ export default function KeysManager({
         password: backupPassword,
       });
 
-      // Trigger file save dialog
       const filePath = await save({
         defaultPath: "iyou_home_backup.iyoubackup",
         filters: [{ name: "iyou Backup", extensions: ["iyoubackup"] }],
@@ -355,7 +350,6 @@ export default function KeysManager({
 
       if (!selected) return;
 
-      // Read file contents via native binary IPC
       const bytes = await invoke<number[]>("read_binary_file", {
         path: selected,
       });
@@ -589,22 +583,85 @@ export default function KeysManager({
     }
   };
 
+  // --- Updater handlers ---
+  const handleUpdatePolicyChange = async (policy: UpdatePolicy) => {
+    const next: UpdatePreferences = { ...updatePrefs, policy };
+    setUpdatePrefs(next);
+    try {
+      await invoke("set_update_preferences", { prefs: next });
+    } catch (e) {
+      console.error("Failed to save update policy:", e);
+    }
+  };
+
+  const handleReleaseChannelChange = async (release_channel: string) => {
+    const next: UpdatePreferences = { ...updatePrefs, release_channel };
+    setUpdatePrefs(next);
+    try {
+      await invoke("set_update_preferences", { prefs: next });
+    } catch (e) {
+      console.error("Failed to save release channel:", e);
+    }
+  };
+
+  const handleCheckUpdates = async () => {
+    setUpdateChecking(true);
+    setUpdateStatusMessage(null);
+    try {
+      const meta = await invoke<UpdateMetadata | null>("check_for_update_vetting", { force: true });
+      if (meta) {
+        setVettedUpdate(meta);
+        setShowVettingModal(true);
+      } else {
+        setUpdateStatusMessage("✓ Your sovereign node is up to date.");
+        setTimeout(() => setUpdateStatusMessage(null), 4000);
+      }
+    } catch (err: any) {
+      setUpdateStatusMessage(`Check failed: ${err?.toString() || "Network unreachable"}`);
+    } finally {
+      setUpdateChecking(false);
+    }
+  };
+
+  const handleExecuteRollback = async () => {
+    setRollbackLoading(true);
+    setRollbackStatusMessage(null);
+    try {
+      await invoke("rollback_to_previous_binary");
+      setRollbackStatusMessage("✅ Binary rolled back successfully! Please restart iyou_home.");
+      setShowRollbackConfirm(false);
+    } catch (err: any) {
+      setRollbackStatusMessage(`Rollback failed: ${err?.toString()}`);
+    } finally {
+      setRollbackLoading(false);
+    }
+  };
+
+  const isPinProtected = Boolean(appPrefs?.app_lock_enabled && appPrefs?.app_lock_pin_hash);
   const seedConfirmValid = seedConfirmText === "REVEAL MY SEED";
 
   return (
-    <div className="component-container">
-      <h2>Identity Vault &amp; Disaster Recovery</h2>
-      <div
-        className="vault-badge"
-        title="Keys are managed securely by the local Rust process"
-      >
-        Vault Mode Active
+    <div className="component-container" data-testid="settings-security-console">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.25rem", flexWrap: "wrap", gap: "0.5rem" }}>
+        <div>
+          <h2 style={{ margin: 0 }}>Identity Vault &amp; Security Console</h2>
+          <p className="muted" style={{ margin: "0.25rem 0 0 0", fontSize: "0.85rem" }}>
+            Cryptographic identity roots, family delegation, device pairing, and backup redundancy.
+          </p>
+        </div>
+        <div
+          className="vault-badge"
+          title="Keys are managed securely by the local Rust process"
+        >
+          Vault Mode Active
+        </div>
       </div>
 
-      {error && <div className="error-message">{error}</div>}
+      {error && <div className="error-message" style={{ marginBottom: "1rem" }}>{error}</div>}
 
       {revokeSuccessMsg && (
         <div
+          data-testid="revoke-success-msg"
           style={{
             background: "#f0fdf4",
             border: "1px solid #bbf7d0",
@@ -620,552 +677,610 @@ export default function KeysManager({
         </div>
       )}
 
-      {/* Active Identity */}
-      <div className="section">
-        <h3>Active Identity</h3>
+      {/* Active Identity Root Header Card */}
+      <div className="section" data-testid="active-identity-card" style={{ marginBottom: "1.5rem" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.5rem" }}>
+          <h3 style={{ margin: 0 }}>Active Primary Persona</h3>
+          {activeProfile && (
+            <span
+              style={{
+                fontSize: "0.75rem",
+                fontWeight: 600,
+                padding: "2px 8px",
+                borderRadius: "4px",
+                background: "var(--color-bg-tertiary, #e2e8f0)",
+                color: "var(--color-text-secondary, #475569)",
+              }}
+            >
+              {levelLabel(activeProfile.level)} · Index #{activeProfile.derivation_index}
+            </span>
+          )}
+        </div>
+
         {activeDid ? (
-          <div>
+          <div style={{ marginTop: "0.75rem" }}>
             {activeProfile && (
               <div
                 style={{
-                  fontSize: "0.85rem",
-                  color: "var(--color-text-secondary)",
-                  marginBottom: "0.5rem",
-                  fontWeight: 500,
+                  fontSize: "0.92rem",
+                  color: "var(--color-text-primary, #0f172a)",
+                  marginBottom: "0.4rem",
+                  fontWeight: 600,
                 }}
               >
-                {activeProfile.profile_name} · {levelLabel(activeProfile.level)} (Index #{activeProfile.derivation_index})
+                {activeProfile.profile_name}
               </div>
             )}
-            <code className="did-display" style={{ marginBottom: "1rem" }}>
+            <code className="did-display" style={{ marginBottom: "0.85rem", display: "block" }}>
               {activeDid}
             </code>
             <div
               style={{
                 display: "flex",
-                gap: "0.75rem",
+                gap: "0.6rem",
                 flexWrap: "wrap",
-                marginTop: "0.75rem",
+                marginTop: "0.5rem",
               }}
             >
-              <button onClick={handleCopyDid}>
+              <button
+                type="button"
+                onClick={handleCopyDid}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.82rem", padding: "0.4rem 0.85rem" }}
+              >
                 {copied ? "\u2713 Copied" : "\uD83D\uDCCB Copy DID"}
               </button>
-              <button onClick={handleExportDocument}>
+              <button
+                type="button"
+                onClick={handleExportDocument}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.82rem", padding: "0.4rem 0.85rem" }}
+              >
                 Export Public DID Document
               </button>
             </div>
           </div>
         ) : (
-          <p className="muted">No active identity found.</p>
+          <p className="muted" style={{ marginTop: "0.5rem" }}>No active identity found.</p>
         )}
       </div>
 
-      {/* RFC-005 Family & Delegations (below Primary Identity) */}
-      <FamilyEnclave />
-
-      {/* Stewarded Dependent Accounts (Deterministic Leaf Derivations) */}
-      <DependentsManager />
-
-      {/* Sovereign Data Redundancy Callout */}
-      <div
-        style={{
-          background: "var(--color-bg-secondary, #f8fafc)",
-          border: "1px solid var(--color-border, #e2e8f0)",
-          borderRadius: "8px",
-          padding: "1rem 1.25rem",
-          marginBottom: "1.25rem",
-        }}
-      >
-        <div
-          style={{
-            fontWeight: 600,
-            fontSize: "0.95rem",
-            color: "var(--color-text, #0f172a)",
-            marginBottom: "0.35rem",
-            display: "flex",
-            alignItems: "center",
-            gap: "0.5rem",
-          }}
-        >
-          {"\uD83D\uDEE1\uFE0F"} Sovereign Data Redundancy
+      {/* ============================================================ */}
+      {/* PILLAR 1: FAMILY & COMPANION DEVICES                         */}
+      {/* ============================================================ */}
+      <div className="settings-pillar pillar-family" data-testid="pillar-family-devices">
+        <div className="settings-pillar-header">
+          <span style={{ fontSize: "1.25rem" }}>{"\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67\u200D\uD83D\uDC66"}</span>
+          <h3 className="settings-pillar-title">Pillar 1: Family &amp; Companion Devices</h3>
+          <span className="settings-pillar-badge">Pillar 1</span>
         </div>
-        <p
-          style={{
-            fontSize: "0.83rem",
-            color: "var(--color-text-secondary, #64748b)",
-            margin: "0 0 0.5rem 0",
-            lineHeight: "1.5",
-          }}
-        >
-          Your identity and content are protected through three independent, zero-cost redundancy paths:
+        <p className="muted" style={{ fontSize: "0.83rem", margin: "0 0 1.25rem 0" }}>
+          Supervised child profiles, device provisioning, and companion mobile pairing derived from your family sovereign root.
         </p>
-        <ul
-          style={{
-            margin: 0,
-            paddingLeft: "1.25rem",
-            fontSize: "0.82rem",
-            color: "var(--color-text-secondary, #475569)",
-            lineHeight: "1.6",
-          }}
-        >
-          <li>
-            <strong>Local Archive Export:</strong> Create password-encrypted <code>.iyoubackup</code> snapshots stored safely on your local disk or flash drive.
-          </li>
-          <li>
-            <strong>Self-Hosted Home NAS / Blossom Node:</strong> Mirror media blobs and credentials automatically to your personal Blossom store (<code>:9002</code>).
-          </li>
-          <li>
-            <strong>Public Nostr Relays:</strong> Publish tamper-evident signed notes and timeline articles to decentralized Nostr relays (<code>:9003</code>).
-          </li>
-        </ul>
-      </div>
 
-      {/* Mobile Device Pairing */}
-      <DevicePairing />
-
-      {/* Encrypted Backup & Recovery */}
-      <div className="section">
-        <h3>Encrypted Backup &amp; Recovery</h3>
-        <p className="muted" style={{ marginBottom: "0.75rem" }}>
-          Export an encrypted <code>.iyoubackup</code> archive of your vault,
-          contacts, and preferences. Protected with a password of your choice.
-        </p>
-        <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
-          <button onClick={handleExportBackup}>
-            Export Encrypted Backup (.iyoubackup)
-          </button>
-          <button onClick={handleRestoreBackup}>
-            Restore from .iyoubackup
-          </button>
+        {/* Companion Mobile Pairing */}
+        <div style={{ marginBottom: "1.25rem" }}>
+          <DevicePairing />
         </div>
+
+        {/* Family Dependents */}
+        <div>
+          <DependentsManager />
+        </div>
+
+        {/* Collapsible RFC-005 Edge Child Pods */}
+        <details style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid var(--color-surface-border, #e5e7eb)" }}>
+          <summary style={{ cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, color: "var(--color-text-secondary, #64748b)", userSelect: "none" }}>
+            {"\uD83D\uDD17"} Edge Child Pods &amp; Shamir Escrow (RFC-005)
+          </summary>
+          <div style={{ marginTop: "0.75rem" }}>
+            <FamilyEnclave />
+          </div>
+        </details>
       </div>
 
-      {/* Session Kill-Switch Card */}
-      <div
-        className="section"
-        style={{
-          border: "1px solid #fed7aa",
-          background: "#fffbeb",
-          borderRadius: "8px",
-        }}
-      >
-        <h3 style={{ color: "#9a3412" }}>{"\uD83D\uDED1"} Active Web Sessions</h3>
-        <p
-          className="muted"
-          style={{ color: "#7c2d12", marginBottom: "0.75rem" }}
-        >
-          Kill all active logins across satellite web apps (iyou_wun, iyou_poly, etc.) instantly. Use this if you logged in on a public or shared computer.
-        </p>
-        <button
-          onClick={() => {
-            setError(null);
-            setRevokeSuccessMsg(null);
-            setShowRevokeModal(true);
-          }}
-          style={{
-            background: "transparent",
-            border: "1px solid #ea580c",
-            color: "#c2410c",
-            fontWeight: 600,
-          }}
-        >
-          {"\uD83D\uDED1"} Revoke All Web Sessions
-        </button>
-      </div>
-
-      {/* App Lock & Inactivity Guard */}
-      <div className="section">
-        <h3>{"\uD83D\uDD12"} App Lock &amp; Inactivity Guard</h3>
-        <p className="muted" style={{ marginBottom: "0.75rem" }}>
-          Require authentication to access iyou_home and automatically lock when inactive.
+      {/* ============================================================ */}
+      {/* PILLAR 2: ENCLAVE SECURITY & ACCESS                          */}
+      {/* ============================================================ */}
+      <div className="settings-pillar pillar-security" data-testid="pillar-enclave-security">
+        <div className="settings-pillar-header">
+          <span style={{ fontSize: "1.25rem" }}>{"\uD83D\uDD10"}</span>
+          <h3 className="settings-pillar-title">Pillar 2: Enclave Security &amp; Access</h3>
+          <span className="settings-pillar-badge">Pillar 2</span>
+        </div>
+        <p className="muted" style={{ fontSize: "0.83rem", margin: "0 0 1.25rem 0" }}>
+          Hardened authentication guards, biometrics, master seed isolation, and global session revocation.
         </p>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
-          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontWeight: 600 }}>
-            <input
-              type="checkbox"
-              checked={appPrefs?.app_lock_enabled ?? false}
-              onChange={handleToggleAppLock}
-            />
-            Enable App Lock
-          </label>
+        {/* App Lock & Inactivity Guard */}
+        <div className="section" style={{ background: "var(--color-bg-secondary, #ffffff)", border: "1px solid var(--color-border, #e2e8f0)", borderRadius: "8px", padding: "1.15rem", marginBottom: "1rem" }}>
+          <h3 style={{ margin: "0 0 0.4rem 0" }}>{"\uD83D\uDD12"} App Lock &amp; Inactivity Guard</h3>
+          <p className="muted" style={{ fontSize: "0.82rem", margin: "0 0 0.85rem 0" }}>
+            Require authentication to access iyou_home and automatically lock when inactive.
+          </p>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
+            <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontWeight: 600, fontSize: "0.88rem" }}>
+              <input
+                type="checkbox"
+                checked={appPrefs?.app_lock_enabled ?? false}
+                onChange={handleToggleAppLock}
+              />
+              Enable App Lock
+            </label>
+
+            {appPrefs?.app_lock_enabled && (
+              <button
+                type="button"
+                onClick={() => {
+                  setLockErrorMessage(null);
+                  setShowPinModal(true);
+                }}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.82rem", padding: "0.35rem 0.75rem" }}
+              >
+                {appPrefs?.app_lock_pin_hash ? "Change PIN" : "Set 6-Digit PIN"}
+              </button>
+            )}
+          </div>
 
           {appPrefs?.app_lock_enabled && (
-            <button
-              onClick={() => {
-                setLockErrorMessage(null);
-                setShowPinModal(true);
-              }}
-              style={{
-                fontSize: "0.85rem",
-                padding: "0.35rem 0.75rem",
-                background: "transparent",
-                border: "1px solid #d1d5db",
-              }}
-            >
-              {appPrefs?.app_lock_pin_hash ? "Change PIN" : "Set 6-Digit PIN"}
-            </button>
+            <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                <label style={{ fontSize: "0.85rem", fontWeight: 500 }}>Auto-lock timeout:</label>
+                <select
+                  value={appPrefs.inactivity_timeout_minutes}
+                  onChange={(e) => handleChangeTimeout(Number(e.target.value))}
+                  style={{
+                    padding: "0.35rem 0.6rem",
+                    borderRadius: "6px",
+                    border: "1px solid #d1d5db",
+                    background: "#fff",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  {INACTIVITY_TIMEOUT_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                <label style={{ fontSize: "0.85rem", fontWeight: 500 }}>Signing session grace period:</label>
+                <select
+                  aria-label="Signing session grace period"
+                  value={appPrefs.signing_grace_period_minutes ?? 0}
+                  onChange={(e) => handleChangeGracePeriod(Number(e.target.value))}
+                  style={{
+                    padding: "0.35rem 0.6rem",
+                    borderRadius: "6px",
+                    border: "1px solid #d1d5db",
+                    background: "#fff",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  {SIGNING_GRACE_PERIOD_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.25rem", flexWrap: "wrap" }}>
+                {appPrefs.app_lock_prf_hash ? (
+                  <>
+                    <span style={{ fontSize: "0.82rem", color: "#16a34a", fontWeight: 600 }}>
+                      {"\u2713"} Biometrics / Passkey enrolled
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleRemoveBiometrics}
+                      className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+                      style={{ fontSize: "0.8rem", padding: "0.25rem 0.55rem" }}
+                    >
+                      Remove Biometrics
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleEnrollBiometrics}
+                    disabled={biometricEnrolling}
+                    className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                    style={{ fontSize: "0.82rem", padding: "0.35rem 0.75rem" }}
+                  >
+                    {biometricEnrolling ? "Enrolling…" : "\uD83D\uDC64 Enroll Biometrics / Passkey"}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {lockStatusMessage && (
+            <p style={{ fontSize: "0.82rem", color: "#16a34a", marginTop: "0.5rem", marginBottom: 0 }}>
+              {lockStatusMessage}
+            </p>
+          )}
+          {lockErrorMessage && (
+            <p style={{ fontSize: "0.82rem", color: "#dc2626", marginTop: "0.5rem", marginBottom: 0 }}>
+              {lockErrorMessage}
+            </p>
           )}
         </div>
 
-        {appPrefs?.app_lock_enabled && (
-          <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-              <label style={{ fontSize: "0.88rem", fontWeight: 500 }}>Auto-lock timeout:</label>
-              <select
-                value={appPrefs.inactivity_timeout_minutes}
-                onChange={(e) => handleChangeTimeout(Number(e.target.value))}
-                style={{
-                  padding: "0.35rem 0.6rem",
-                  borderRadius: "6px",
-                  border: "1px solid #d1d5db",
-                  background: "#fff",
-                  fontSize: "0.88rem",
-                }}
-              >
-                {INACTIVITY_TIMEOUT_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
+        {/* Master Seed Reveal (Hardened) */}
+        <div className="section" style={{ background: "var(--color-bg-secondary, #ffffff)", border: "1px solid var(--color-border, #e2e8f0)", borderRadius: "8px", padding: "1.15rem", marginBottom: "1rem" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.75rem" }}>
+            <div>
+              <h3 style={{ margin: "0 0 0.35rem 0" }}>{"\uD83D\uDD11"} Master Root Seed</h3>
+              <p className="muted" style={{ margin: 0, fontSize: "0.82rem" }}>
+                Your 64-character hex master seed is the cryptographic root of all personas. Protected behind PIN challenge.
+              </p>
             </div>
-
-            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-              <label style={{ fontSize: "0.88rem", fontWeight: 500 }}>Signing session grace period:</label>
-              <select
-                aria-label="Signing session grace period"
-                value={appPrefs.signing_grace_period_minutes ?? 0}
-                onChange={(e) => handleChangeGracePeriod(Number(e.target.value))}
-                style={{
-                  padding: "0.35rem 0.6rem",
-                  borderRadius: "6px",
-                  border: "1px solid #d1d5db",
-                  background: "#fff",
-                  fontSize: "0.88rem",
-                }}
-              >
-                {SIGNING_GRACE_PERIOD_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.25rem" }}>
-              {appPrefs.app_lock_prf_hash ? (
-                <>
-                  <span style={{ fontSize: "0.85rem", color: "#16a34a" }}>
-                    {"\u2713"} Biometrics / Passkey enrolled
-                  </span>
-                  <button
-                    onClick={handleRemoveBiometrics}
-                    style={{
-                      fontSize: "0.8rem",
-                      padding: "0.25rem 0.5rem",
-                      background: "transparent",
-                      border: "1px solid #ef4444",
-                      color: "#dc2626",
-                    }}
-                  >
-                    Remove Biometrics
-                  </button>
-                </>
-              ) : (
-                <button
-                  onClick={handleEnrollBiometrics}
-                  disabled={biometricEnrolling}
-                  style={{
-                    fontSize: "0.85rem",
-                    padding: "0.35rem 0.75rem",
-                    background: "transparent",
-                    border: "1px solid #d1d5db",
-                  }}
-                >
-                  {biometricEnrolling ? "Enrolling…" : "\uD83D\uDC64 Enroll Biometrics / Passkey"}
-                </button>
-              )}
-            </div>
+            <button
+              type="button"
+              data-testid="reveal-master-seed-btn"
+              onClick={openSeedModal}
+              className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+              style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
+            >
+              {"\uD83D\uDD11"} Reveal Master Seed
+            </button>
           </div>
-        )}
+        </div>
 
-        {lockStatusMessage && (
-          <p style={{ fontSize: "0.85rem", color: "#16a34a", marginTop: "0.5rem" }}>
-            {lockStatusMessage}
-          </p>
-        )}
-        {lockErrorMessage && (
-          <p style={{ fontSize: "0.85rem", color: "#dc2626", marginTop: "0.5rem" }}>
-            {lockErrorMessage}
-          </p>
-        )}
+        {/* Active Web Sessions Kill-Switch Card */}
+        <div
+          className="section"
+          style={{
+            border: "1px solid #fed7aa",
+            background: "#fffbeb",
+            borderRadius: "8px",
+            padding: "1.15rem",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.75rem" }}>
+            <div>
+              <h3 style={{ color: "#9a3412", margin: "0 0 0.35rem 0" }}>{"\uD83D\uDED1"} Active Web Sessions</h3>
+              <p style={{ color: "#7c2d12", margin: 0, fontSize: "0.82rem", lineHeight: "1.4" }}>
+                Kill all active logins across satellite web apps (iyou_wun, iyou_poly) immediately.
+              </p>
+            </div>
+            <button
+              type="button"
+              data-testid="kill-switch-btn"
+              onClick={() => {
+                setError(null);
+                setRevokeSuccessMsg(null);
+                setShowRevokeModal(true);
+              }}
+              className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+              style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
+            >
+              {"\uD83D\uDED1"} Revoke All Web Sessions
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* Software Updates & Verification */}
-      <div className="section" style={{ marginTop: "1rem" }}>
-        <h3>Software Updates & Verification</h3>
-        <p className="muted" style={{ marginBottom: "0.85rem" }}>
-          Control remote update polling and cryptographically inspect release binaries before execution.
+      {/* ============================================================ */}
+      {/* PILLAR 3: REDUNDANCY, STORAGE & UPDATES                      */}
+      {/* ============================================================ */}
+      <div className="settings-pillar pillar-redundancy" data-testid="pillar-redundancy-updates">
+        <div className="settings-pillar-header">
+          <span style={{ fontSize: "1.25rem" }}>{"\uD83D\uDEE1\uFE0F"}</span>
+          <h3 className="settings-pillar-title">Pillar 3: Redundancy, Storage &amp; Updates</h3>
+          <span className="settings-pillar-badge">Pillar 3</span>
+        </div>
+        <p className="muted" style={{ fontSize: "0.83rem", margin: "0 0 1.25rem 0" }}>
+          Sovereign offline backup archives, cryptographic software update verification, and fail-safe recovery.
         </p>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", marginBottom: "1rem" }}>
-          <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="update_policy"
-              value="locked"
-              checked={updatePrefs.policy === "locked"}
-              onChange={() => handleUpdatePolicyChange("locked")}
-              style={{ marginTop: "0.2rem" }}
-            />
+        {/* Unified Sovereign Backup Card */}
+        <div className="section" style={{ background: "var(--color-bg-secondary, #ffffff)", border: "1px solid var(--color-border, #e2e8f0)", borderRadius: "8px", padding: "1.25rem", marginBottom: "1rem" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.75rem", marginBottom: "0.85rem" }}>
             <div>
-              <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
-                🔒 Air-Gapped / Locked
-              </div>
-              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
-                Zero network polling. Disables all remote version checks and auto-update triggers.
-              </div>
+              <h3 style={{ margin: "0 0 0.35rem 0" }}>{"\uD83D\uDEE1\uFE0F"} Sovereign Data Redundancy &amp; Backup</h3>
+              <p className="muted" style={{ margin: 0, fontSize: "0.82rem" }}>
+                Export or restore encrypted <code>.iyoubackup</code> archives of your vault, contacts, and preferences.
+              </p>
             </div>
-          </label>
-
-          <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="update_policy"
-              value="manual"
-              checked={updatePrefs.policy === "manual"}
-              onChange={() => handleUpdatePolicyChange("manual")}
-              style={{ marginTop: "0.2rem" }}
-            />
-            <div>
-              <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
-                👁️ Manual Review (Recommended)
-              </div>
-              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
-                Poll on demand or surface subtle notifications; require manual cryptographic signature inspection before applying.
-              </div>
+            <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                data-testid="export-backup-btn"
+                onClick={handleExportBackup}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
+              >
+                {"\uD83D\uDCE6"} Export Encrypted Backup (.iyoubackup)
+              </button>
+              <button
+                type="button"
+                data-testid="restore-backup-btn"
+                onClick={handleRestoreBackup}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
+              >
+                {"\uD83D\uDCE5"} Restore from .iyoubackup
+              </button>
             </div>
-          </label>
-
-          <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="update_policy"
-              value="auto"
-              checked={updatePrefs.policy === "auto"}
-              onChange={() => handleUpdatePolicyChange("auto")}
-              style={{ marginTop: "0.2rem" }}
-            />
-            <div>
-              <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
-                ⚡ Automatic
-              </div>
-              <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
-                Download verified updates in background and prompt to restart.
-              </div>
-            </div>
-          </label>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.75rem" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-            <span style={{ fontSize: "0.82rem", color: "#475569", fontWeight: 600 }}>Release Channel:</span>
-            <select
-              value={updatePrefs.release_channel}
-              onChange={(e) => handleReleaseChannelChange(e.target.value)}
-              style={{
-                fontSize: "0.82rem",
-                padding: "0.25rem 0.6rem",
-                borderRadius: "6px",
-                border: "1px solid #cbd5e1",
-                background: "#ffffff",
-              }}
-            >
-              <option value="stable">Stable (Verified)</option>
-              <option value="beta">Beta (Preview)</option>
-            </select>
           </div>
 
-          <button
-            type="button"
-            onClick={handleCheckUpdates}
-            disabled={updateChecking}
+          {/* Collapsible 3-Guarantees Checklist */}
+          <details
+            data-testid="redundancy-guarantees-details"
             style={{
-              fontSize: "0.82rem",
-              padding: "0.4rem 0.9rem",
-              background: "#2563eb",
-              color: "#ffffff",
-              border: "none",
+              marginTop: "0.75rem",
+              background: "var(--color-bg-tertiary, #f8fafc)",
+              border: "1px solid var(--color-border, #e2e8f0)",
               borderRadius: "6px",
-              fontWeight: 600,
-              cursor: updateChecking ? "not-allowed" : "pointer",
+              padding: "0.6rem 0.85rem",
             }}
           >
-            {updateChecking ? "Checking Manifest…" : "🔄 Check for Updates Now"}
-          </button>
+            <summary style={{ cursor: "pointer", fontSize: "0.82rem", fontWeight: 600, color: "var(--color-text-secondary, #475569)", userSelect: "none" }}>
+              {"\uD83D\uDEE1\uFE0F"} View 3-Path Sovereign Redundancy Guarantees
+            </summary>
+            <ul
+              style={{
+                margin: "0.6rem 0 0.2rem 0",
+                paddingLeft: "1.25rem",
+                fontSize: "0.8rem",
+                color: "var(--color-text-secondary, #475569)",
+                lineHeight: "1.6",
+              }}
+            >
+              <li>
+                <strong>Self-Contained SQLite &amp; Local Encrypted Archive:</strong> Create password-encrypted <code>.iyoubackup</code> snapshots stored safely on local disk or USB drive.
+              </li>
+              <li>
+                <strong>XChaCha20-Poly1305 / AES-256 Passphrase Encryption:</strong> Sovereign end-to-end encryption securing your credentials, contacts, and personal preferences against unauthorized access.
+              </li>
+              <li>
+                <strong>Lossless Multi-Device Portability:</strong> Mirror media blobs to your personal Blossom store (<code>:9002</code>) and sync tamper-evident state across decentralized Nostr relays (<code>:9003</code>).
+              </li>
+            </ul>
+          </details>
         </div>
 
-        {updateStatusMessage && (
+        {/* Software Updates & Verification */}
+        <div className="section" style={{ background: "var(--color-bg-secondary, #ffffff)", border: "1px solid var(--color-border, #e2e8f0)", borderRadius: "8px", padding: "1.25rem", marginBottom: "1rem" }}>
+          <h3 style={{ margin: "0 0 0.35rem 0" }}>Software Updates &amp; Verification</h3>
+          <p className="muted" style={{ marginBottom: "0.85rem", fontSize: "0.82rem" }}>
+            Control remote update polling and cryptographically inspect release binaries before execution.
+          </p>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", marginBottom: "1rem" }}>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="update_policy"
+                value="locked"
+                checked={updatePrefs.policy === "locked"}
+                onChange={() => handleUpdatePolicyChange("locked")}
+                style={{ marginTop: "0.2rem" }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
+                  🔒 Air-Gapped / Locked
+                </div>
+                <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
+                  Zero network polling. Disables all remote version checks and auto-update triggers.
+                </div>
+              </div>
+            </label>
+
+            <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="update_policy"
+                value="manual"
+                checked={updatePrefs.policy === "manual"}
+                onChange={() => handleUpdatePolicyChange("manual")}
+                style={{ marginTop: "0.2rem" }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
+                  👁️ Manual Review (Recommended)
+                </div>
+                <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
+                  Poll on demand or surface subtle notifications; require manual cryptographic signature inspection before applying.
+                </div>
+              </div>
+            </label>
+
+            <label style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem", cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="update_policy"
+                value="auto"
+                checked={updatePrefs.policy === "auto"}
+                onChange={() => handleUpdatePolicyChange("auto")}
+                style={{ marginTop: "0.2rem" }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, fontSize: "0.88rem", color: "#1e293b" }}>
+                  ⚡ Automatic
+                </div>
+                <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
+                  Download verified updates in background and prompt to restart.
+                </div>
+              </div>
+            </label>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.75rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <span style={{ fontSize: "0.82rem", color: "#475569", fontWeight: 600 }}>Release Channel:</span>
+              <select
+                value={updatePrefs.release_channel}
+                onChange={(e) => handleReleaseChannelChange(e.target.value)}
+                style={{
+                  fontSize: "0.82rem",
+                  padding: "0.25rem 0.6rem",
+                  borderRadius: "6px",
+                  border: "1px solid #cbd5e1",
+                  background: "#ffffff",
+                }}
+              >
+                <option value="stable">Stable (Verified)</option>
+                <option value="beta">Beta (Preview)</option>
+              </select>
+            </div>
+
+            <button
+              type="button"
+              data-testid="check-updates-btn"
+              onClick={handleCheckUpdates}
+              disabled={updateChecking}
+              className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
+              style={{
+                fontSize: "0.82rem",
+                padding: "0.45rem 1rem",
+                cursor: updateChecking ? "not-allowed" : "pointer",
+              }}
+            >
+              {updateChecking ? "Checking Manifest…" : "🔄 Check for Updates Now"}
+            </button>
+          </div>
+
+          {updateStatusMessage && (
+            <div
+              style={{
+                marginTop: "0.75rem",
+                fontSize: "0.82rem",
+                fontWeight: 600,
+                color: updateStatusMessage.startsWith("✓") ? "#16a34a" : "#dc2626",
+              }}
+            >
+              {updateStatusMessage}
+            </div>
+          )}
+        </div>
+
+        {/* Danger Zone: Wipe & Reset + Binary Rollback */}
+        <details
+          data-testid="danger-zone-details"
+          style={{
+            marginTop: "1.25rem",
+            border: "1px solid rgba(220, 38, 38, 0.35)",
+            borderRadius: "8px",
+            padding: "1rem",
+            background: "rgba(220, 38, 38, 0.04)",
+          }}
+        >
+          <summary
+            style={{
+              cursor: "pointer",
+              fontWeight: 600,
+              fontSize: "0.85rem",
+              color: "#dc2626",
+              userSelect: "none",
+            }}
+          >
+            ⚠️ Danger Zone: Factory Reset &amp; Binary Rollback
+          </summary>
           <div
             style={{
               marginTop: "0.75rem",
               fontSize: "0.82rem",
-              fontWeight: 600,
-              color: updateStatusMessage.startsWith("✓") ? "#16a34a" : "#dc2626",
+              color: "var(--color-text-secondary, #64748b)",
             }}
           >
-            {updateStatusMessage}
-          </div>
-        )}
-      </div>
-
-      {/* Master Seed Reveal */}
-      <div className="section">
-        <h3>Master Seed</h3>
-        <p className="muted" style={{ marginBottom: "0.75rem" }}>
-          Your 64-character hex master seed is the root of all derived
-          identities. Keep it offline and never share it.
-        </p>
-        <button
-          onClick={openSeedModal}
-          style={{
-            background: "transparent",
-            border: "1px solid #d97706",
-            color: "#92400e",
-          }}
-        >
-          Reveal Master Seed
-        </button>
-      </div>
-
-      {/* Advanced / Legacy Import */}
-      <details style={{ marginTop: "1rem" }}>
-        <summary
-          style={{
-            cursor: "pointer",
-            fontWeight: 600,
-            fontSize: "0.9rem",
-            color: "var(--color-text-muted)",
-            padding: "0.5rem 0",
-          }}
-        >
-          Advanced / Legacy Import
-        </summary>
-        <div className="section" style={{ marginTop: "0.5rem" }}>
-          <h3>Import Seed / Identity Recovery</h3>
-          <form onSubmit={handleImport}>
-            <div className="form-group">
-              <label>DID</label>
-              <input
-                type="text"
-                value={importDid}
-                onChange={(e) => setImportDid(e.target.value)}
-                placeholder="did:key:..."
-                required
-              />
-            </div>
-            <div className="form-group">
-              <label>Private Key (Base58)</label>
-              <input
-                type="password"
-                value={importKey}
-                onChange={(e) => setImportKey(e.target.value)}
-                placeholder="Base58 encoded seed"
-                required
-              />
-            </div>
-            <button type="submit">Import Key</button>
-          </form>
-        </div>
-      </details>
-
-      {/* Danger Zone: Wipe & Reset + Binary Rollback */}
-      <details
-        className="mt-8 border border-red-900/40 rounded-lg p-4 bg-red-950/10"
-        style={{
-          marginTop: "1.5rem",
-          border: "1px solid rgba(220, 38, 38, 0.3)",
-          borderRadius: "8px",
-          padding: "1rem",
-          background: "rgba(220, 38, 38, 0.05)",
-        }}
-      >
-        <summary
-          className="text-xs font-semibold text-red-400 cursor-pointer select-none"
-          style={{
-            cursor: "pointer",
-            fontWeight: 600,
-            fontSize: "0.85rem",
-            color: "#dc2626",
-          }}
-        >
-          ⚠️ Danger Zone: Wipe &amp; Reset &amp; Binary Rollback
-        </summary>
-        <div
-          className="mt-3 text-xs text-slate-400 space-y-2"
-          style={{
-            marginTop: "0.75rem",
-            fontSize: "0.82rem",
-            color: "var(--color-text-secondary, #64748b)",
-          }}
-        >
-          <p style={{ margin: "0 0 0.75rem 0", lineHeight: "1.5" }}>
-            Wiping your vault permanently destroys all local persona keys, contacts, and credentials unless you have an offline seed phrase or .iyoubackup archive.
-          </p>
-          <button
-            onClick={handleWipeAndReset}
-            disabled={isGenerating}
-            className="px-3 py-1.5 bg-red-900/30 hover:bg-red-800/50 border border-red-700/60 rounded text-red-300 font-mono text-xs transition"
-            style={{
-              background: "#fee2e2",
-              border: "1px solid #f87171",
-              color: "#991b1b",
-              fontWeight: 600,
-              fontSize: "0.8rem",
-            }}
-          >
-            {isGenerating ? "Wiping & Regenerating..." : "Wipe & Regenerate Vault"}
-          </button>
-
-          {/* Binary Rollback Section */}
-          <div style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid rgba(220, 38, 38, 0.2)" }}>
-            <div style={{ fontWeight: 600, fontSize: "0.85rem", color: "#991b1b", marginBottom: "0.3rem" }}>
-              One-Click Binary Rollback
-            </div>
-            <p style={{ margin: "0 0 0.6rem 0", lineHeight: "1.4", fontSize: "0.8rem" }}>
-              {hasRollback
-                ? "A staged snapshot of your prior binary exists (bin/iyou-home.previous). If a newly installed version exhibits faults, you can immediately revert to the previous executable."
-                : "No previous binary snapshot found on disk. Rollback snapshots are automatically staged during updates."}
+            <p style={{ margin: "0 0 0.75rem 0", lineHeight: "1.5" }}>
+              Wiping your vault permanently destroys all local persona keys, contacts, and credentials unless you have an offline seed phrase or .iyoubackup archive.
             </p>
             <button
               type="button"
-              onClick={() => setShowRollbackConfirm(true)}
-              disabled={!hasRollback || rollbackLoading}
+              data-testid="regenerate-vault-btn"
+              onClick={handleWipeAndReset}
+              disabled={isGenerating}
+              className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
               style={{
-                background: hasRollback ? "#fee2e2" : "#f1f5f9",
-                border: hasRollback ? "1px solid #f87171" : "1px solid #cbd5e1",
-                color: hasRollback ? "#991b1b" : "#94a3b8",
-                fontWeight: 600,
                 fontSize: "0.8rem",
-                cursor: hasRollback ? "pointer" : "not-allowed",
+                padding: "0.4rem 0.85rem",
               }}
             >
-              {rollbackLoading ? "Restoring Previous Binary…" : "⏪ Rollback to Previous Version"}
+              {isGenerating ? "Wiping & Regenerating..." : "Wipe & Regenerate Vault"}
             </button>
-            {rollbackStatusMessage && (
-              <p style={{ marginTop: "0.5rem", fontSize: "0.82rem", color: "#16a34a", fontWeight: 600 }}>
-                {rollbackStatusMessage}
-              </p>
-            )}
-          </div>
-        </div>
-      </details>
 
-      {/* ========== Seed Reveal Modal ========== */}
+            {/* Binary Rollback Section */}
+            <div style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid rgba(220, 38, 38, 0.2)" }}>
+              <div style={{ fontWeight: 600, fontSize: "0.85rem", color: "#991b1b", marginBottom: "0.3rem" }}>
+                One-Click Binary Rollback
+              </div>
+              <p style={{ margin: "0 0 0.6rem 0", lineHeight: "1.4", fontSize: "0.8rem" }}>
+                {hasRollback
+                  ? "A staged snapshot of your prior binary exists (bin/iyou-home.previous). If a newly installed version exhibits faults, you can immediately revert to the previous executable."
+                  : "No previous binary snapshot found on disk. Rollback snapshots are automatically staged during updates."}
+              </p>
+              <button
+                type="button"
+                data-testid="rollback-btn"
+                onClick={() => setShowRollbackConfirm(true)}
+                disabled={!hasRollback || rollbackLoading}
+                className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+                style={{
+                  fontSize: "0.8rem",
+                  padding: "0.4rem 0.85rem",
+                  cursor: hasRollback ? "pointer" : "not-allowed",
+                  opacity: hasRollback ? 1 : 0.6,
+                }}
+              >
+                {rollbackLoading ? "Restoring Previous Binary…" : "⏪ Rollback to Previous Version"}
+              </button>
+              {rollbackStatusMessage && (
+                <p style={{ marginTop: "0.5rem", fontSize: "0.82rem", color: "#16a34a", fontWeight: 600 }}>
+                  {rollbackStatusMessage}
+                </p>
+              )}
+            </div>
+
+            {/* Advanced / Legacy Import */}
+            <div style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid rgba(220, 38, 38, 0.2)" }}>
+              <details>
+                <summary style={{ cursor: "pointer", fontWeight: 600, fontSize: "0.82rem", color: "var(--color-text-secondary, #64748b)" }}>
+                  Advanced / Legacy Key Import
+                </summary>
+                <form onSubmit={handleImport} style={{ marginTop: "0.75rem" }}>
+                  <div className="form-group" style={{ marginBottom: "0.6rem" }}>
+                    <label style={{ fontSize: "0.78rem" }}>DID</label>
+                    <input
+                      type="text"
+                      value={importDid}
+                      onChange={(e) => setImportDid(e.target.value)}
+                      placeholder="did:key:..."
+                      required
+                      style={{ fontSize: "0.8rem" }}
+                    />
+                  </div>
+                  <div className="form-group" style={{ marginBottom: "0.6rem" }}>
+                    <label style={{ fontSize: "0.78rem" }}>Private Key (Base58)</label>
+                    <input
+                      type="password"
+                      value={importKey}
+                      onChange={(e) => setImportKey(e.target.value)}
+                      placeholder="Base58 encoded seed"
+                      required
+                      style={{ fontSize: "0.8rem" }}
+                    />
+                  </div>
+                  <button type="submit" className="btn-secondary" style={{ fontSize: "0.8rem", padding: "0.35rem 0.75rem" }}>
+                    Import Key
+                  </button>
+                </form>
+              </details>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      {/* ========== Hardened Master Seed Reveal Modal ========== */}
       {showSeedModal && (
-        <div className="modal-overlay" onClick={closeSeedModal}>
+        <div className="modal-overlay" data-testid="seed-reveal-modal" onClick={closeSeedModal}>
           <div
             className="modal-content"
             onClick={(e) => e.stopPropagation()}
@@ -1180,17 +1295,28 @@ export default function KeysManager({
                 borderRadius: "8px",
                 padding: "0.75rem 1rem",
                 marginBottom: "1rem",
-                fontSize: "0.9rem",
+                fontSize: "0.88rem",
                 color: "#92400e",
               }}
             >
-              <strong>Warning:</strong> Never share your master seed. Anyone
-              with this phrase has lifetime control over all personas.
+              <strong>Security Warning:</strong> Never share your master root seed. Anyone with this hex phrase has irrevocable, lifetime ownership of your primary persona and all derived family keys.
             </div>
 
             {revealedSeed ? (
-              <div>
+              <div data-testid="seed-revealed-view">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.4rem" }}>
+                  <label style={{ fontSize: "0.82rem", fontWeight: 600, color: "var(--color-text-secondary, #475569)" }}>
+                    64-Character Master Seed (Hex):
+                  </label>
+                  <span
+                    data-testid="seed-timer-countdown"
+                    style={{ fontSize: "0.75rem", color: "#d97706", fontWeight: 600 }}
+                  >
+                    ⏱️ Auto-hides in {seedRemainingSeconds}s
+                  </span>
+                </div>
                 <pre
+                  data-testid="revealed-seed-text"
                   style={{
                     background: "#1e1b4b",
                     color: "#c7d2fe",
@@ -1205,106 +1331,204 @@ export default function KeysManager({
                 >
                   {revealedSeed}
                 </pre>
-                <p
-                  style={{
-                    fontSize: "0.78rem",
-                    color: "var(--color-text-muted)",
-                    margin: 0,
-                  }}
-                >
-                  This seed will automatically hide in 30 seconds.
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "1rem" }}>
+                  <button
+                    type="button"
+                    data-testid="copy-master-seed"
+                    onClick={handleCopyMasterSeed}
+                    className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                    style={{ fontSize: "0.85rem", padding: "0.45rem 0.95rem", display: "flex", alignItems: "center", gap: "0.35rem" }}
+                  >
+                    <span>{seedCopied ? "\u2713" : "\uD83D\uDCCB"}</span>
+                    {seedCopied ? "Copied!" : "Copy Seed"}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="close-seed-modal"
+                    onClick={closeSeedModal}
+                    className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
+                    style={{ fontSize: "0.85rem", padding: "0.45rem 1rem" }}
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            ) : isPinProtected ? (
+              <div data-testid="seed-pin-challenge">
+                <p style={{ fontSize: "0.85rem", color: "#475569", margin: "0 0 1rem 0" }}>
+                  App Lock is active. Please enter your 6-digit PIN to authenticate before revealing the master seed.
                 </p>
+                <div style={{ marginBottom: "1rem" }}>
+                  <label style={{ display: "block", fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.35rem" }}>
+                    Enter 6-Digit PIN:
+                  </label>
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={6}
+                    data-testid="seed-pin-input"
+                    value={seedPin}
+                    onChange={(e) => {
+                      setSeedPin(e.target.value.replace(/\D/g, ""));
+                      setSeedPinError(null);
+                    }}
+                    placeholder="••••••"
+                    autoFocus
+                    style={{
+                      width: "100%",
+                      padding: "0.55rem 0.75rem",
+                      borderRadius: "6px",
+                      border: "1px solid #cbd5e1",
+                      fontSize: "1.1rem",
+                      letterSpacing: "0.2em",
+                      textAlign: "center",
+                      boxSizing: "border-box",
+                    }}
+                  />
+                </div>
+
+                {seedPinError && (
+                  <div
+                    data-testid="seed-pin-error"
+                    style={{
+                      marginBottom: "0.75rem",
+                      color: "#dc2626",
+                      fontSize: "0.82rem",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {seedPinError}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "1rem", flexWrap: "wrap", gap: "0.5rem" }}>
+                  {appPrefs?.app_lock_prf_hash ? (
+                    <button
+                      type="button"
+                      data-testid="seed-biometric-verify"
+                      onClick={handleVerifyBiometricsAndReveal}
+                      className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                      style={{ fontSize: "0.82rem", padding: "0.45rem 0.85rem" }}
+                    >
+                      {"\uD83D\uDC64"} Verify with Biometrics
+                    </button>
+                  ) : <div />}
+
+                  <div style={{ display: "flex", gap: "0.5rem" }}>
+                    <button
+                      type="button"
+                      onClick={closeSeedModal}
+                      className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                      style={{ fontSize: "0.82rem", padding: "0.45rem 0.85rem" }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="seed-pin-submit"
+                      onClick={handleVerifyPinAndReveal}
+                      disabled={seedPin.length !== 6}
+                      className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
+                      style={{ fontSize: "0.85rem", padding: "0.45rem 1rem" }}
+                    >
+                      Verify &amp; Reveal
+                    </button>
+                  </div>
+                </div>
               </div>
             ) : (
-              <div>
-                <div className="form-group">
-                  <label>
+              <div data-testid="seed-text-confirm">
+                <p style={{ fontSize: "0.85rem", color: "#475569", margin: "0 0 1rem 0" }}>
+                  App Lock is not currently configured. To protect against accidental revelation, type the confirmation phrase below:
+                </p>
+                <div className="form-group" style={{ marginBottom: "1rem" }}>
+                  <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 600, marginBottom: "0.35rem" }}>
                     Type <code>REVEAL MY SEED</code> to confirm:
                   </label>
                   <input
                     type="text"
+                    data-testid="seed-confirm-input"
                     value={seedConfirmText}
                     onChange={(e) => setSeedConfirmText(e.target.value)}
                     placeholder="REVEAL MY SEED"
+                    style={{
+                      width: "100%",
+                      padding: "0.55rem 0.75rem",
+                      borderRadius: "6px",
+                      border: "1px solid #cbd5e1",
+                      fontSize: "0.88rem",
+                      boxSizing: "border-box",
+                    }}
                   />
                 </div>
-                <button
-                  onClick={handleRevealSeed}
-                  disabled={!seedConfirmValid || seedCountdown > 0}
-                  style={{
-                    opacity: seedConfirmValid && seedCountdown === 0 ? 1 : 0.5,
-                    cursor:
-                      seedConfirmValid && seedCountdown === 0
-                        ? "pointer"
-                        : "not-allowed",
-                  }}
-                >
-                  {seedCountdown > 0
-                    ? `Wait ${seedCountdown}s...`
-                    : "Show Seed"}
-                </button>
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.5rem", marginTop: "1rem" }}>
+                  <button
+                    type="button"
+                    onClick={closeSeedModal}
+                    className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                    style={{ fontSize: "0.82rem", padding: "0.45rem 0.85rem" }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="seed-confirm-btn"
+                    onClick={executeRevealSeed}
+                    disabled={!seedConfirmValid}
+                    className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
+                    style={{
+                      fontSize: "0.85rem",
+                      padding: "0.45rem 1rem",
+                      opacity: seedConfirmValid ? 1 : 0.5,
+                      cursor: seedConfirmValid ? "pointer" : "not-allowed",
+                    }}
+                  >
+                    Show Seed
+                  </button>
+                </div>
               </div>
             )}
-
-            <div style={{ marginTop: "1rem", textAlign: "right" }}>
-              <button
-                onClick={closeSeedModal}
-                style={{
-                  background: "#f3f4f6",
-                  border: "1px solid #d1d5db",
-                  color: "var(--color-text-secondary)",
-                }}
-              >
-                Close
-              </button>
-            </div>
           </div>
         </div>
       )}
 
       {/* ========== Backup Password Modal ========== */}
       {showBackupPassword && (
-        <div
-          className="modal-overlay"
-          onClick={() => setShowBackupPassword(false)}
-        >
-          <div
-            className="modal-content"
-            onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: "440px" }}
-          >
+        <div className="modal-overlay" data-testid="backup-password-modal" onClick={() => setShowBackupPassword(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "440px" }}>
             <h3>Set Backup Password</h3>
             <p className="muted" style={{ fontSize: "0.85rem" }}>
-              Choose a strong password. This password is required to restore
-              the backup.
+              Choose a strong password. This password is required to restore the backup.
             </p>
             <div className="form-group">
               <label>Password</label>
               <input
                 type="password"
+                data-testid="backup-password-input"
                 value={backupPassword}
                 onChange={(e) => setBackupPassword(e.target.value)}
                 placeholder="Enter backup password"
                 autoFocus
               />
             </div>
-            <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.5rem" }}>
+            <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", justifyContent: "flex-end" }}>
               <button
-                onClick={executeExport}
-                disabled={!backupPassword || backupLoading}
-                style={{ background: "#137333", color: "white" }}
-              >
-                {backupLoading ? "Encrypting..." : "Export Backup"}
-              </button>
-              <button
+                type="button"
                 onClick={() => setShowBackupPassword(false)}
-                style={{
-                  background: "#f3f4f6",
-                  border: "1px solid #d1d5db",
-                  color: "var(--color-text-secondary)",
-                }}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
               >
                 Cancel
+              </button>
+              <button
+                type="button"
+                data-testid="confirm-download-backup-btn"
+                onClick={executeExport}
+                disabled={!backupPassword || backupLoading}
+                className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 1rem" }}
+              >
+                {backupLoading ? "Encrypting..." : "Export Backup"}
               </button>
             </div>
           </div>
@@ -1315,51 +1539,49 @@ export default function KeysManager({
       {showRestorePassword && (
         <div
           className="modal-overlay"
+          data-testid="restore-password-modal"
           onClick={() => {
             setShowRestorePassword(false);
             setPendingRestoreBytes(null);
           }}
         >
-          <div
-            className="modal-content"
-            onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: "440px" }}
-          >
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "440px" }}>
             <h3>Restore Backup</h3>
             <p className="muted" style={{ fontSize: "0.85rem" }}>
-              Enter the password used when this backup was created. This will
-              overwrite your current vault, contacts, and preferences.
+              Enter the password used when this backup was created. This will overwrite your current vault, contacts, and preferences.
             </p>
             <div className="form-group">
               <label>Backup Password</label>
               <input
                 type="password"
+                data-testid="restore-password-input"
                 value={restorePassword}
                 onChange={(e) => setRestorePassword(e.target.value)}
                 placeholder="Enter backup password"
                 autoFocus
               />
             </div>
-            <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.5rem" }}>
+            <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", justifyContent: "flex-end" }}>
               <button
-                onClick={executeRestore}
-                disabled={!restorePassword || restoreLoading}
-                style={{ background: "#dc2626", color: "white" }}
-              >
-                {restoreLoading ? "Restoring..." : "Restore & Overwrite"}
-              </button>
-              <button
+                type="button"
                 onClick={() => {
                   setShowRestorePassword(false);
                   setPendingRestoreBytes(null);
                 }}
-                style={{
-                  background: "#f3f4f6",
-                  border: "1px solid #d1d5db",
-                  color: "var(--color-text-secondary)",
-                }}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
               >
                 Cancel
+              </button>
+              <button
+                type="button"
+                data-testid="confirm-restore-backup-btn"
+                onClick={executeRestore}
+                disabled={!restorePassword || restoreLoading}
+                className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 1rem" }}
+              >
+                {restoreLoading ? "Restoring..." : "Restore & Overwrite"}
               </button>
             </div>
           </div>
@@ -1370,15 +1592,12 @@ export default function KeysManager({
       {showRevokeModal && (
         <div
           className="modal-overlay"
+          data-testid="kill-switch-modal"
           onClick={() => {
             if (!revokeLoading) setShowRevokeModal(false);
           }}
         >
-          <div
-            className="modal-content"
-            onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: "480px" }}
-          >
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "480px" }}>
             <h3 style={{ color: "#dc2626" }}>{"\uD83D\uDED1"} Confirm Global Session Revocation</h3>
             <div
               style={{
@@ -1394,34 +1613,23 @@ export default function KeysManager({
             >
               This will immediately log you out of all web browsers and satellite apps. You will need to re-authenticate with iyou_home to sign back in.
             </div>
-            <div
-              style={{
-                display: "flex",
-                gap: "0.75rem",
-                marginTop: "1rem",
-                justifyContent: "flex-end",
-              }}
-            >
+            <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", justifyContent: "flex-end" }}>
               <button
+                type="button"
                 onClick={() => setShowRevokeModal(false)}
                 disabled={revokeLoading}
-                style={{
-                  background: "#f3f4f6",
-                  border: "1px solid #d1d5db",
-                  color: "var(--color-text-secondary)",
-                }}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
               >
                 Cancel
               </button>
               <button
+                type="button"
+                data-testid="confirm-revoke-sessions-btn"
                 onClick={handleConfirmRevoke}
                 disabled={revokeLoading}
-                style={{
-                  background: "#dc2626",
-                  border: "1px solid #b91c1c",
-                  color: "white",
-                  fontWeight: 600,
-                }}
+                className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 1rem", fontWeight: 600 }}
               >
                 {revokeLoading ? "Revoking..." : "Confirm Revocation"}
               </button>
@@ -1441,11 +1649,7 @@ export default function KeysManager({
             setLockErrorMessage(null);
           }}
         >
-          <div
-            className="modal-content"
-            onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: "400px" }}
-          >
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "400px" }}>
             <h3>{appPrefs?.app_lock_pin_hash ? "Change App Lock PIN" : "Set 6-Digit App Lock PIN"}</h3>
             <p className="muted" style={{ fontSize: "0.85rem", marginBottom: "1rem" }}>
               Enter a 6-digit numeric PIN to protect access to iyou_home.
@@ -1505,20 +1709,18 @@ export default function KeysManager({
                     setConfirmPin("");
                     setLockErrorMessage(null);
                   }}
-                  style={{
-                    background: "#f3f4f6",
-                    border: "1px solid #d1d5db",
-                    color: "var(--color-text-secondary)",
-                  }}
+                  className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                  style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={newPin.length !== 6 || confirmPin.length !== 6}
+                  className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
                   style={{
-                    background: "#137333",
-                    color: "white",
+                    fontSize: "0.85rem",
+                    padding: "0.45rem 1rem",
                     opacity: newPin.length !== 6 || confirmPin.length !== 6 ? 0.5 : 1,
                   }}
                 >
@@ -1533,11 +1735,7 @@ export default function KeysManager({
       {/* ========== Rollback Confirmation Modal ========== */}
       {showRollbackConfirm && (
         <div className="modal-overlay" onClick={() => setShowRollbackConfirm(false)}>
-          <div
-            className="modal-content"
-            onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: "460px" }}
-          >
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "460px" }}>
             <h3 style={{ color: "#dc2626" }}>Confirm Binary Rollback</h3>
             <p className="muted" style={{ fontSize: "0.85rem", lineHeight: "1.5", marginBottom: "1rem" }}>
               Are you sure you want to replace the current executable with the previous binary snapshot? This will restore the prior version. You should restart the application after rollback.
@@ -1547,11 +1745,8 @@ export default function KeysManager({
                 type="button"
                 onClick={() => setShowRollbackConfirm(false)}
                 disabled={rollbackLoading}
-                style={{
-                  background: "#f3f4f6",
-                  border: "1px solid #d1d5db",
-                  color: "var(--color-text-secondary)",
-                }}
+                className="btn-secondary bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 0.9rem" }}
               >
                 Cancel
               </button>
@@ -1559,12 +1754,8 @@ export default function KeysManager({
                 type="button"
                 onClick={handleExecuteRollback}
                 disabled={rollbackLoading}
-                style={{
-                  background: "#dc2626",
-                  border: "1px solid #b91c1c",
-                  color: "#ffffff",
-                  fontWeight: 600,
-                }}
+                className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+                style={{ fontSize: "0.85rem", padding: "0.45rem 1rem", fontWeight: 600 }}
               >
                 {rollbackLoading ? "Restoring…" : "Confirm Rollback"}
               </button>

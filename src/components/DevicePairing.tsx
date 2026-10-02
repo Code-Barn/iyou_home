@@ -99,8 +99,10 @@ export default function DevicePairing() {
           </span>
         </h3>
         <button
+          data-testid="pair-mobile-device-btn"
           onClick={() => setShowPairModal(true)}
-          style={{ background: "#1d4ed8", color: "white" }}
+          className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
+          style={{ padding: "0.45rem 0.95rem", fontSize: "0.85rem", cursor: "pointer" }}
         >
           {"\uFF0B"} Pair Mobile Device
         </button>

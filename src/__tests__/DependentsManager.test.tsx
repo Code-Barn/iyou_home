@@ -76,6 +76,30 @@ const { mockInvoke, mockWriteText, state } = vi.hoisted(() => {
         state.dependents.push(newDep);
         return Promise.resolve(newDep);
       }
+      case "graduate_dependent_to_sovereign": {
+        const depId = (args?.dependentId as string) || "";
+        const dep = state.dependents.find((d) => d.dependent_id === depId);
+        if (dep) {
+          dep.custody_stage = 3;
+          dep.graduated_at = Math.floor(Date.now() / 1000);
+        }
+        return Promise.resolve(
+          state.bundle || {
+            bundle_version: "1.0",
+            dependent_id: depId,
+            petname: dep?.name || "AdultChild",
+            did: dep?.did || "did:key:z6MkuAdultLeaf1234567890",
+            ed25519_private_key_b58: "MockEd25519PrivKeyBase58==",
+            nostr_private_key_hex: "0123456789abcdef".repeat(4),
+            nostr_pubkey_hex: "fedcba9876543210".repeat(4),
+            guardian_did: "did:key:z6MkuParentGuardian1234567890",
+            custody_stage: 3,
+            allowed_relays: ["wss://relay.iyou.me"],
+            attestation_vc: { type: "AgeBracketCredential" },
+            exported_at: 1700000000,
+          }
+        );
+      }
       default:
         return Promise.resolve();
     }
@@ -354,4 +378,118 @@ describe("DependentsManager", () => {
 
     expect(await screen.findByTestId("dependent-name-dep_leo_123")).toHaveTextContent("Leo");
   });
+
+  describe("Emancipation Guard & Graduation", () => {
+    it("strictly renders emancipation button only for dependents >= 18 and hides it for minors", async () => {
+      state.dependents = [
+        {
+          dependent_id: "dep_minor_child",
+          name: "YoungChild",
+          birth_year: currentYear - 8, // 8yo
+          custody_stage: 1,
+          dependent_index: 0,
+          did: "did:key:z6MkuYoung1",
+          nostr_pubkey_hex: "aa".repeat(32),
+          guardian_did: "did:key:z6MkuParentGuardian",
+          allowed_relays: ["wss://relay.iyou.me"],
+          revoked: false,
+          created_at: 1700000000,
+          graduated_at: null,
+        },
+        {
+          dependent_id: "dep_minor_teen",
+          name: "TeenChild",
+          birth_year: currentYear - 16, // 16yo
+          custody_stage: 2,
+          dependent_index: 1,
+          did: "did:key:z6MkuTeen2",
+          nostr_pubkey_hex: "bb".repeat(32),
+          guardian_did: "did:key:z6MkuParentGuardian",
+          allowed_relays: ["wss://relay.iyou.me"],
+          revoked: false,
+          created_at: 1700000100,
+          graduated_at: null,
+        },
+        {
+          dependent_id: "dep_adult_18",
+          name: "AdultChild",
+          birth_year: currentYear - 18, // 18yo
+          custody_stage: 2,
+          dependent_index: 2,
+          did: "did:key:z6MkuAdult3",
+          nostr_pubkey_hex: "cc".repeat(32),
+          guardian_did: "did:key:z6MkuParentGuardian",
+          allowed_relays: ["wss://relay.iyou.me"],
+          revoked: false,
+          created_at: 1700000200,
+          graduated_at: null,
+        },
+      ];
+
+      render(<DependentsManager />);
+
+      // Minors must NOT have the emancipation button
+      expect(await screen.findByTestId("dependent-card-dep_minor_child")).toBeInTheDocument();
+      expect(screen.queryByTestId("dependent-emancipate-dep_minor_child")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("dependent-emancipate-dep_minor_teen")).not.toBeInTheDocument();
+
+      // 18+ dependent MUST have the emancipation button
+      const adultEmancipateBtn = screen.getByTestId("dependent-emancipate-dep_adult_18");
+      expect(adultEmancipateBtn).toBeInTheDocument();
+      expect(adultEmancipateBtn).toHaveTextContent("Emancipate (18+ / graduate)");
+    });
+
+    it("requires two-step confirmation to graduate dependent to sovereign and opens provisioning modal", async () => {
+      state.dependents = [
+        {
+          dependent_id: "dep_adult_19",
+          name: "SovereignReady",
+          birth_year: currentYear - 19,
+          custody_stage: 2,
+          dependent_index: 0,
+          did: "did:key:z6MkuReady1",
+          nostr_pubkey_hex: "dd".repeat(32),
+          guardian_did: "did:key:z6MkuParentGuardian",
+          allowed_relays: ["wss://relay.iyou.me"],
+          revoked: false,
+          created_at: 1700000300,
+          graduated_at: null,
+        },
+      ];
+
+      render(<DependentsManager />);
+
+      const emancipateBtn = await screen.findByTestId("dependent-emancipate-dep_adult_19");
+      expect(emancipateBtn).toHaveTextContent("Emancipate (18+ / graduate)");
+
+      // Step 1: Click once to arm
+      fireEvent.click(emancipateBtn);
+      expect(emancipateBtn).toHaveTextContent("⚠️ Confirm Emancipation");
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "graduate_dependent_to_sovereign",
+        expect.anything()
+      );
+
+      // Step 2: Click again to execute
+      fireEvent.click(emancipateBtn);
+
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("graduate_dependent_to_sovereign", {
+          dependentId: "dep_adult_19",
+        });
+      });
+
+      // Shows success message
+      expect(
+        await screen.findByText(/🎓 SovereignReady has graduated to sovereign status/i)
+      ).toBeInTheDocument();
+
+      // Emancipation button is gone and graduated badge is rendered
+      expect(screen.queryByTestId("dependent-emancipate-dep_adult_19")).not.toBeInTheDocument();
+      expect(screen.getByTestId("dependent-graduated-badge-dep_adult_19")).toHaveTextContent(
+        "🎓 Sovereign / Graduated"
+      );
+    });
+  });
 });
+

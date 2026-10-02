@@ -71,6 +71,11 @@ export default function DependentsManager() {
   const [addLoading, setAddLoading] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
 
+  // Emancipation guard state
+  const [armEmancipateId, setArmEmancipateId] = useState<string | null>(null);
+  const [emancipateLoading, setEmancipateLoading] = useState(false);
+  const [emancipateSuccessMsg, setEmancipateSuccessMsg] = useState<string | null>(null);
+
   const loadDependents = useCallback(async () => {
     setLoading(true);
     try {
@@ -171,6 +176,36 @@ export default function DependentsManager() {
     }
   };
 
+  const handleEmancipate = async (dep: DependentProfile) => {
+    if (armEmancipateId !== dep.dependent_id) {
+      setArmEmancipateId(dep.dependent_id);
+      return;
+    }
+    setArmEmancipateId(null);
+    setEmancipateLoading(true);
+    setError(null);
+    try {
+      const bundle = await invoke<DependentProvisioningBundle>("graduate_dependent_to_sovereign", {
+        dependentId: dep.dependent_id,
+      });
+      setEmancipateSuccessMsg(`🎓 ${dep.name} has graduated to sovereign status.`);
+      setTimeout(() => setEmancipateSuccessMsg(null), 5000);
+      await loadDependents();
+      setSelectedDep(dep);
+      setProvisionBundle(bundle);
+      try {
+        const qr = await invoke<string>("render_qr_code", {
+          data: JSON.stringify(bundle),
+        });
+        setQrDataUrl(qr);
+      } catch {}
+    } catch (err: any) {
+      setError(`Emancipation failed: ${err.toString()}`);
+    } finally {
+      setEmancipateLoading(false);
+    }
+  };
+
   const pillStyle = (stage: number): React.CSSProperties => {
     if (stage === 1) {
       return {
@@ -226,6 +261,7 @@ export default function DependentsManager() {
             setAddError(null);
             setShowAddModal(true);
           }}
+          className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
           style={{ fontSize: "0.85rem", padding: "0.4rem 0.85rem" }}
         >
           + Add Dependent
@@ -235,6 +271,24 @@ export default function DependentsManager() {
       {error && (
         <div className="error-message" style={{ marginTop: "0.75rem" }}>
           {error}
+        </div>
+      )}
+
+      {emancipateSuccessMsg && (
+        <div
+          data-testid="emancipate-success-message"
+          style={{
+            marginTop: "0.75rem",
+            background: "#f0fdf4",
+            border: "1px solid #bbf7d0",
+            color: "#166534",
+            padding: "0.5rem 0.75rem",
+            borderRadius: "6px",
+            fontSize: "0.85rem",
+            fontWeight: 500,
+          }}
+        >
+          {emancipateSuccessMsg}
         </div>
       )}
 
@@ -341,11 +395,55 @@ export default function DependentsManager() {
                   </div>
                 </div>
 
-                <div>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                  {/* Emancipation Guard: strictly renders on individual dependent when age >= 18 */}
+                  {new Date().getFullYear() - dep.birth_year >= 18 && !dep.revoked && dep.custody_stage !== 3 && (
+                    <button
+                      type="button"
+                      data-testid={`dependent-emancipate-${dep.dependent_id}`}
+                      onClick={() => handleEmancipate(dep)}
+                      disabled={emancipateLoading}
+                      className="btn-destructive bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900 font-medium rounded-lg transition-colors"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "0.35rem",
+                        fontSize: "0.82rem",
+                        padding: "0.45rem 0.85rem",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                        background: armEmancipateId === dep.dependent_id ? "#dc2626" : undefined,
+                        color: armEmancipateId === dep.dependent_id ? "#ffffff" : undefined,
+                      }}
+                    >
+                      {armEmancipateId === dep.dependent_id
+                        ? "⚠️ Confirm Emancipation"
+                        : "Emancipate (18+ / graduate)"}
+                    </button>
+                  )}
+
+                  {(dep.custody_stage === 3 || dep.graduated_at) && (
+                    <span
+                      data-testid={`dependent-graduated-badge-${dep.dependent_id}`}
+                      style={{
+                        background: "#dcfce7",
+                        color: "#166534",
+                        border: "1px solid #86efac",
+                        borderRadius: "999px",
+                        padding: "3px 10px",
+                        fontSize: "0.75rem",
+                        fontWeight: 600,
+                      }}
+                    >
+                      🎓 Sovereign / Graduated
+                    </span>
+                  )}
+
                   <button
                     data-testid={`provision-dependent-${dep.dependent_id}`}
                     onClick={() => handleOpenProvision(dep)}
                     disabled={dep.revoked}
+                    className="btn-primary bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-lg shadow-sm transition-colors"
                     style={{
                       display: "flex",
                       alignItems: "center",
