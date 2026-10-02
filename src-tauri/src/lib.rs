@@ -2790,6 +2790,26 @@ fn export_dependent_leaf_bundle(
     vault::export_dependent_leaf_bundle(&vault, &dependent_id)
 }
 
+#[tauri::command]
+fn get_dependent_provisioning_bundle(
+    app: AppHandle,
+    dependent_id: String,
+) -> Result<vault::DependentProvisioningBundle, String> {
+    let vault = vault::load_vault(&app)?;
+    vault::get_dependent_provisioning_bundle(&vault, &dependent_id)
+}
+
+#[tauri::command]
+fn list_dependents(app: AppHandle) -> Result<Vec<vault::DependentProfile>, String> {
+    let vault = vault::load_vault(&app)?;
+    Ok(vault::list_dependents(&vault))
+}
+
+#[tauri::command]
+fn render_qr_code(data: String) -> Result<String, String> {
+    pairing::render_qr_png_b64(&data)
+}
+
 /// Graduates a dependent who has attained age 18 to sovereign status.
 /// Sets custody_stage = 3 (Sovereign Pending) and returns the sealed graduation bundle.
 #[tauri::command]
@@ -4052,6 +4072,9 @@ pub fn run() {
             activate_sovereign_identity,
             create_dependent_profile,
             export_dependent_leaf_bundle,
+            get_dependent_provisioning_bundle,
+            list_dependents,
+            render_qr_code,
             graduate_dependent_to_sovereign,
             list_roles,
             create_role_profile,

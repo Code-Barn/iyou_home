@@ -72,6 +72,37 @@ export interface BusinessProfile {
   created_at: number;
 }
 
+export interface DependentProfile {
+  dependent_id: string;
+  name: string;
+  birth_year: number;
+  custody_stage: number; // 1 = Guided Delegation, 2 = Autonomous, 3 = Sovereign Pending
+  dependent_index: number;
+  did: string;
+  nostr_pubkey_hex: string;
+  guardian_did: string;
+  allowed_relays: string[];
+  attestation_vc?: any;
+  revoked: boolean;
+  created_at: number;
+  graduated_at?: number | null;
+}
+
+export interface DependentProvisioningBundle {
+  bundle_version: string;
+  dependent_id: string;
+  petname: string;
+  did: string;
+  ed25519_private_key_b58: string;
+  nostr_private_key_hex: string;
+  nostr_pubkey_hex: string;
+  guardian_did: string;
+  custody_stage: number;
+  allowed_relays: string[];
+  attestation_vc: any;
+  exported_at: number;
+}
+
 export type EnclaveProfile = Profile | RoleProfile | BusinessProfile;
 
 export type PersonaProfile = Profile;

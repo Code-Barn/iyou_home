@@ -1986,6 +1986,17 @@ pub fn export_dependent_leaf_bundle(
     Ok(bundle)
 }
 
+pub fn get_dependent_provisioning_bundle(
+    vault: &VaultStore,
+    dependent_id: &str,
+) -> Result<DependentProvisioningBundle, String> {
+    export_dependent_leaf_bundle(vault, dependent_id)
+}
+
+pub fn list_dependents(vault: &VaultStore) -> Vec<DependentProfile> {
+    vault.dependents.clone()
+}
+
 pub fn graduate_dependent(
     vault: &mut VaultStore,
     dependent_id: &str,
@@ -4394,6 +4405,57 @@ mod tests {
         let result = export_dependent_leaf_bundle(&vault, &dep.dependent_id);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("revoked"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_get_dependent_provisioning_bundle_valid_leaf_only() {
+        let mut path = temp_dir();
+        path.push("test_get_provisioning_bundle_vault.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = create_vault_at_path(&path).expect("Should create vault");
+        let dep = add_dependent_profile(&mut vault, "Violette".to_string(), 2016, 1)
+            .expect("Add child Violette");
+
+        let bundle = get_dependent_provisioning_bundle(&vault, &dep.dependent_id)
+            .expect("Bundle retrieval must succeed");
+
+        assert_eq!(bundle.bundle_version, "1.0");
+        assert_eq!(bundle.dependent_id, dep.dependent_id);
+        assert_eq!(bundle.petname, "Violette");
+        assert_eq!(bundle.did, dep.did);
+        assert_eq!(bundle.guardian_did, dep.guardian_did);
+        assert_eq!(bundle.custody_stage, 1);
+        assert!(!bundle.ed25519_private_key_b58.is_empty());
+        assert!(!bundle.nostr_private_key_hex.is_empty());
+        assert_eq!(bundle.nostr_pubkey_hex, dep.nostr_pubkey_hex);
+
+        let bundle_json = serde_json::to_string(&bundle).expect("Serialize bundle");
+
+        // Master root seed must NEVER be present
+        assert!(!bundle_json.contains(&vault.root_seed_base58));
+        let seed_bytes = decode_root_seed(&vault).unwrap();
+        assert!(!bundle_json.contains(&hex::encode(&seed_bytes)));
+
+        // Parent profile secret keys must NEVER be present
+        for p in &vault.profiles {
+            let kp = get_profile_keypair(&vault, &p.profile_id).unwrap();
+            let sk_b58 = bs58::encode(kp.signing_key.to_bytes()).into_string();
+            assert!(!bundle_json.contains(&sk_b58));
+        }
+
+        // Test list_dependents includes the profile
+        let deps = list_dependents(&vault);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "Violette");
+
+        // Revoked dependent cannot export bundle
+        vault.dependents.iter_mut().find(|d| d.dependent_id == dep.dependent_id).unwrap().revoked = true;
+        let res_revoked = get_dependent_provisioning_bundle(&vault, &dep.dependent_id);
+        assert!(res_revoked.is_err());
+        assert!(res_revoked.unwrap_err().contains("revoked"));
 
         let _ = fs::remove_file(path);
     }

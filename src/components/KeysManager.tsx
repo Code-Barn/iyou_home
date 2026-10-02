@@ -32,6 +32,7 @@ import {
 import DevicePairing from "./DevicePairing";
 import UpdateVettingModal from "./updater/UpdateVettingModal";
 import FamilyEnclave from "./family/FamilyEnclave";
+import DependentsManager from "./DependentsManager";
 
 function levelLabel(level: number): string {
   if (level === 0) return "L0 Anchor";
@@ -662,6 +663,9 @@ export default function KeysManager({
 
       {/* RFC-005 Family & Delegations (below Primary Identity) */}
       <FamilyEnclave />
+
+      {/* Stewarded Dependent Accounts (Deterministic Leaf Derivations) */}
+      <DependentsManager />
 
       {/* Sovereign Data Redundancy Callout */}
       <div
