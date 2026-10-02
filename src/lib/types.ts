@@ -356,6 +356,8 @@ export interface InviteRecord {
   nonce: string;
   /** Full signed token JSON — copyable and QR-encodable. */
   token_json: string;
+  /** Base64url-encoded token JSON for deep link airlock URLs. */
+  token_base64?: string;
   issuer_did: string;
   tier: InviteTier;
   created_at: number;

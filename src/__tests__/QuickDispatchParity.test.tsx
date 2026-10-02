@@ -211,7 +211,7 @@ describe("Quick Dispatch Parity & Contracts", () => {
         (c) => c[0] === "dispatch_nostr_event" && c[1]?.kind === 1063,
       );
       expect(invokeCall).toBeDefined();
-      const tags: string[][] = invokeCall![1].tags;
+      const tags: string[][] = (invokeCall![1] as any).tags;
 
       const urlTag = tags.find((t) => t[0] === "url");
       const mTag = tags.find((t) => t[0] === "m");
@@ -295,7 +295,7 @@ describe("Quick Dispatch Parity & Contracts", () => {
         (c) => c[0] === "dispatch_nostr_event" && c[1]?.kind === 30023,
       );
       expect(invokeCall).toBeDefined();
-      const tags: string[][] = invokeCall![1].tags;
+      const tags: string[][] = (invokeCall![1] as any).tags;
 
       // ["d", uuid]
       const dTag = tags.find((t) => t[0] === "d");

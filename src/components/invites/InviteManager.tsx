@@ -51,6 +51,8 @@ import {
   quotaStanding,
   standingBadge,
 } from "./inviteVetting";
+export { INVITE_QR_MODAL_HELPER_COPY } from "./IssueInviteModal";
+import { INVITE_QR_MODAL_HELPER_COPY } from "./IssueInviteModal";
 
 const SCOPE_OPTIONS = ["relay:read", "relay:write"] as const;
 
@@ -152,6 +154,46 @@ function shortNonce(nonce: string): string {
   return nonce.length > 12 ? `${nonce.slice(0, 6)}…${nonce.slice(-4)}` : nonce;
 }
 
+export const INVITE_AIRLOCK_BASE = "https://iyou.me/airlock/";
+
+export function base64UrlEncode(str: string): string {
+  if (typeof btoa === "undefined") {
+    const buf = (globalThis as unknown as { Buffer?: { from: (s: string, enc: string) => { toString: (enc: string) => string } } }).Buffer;
+    return buf ? buf.from(str, "utf-8").toString("base64url") : "";
+  }
+  const utf8Bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (let i = 0; i < utf8Bytes.length; i++) {
+    binary += String.fromCharCode(utf8Bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function buildInviteLink(token: { token_base64?: string; token_json?: string }): string {
+  const b64 =
+    token.token_base64 ||
+    (token.token_json ? base64UrlEncode(token.token_json) : base64UrlEncode(JSON.stringify(token)));
+  return `${INVITE_AIRLOCK_BASE}?invite=${b64}`;
+}
+
+export function isInviteActionable(
+  inv: Pick<InviteRecord, "status" | "uses_count" | "max_uses">,
+): boolean {
+  if (inv.status === "revoked" || inv.status === "expired") {
+    return false;
+  }
+  const resolved = resolveInviteStatus(inv).label.toLowerCase();
+  if (resolved === "exhausted") {
+    return false;
+  }
+  return (
+    inv.status === "live" ||
+    (inv as any).status === "claimed" ||
+    resolved === "live" ||
+    resolved === "claimed"
+  );
+}
+
 export default function InviteManager() {
   const [issuer, setIssuer] = useState<IssuerStatus | null>(null);
   const [invites, setInvites] = useState<InviteRecord[]>([]);
@@ -176,6 +218,7 @@ export default function InviteManager() {
   const [copiedLink, setCopiedLink] = useState(false);
 
   const [revokingNonce, setRevokingNonce] = useState<string | null>(null);
+  const [copiedRowNonce, setCopiedRowNonce] = useState<string | null>(null);
 
   // Issuer standing inputs: contact book size and the operator-tunable
   // threshold. None of this is a developer affordance — the enclave enforces
@@ -350,6 +393,66 @@ export default function InviteManager() {
       } catch {
         // no-op
       }
+    }
+  };
+
+  const handleCopyRowLink = async (inv: InviteRecord) => {
+    const link = buildInviteLink(inv);
+    try {
+      await writeText(link);
+      setCopiedRowNonce(inv.nonce);
+      setTimeout(() => {
+        setCopiedRowNonce((cur) => (cur === inv.nonce ? null : cur));
+      }, 1800);
+    } catch {
+      try {
+        await navigator.clipboard.writeText(link);
+        setCopiedRowNonce(inv.nonce);
+        setTimeout(() => {
+          setCopiedRowNonce((cur) => (cur === inv.nonce ? null : cur));
+        }, 1800);
+      } catch {
+        // clipboard unavailable
+      }
+    }
+  };
+
+  const openQrModal = async (inv: InviteRecord) => {
+    setMintError(null);
+    let parsed: InviteCapabilityToken;
+    try {
+      parsed = JSON.parse(inv.token_json);
+    } catch {
+      parsed = {
+        v: 1,
+        issuer_did: inv.issuer_did,
+        satellite_id: "",
+        nonce: inv.nonce,
+        max_uses: inv.max_uses,
+        uses_count: inv.uses_count,
+        tier: inv.tier,
+        created_at: inv.created_at,
+        expires_at: inv.expires_at,
+        scope: ["join"],
+        signature: "",
+      };
+    }
+
+    setMintedToken(parsed);
+    const fallbackLink = buildInviteLink(inv);
+    setInviteLink(fallbackLink);
+    setShowModal(true);
+
+    try {
+      const qr = await invoke<InviteQrPayload>("render_invite_qr", {
+        tokenJson: inv.token_json,
+      });
+      if (qr) {
+        setInviteLink(qr.link || fallbackLink);
+        setQrUrl(qr.qr_data_url || null);
+      }
+    } catch {
+      // Best-effort: copyable link and JSON remain usable
     }
   };
 
@@ -607,22 +710,62 @@ export default function InviteManager() {
                 </td>
                 <td style={{ padding: "0.5rem 0.6rem" }}>{formatDate(inv.expires_at)}</td>
                 <td style={{ padding: "0.5rem 0.6rem", textAlign: "right" }}>
-                  {inv.status !== "revoked" && (
-                    <button
-                      type="button"
-                      data-testid={`invite-revoke-${inv.nonce}`}
-                      onClick={() => handleRevoke(inv.nonce)}
-                      disabled={revokingNonce === inv.nonce}
-                      style={{
-                        fontSize: "0.75rem",
-                        color: tone("danger-fg", "#b91c1c"),
-                        borderRadius: "6px",
-                        padding: "0.25rem 0.6rem",
-                      }}
-                    >
-                      {revokingNonce === inv.nonce ? "…" : "Revoke"}
-                    </button>
-                  )}
+                  <div style={{ display: "flex", gap: "0.4rem", justifyContent: "flex-end", alignItems: "center" }}>
+                    {isInviteActionable(inv) && (
+                      <>
+                        <button
+                          type="button"
+                          data-testid={`invite-copy-link-${inv.nonce}`}
+                          onClick={() => handleCopyRowLink(inv)}
+                          title={copiedRowNonce === inv.nonce ? "Copied!" : "Copy airlock invite link"}
+                          style={{
+                            fontSize: "0.75rem",
+                            color: tone("text", "#374151"),
+                            background: tone("surface-sunken", "#f3f4f6"),
+                            border: `1px solid ${tone("border", "#d1d5db")}`,
+                            borderRadius: "6px",
+                            padding: "0.25rem 0.55rem",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {copiedRowNonce === inv.nonce ? "Copied!" : "Copy Link"}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid={`invite-qr-${inv.nonce}`}
+                          onClick={() => openQrModal(inv)}
+                          title="View QR Code"
+                          style={{
+                            fontSize: "0.75rem",
+                            color: tone("text", "#374151"),
+                            background: tone("surface-sunken", "#f3f4f6"),
+                            border: `1px solid ${tone("border", "#d1d5db")}`,
+                            borderRadius: "6px",
+                            padding: "0.25rem 0.55rem",
+                            cursor: "pointer",
+                          }}
+                        >
+                          QR
+                        </button>
+                      </>
+                    )}
+                    {inv.status !== "revoked" && (
+                      <button
+                        type="button"
+                        data-testid={`invite-revoke-${inv.nonce}`}
+                        onClick={() => handleRevoke(inv.nonce)}
+                        disabled={revokingNonce === inv.nonce}
+                        style={{
+                          fontSize: "0.75rem",
+                          color: tone("danger-fg", "#b91c1c"),
+                          borderRadius: "6px",
+                          padding: "0.25rem 0.6rem",
+                        }}
+                      >
+                        {revokingNonce === inv.nonce ? "…" : "Revoke"}
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
@@ -740,6 +883,18 @@ export default function InviteManager() {
                       <span style={{ fontSize: "0.72rem", color: tone("text-muted", "#6b7280") }}>
                         Scan to open invite link
                       </span>
+                      <p
+                        data-testid="invite-qr-hint"
+                        style={{
+                          fontSize: "0.74rem",
+                          color: tone("text-muted", "#6b7280"),
+                          margin: "0.35rem 0 0",
+                          textAlign: "center",
+                          maxWidth: 220,
+                        }}
+                      >
+                        {INVITE_QR_MODAL_HELPER_COPY}
+                      </p>
                     </div>
                   )}
                 </div>

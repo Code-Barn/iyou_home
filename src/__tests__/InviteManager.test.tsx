@@ -17,7 +17,7 @@
 
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi } from "vitest";
-import InviteManager from "../components/invites/InviteManager";
+import InviteManager, { INVITE_QR_MODAL_HELPER_COPY } from "../components/invites/InviteManager";
 import type { InviteCapabilityToken, IssuerStatus, InviteRecord } from "../lib/types";
 
 type InvokeHandler = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -179,6 +179,7 @@ describe("InviteManager (RFC-002)", () => {
       "deadbeefdeadbeefdeadbeefdeadbeef",
     );
     expect(screen.getByTestId("invite-qr-image")).toHaveAttribute("src", "data:image/png;base64,iVBORw0KGgo=");
+    expect(screen.getByTestId("invite-qr-hint")).toHaveTextContent(INVITE_QR_MODAL_HELPER_COPY);
 
     // The enclave builds the link from the same token JSON; the modal forwards
     // that exact string rather than encoding it in the browser.
@@ -209,6 +210,170 @@ describe("InviteManager (RFC-002)", () => {
       expect(writeText).toHaveBeenCalledWith("https://iyou.me/airlock/?invite=eyJ2IjoxfQ");
     });
     expect(await screen.findByTestId("invite-copy-link")).toHaveTextContent("Link Copied");
+  });
+
+  it("renders Copy Link and QR buttons for live and claimed table rows, but not exhausted or revoked", async () => {
+    const activeLiveInvite: InviteRecord = {
+      nonce: "nonce-live-1",
+      token_json: JSON.stringify({ nonce: "nonce-live-1", scope: ["join"] }),
+      token_base64: "bGl2ZS10b2tlbg",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: null,
+      uses_count: 0,
+      max_uses: 2,
+      status: "live",
+    };
+    const claimedInvite: InviteRecord = {
+      nonce: "nonce-claimed-2",
+      token_json: JSON.stringify({ nonce: "nonce-claimed-2", scope: ["join"] }),
+      token_base64: "Y2xhaW1lZC10b2tlbg",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: "did:key:z6Mkchild",
+      uses_count: 1,
+      max_uses: 2,
+      status: "live",
+    };
+    const exhaustedInvite: InviteRecord = {
+      nonce: "nonce-exhausted-3",
+      token_json: JSON.stringify({ nonce: "nonce-exhausted-3" }),
+      token_base64: "ZXhoYXVzdGVk",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: "did:key:z6Mkchild2",
+      uses_count: 2,
+      max_uses: 2,
+      status: "used",
+    };
+    const revokedInvite: InviteRecord = {
+      nonce: "nonce-revoked-4",
+      token_json: JSON.stringify({ nonce: "nonce-revoked-4" }),
+      token_base64: "cmV2b2tlZA",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: null,
+      uses_count: 0,
+      max_uses: 1,
+      status: "revoked",
+    };
+
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_invites") {
+        return Promise.resolve([activeLiveInvite, claimedInvite, exhaustedInvite, revokedInvite]);
+      }
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+
+    // Live invite row has Copy Link, QR, and Revoke
+    await waitFor(() => {
+      expect(screen.getByTestId("invite-copy-link-nonce-live-1")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("invite-qr-nonce-live-1")).toBeInTheDocument();
+    expect(screen.getByTestId("invite-revoke-nonce-live-1")).toBeInTheDocument();
+
+    // Claimed invite row has Copy Link, QR, and Revoke
+    expect(screen.getByTestId("invite-copy-link-nonce-claimed-2")).toBeInTheDocument();
+    expect(screen.getByTestId("invite-qr-nonce-claimed-2")).toBeInTheDocument();
+    expect(screen.getByTestId("invite-revoke-nonce-claimed-2")).toBeInTheDocument();
+
+    // Exhausted invite row does NOT have Copy Link or QR, but has Revoke
+    expect(screen.queryByTestId("invite-copy-link-nonce-exhausted-3")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("invite-qr-nonce-exhausted-3")).not.toBeInTheDocument();
+    expect(screen.getByTestId("invite-revoke-nonce-exhausted-3")).toBeInTheDocument();
+
+    // Revoked invite row has NONE of the actions
+    expect(screen.queryByTestId("invite-copy-link-nonce-revoked-4")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("invite-qr-nonce-revoked-4")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("invite-revoke-nonce-revoked-4")).not.toBeInTheDocument();
+  });
+
+  it("copies airlock link to clipboard from table row Copy Link button", async () => {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    const activeInvite: InviteRecord = {
+      nonce: "nonce-copy-test",
+      token_json: JSON.stringify({ nonce: "nonce-copy-test" }),
+      token_base64: "dGVzdC1iYXNlNjQtdG9rZW4",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: null,
+      uses_count: 0,
+      max_uses: 1,
+      status: "live",
+    };
+
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_invites") return Promise.resolve([activeInvite]);
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+
+    const copyBtn = await screen.findByTestId("invite-copy-link-nonce-copy-test");
+    expect(copyBtn).toHaveTextContent("Copy Link");
+
+    fireEvent.click(copyBtn);
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("https://iyou.me/airlock/?invite=dGVzdC1iYXNlNjQtdG9rZW4");
+    });
+    expect(copyBtn).toHaveTextContent("Copied!");
+  });
+
+  it("opens QR modal from table row QR button and shows helper microcopy", async () => {
+    const activeInvite: InviteRecord = {
+      nonce: "nonce-qr-test",
+      token_json: JSON.stringify({ nonce: "nonce-qr-test", tier: "member" }),
+      token_base64: "dGVzdC1xci1iYXNlNjQ",
+      issuer_did: "did:key:z6Mkprimary",
+      tier: "member",
+      created_at: 1700000000,
+      expires_at: 1710000000,
+      child_did: null,
+      uses_count: 0,
+      max_uses: 1,
+      status: "live",
+    };
+
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_invites") return Promise.resolve([activeInvite]);
+      if (cmd === "render_invite_qr") {
+        return Promise.resolve({
+          link: "https://iyou.me/airlock/?invite=dGVzdC1xci1iYXNlNjQ",
+          qr_data_url: "data:image/png;base64,QRTEST==",
+        });
+      }
+      return defaultHandler(cmd, args);
+    });
+
+    render(<InviteManager />);
+
+    const qrBtn = await screen.findByTestId("invite-qr-nonce-qr-test");
+    fireEvent.click(qrBtn);
+
+    expect(await screen.findByTestId("invite-modal")).toBeInTheDocument();
+    expect(mockInvoke).toHaveBeenCalledWith("render_invite_qr", {
+      tokenJson: activeInvite.token_json,
+    });
+    expect(screen.getByTestId("invite-qr-image")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,QRTEST==",
+    );
+    expect(screen.getByTestId("invite-qr-hint")).toHaveTextContent(
+      "You can re-open this QR code or copy the airlock link at any time from your Invites table.",
+    );
   });
 
   it("clamps max_uses to 4 for an ordinary member", async () => {
@@ -497,6 +662,7 @@ describe("InviteManager (RFC-002)", () => {
         "ok-fg",
         "overlay",
         "surface",
+        "surface-sunken",
         "text",
         "text-muted",
       ].sort(),

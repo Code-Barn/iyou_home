@@ -190,6 +190,9 @@ pub struct InviteRecord {
     pub nonce: String,
     /// Full signed token JSON — copyable and QR-encodable.
     pub token_json: String,
+    /// Base64url-encoded token JSON for deep link airlock URLs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_base64: Option<String>,
     pub issuer_did: String,
     pub tier: String,
     pub created_at: u64,
@@ -906,9 +909,11 @@ pub fn list_invite_records(conn: &Connection, now: u64) -> Result<Vec<InviteReco
         } else {
             "live".to_string()
         };
+        let token_base64 = Some(base64url_encode(token_json.as_bytes()));
         records.push(InviteRecord {
             nonce,
             token_json,
+            token_base64,
             issuer_did,
             tier,
             created_at: created_at.max(0) as u64,
@@ -1597,6 +1602,9 @@ mod tests {
         let records = list_invite_records(&conn, now).expect("list");
         assert_eq!(records.len(), 5);
         assert!(records.iter().all(|r| r.tier == "member" && r.status == "live"));
+        assert!(records.iter().all(|r| {
+            r.token_base64.as_deref() == Some(&base64url_encode(r.token_json.as_bytes()))
+        }));
 
         // The same ledger against an ordinary peer identity is still capped:
         // only the waiver is new, not the quota arithmetic.
