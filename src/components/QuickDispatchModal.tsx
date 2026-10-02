@@ -31,9 +31,50 @@ export const OUTBOX_RELAY_ENDPOINTS = [
   "ws://127.0.0.1:9003",
   "wss://relay.iyou.me",
   "wss://nos.lol",
+  "wss://relay.damus.io",
 ] as const;
 
 export const RELAY_ENDPOINTS = OUTBOX_RELAY_ENDPOINTS;
+
+export function extractHashtags(text: string): string[] {
+  const matches = text.matchAll(/(?:^|\s)#([a-zA-Z0-9_\-]+)/g);
+  const tags: string[] = [];
+  for (const match of matches) {
+    const slug = match[1].toLowerCase();
+    if (!tags.includes(slug)) {
+      tags.push(slug);
+    }
+  }
+  return tags;
+}
+
+export function generateUuid(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+export function mapFidelityTier(tier: string): "1" | "2" | "3" {
+  switch (tier.toLowerCase()) {
+    case "hardware":
+    case "sovereign":
+    case "3":
+      return "3";
+    case "institutional":
+    case "vetted":
+    case "2":
+      return "2";
+    case "social":
+    case "1":
+    default:
+      return "1";
+  }
+}
 
 async function computeSha256Hex(buffer: ArrayBuffer): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
@@ -124,18 +165,21 @@ export async function publishToRelay(relayUrl: string, event: any, timeoutMs = 3
 export function broadcastToRelays(
   event: any,
   customRelays?: string[],
+  timeoutMs = 2500,
 ): Promise<PromiseSettledResult<boolean>[]> {
-  // Always include both local enclave relay (:9003) and ecosystem mesh relay (relay.iyou.me)
+  // Always include local enclave relay (:9003), ecosystem mesh relay (relay.iyou.me), and upstream relays
   const relays = Array.from(
     new Set([
       "ws://127.0.0.1:9003",
       "wss://relay.iyou.me",
+      "wss://nos.lol",
+      "wss://relay.damus.io",
       ...(customRelays || RELAY_ENDPOINTS),
     ]),
   );
 
-  // Parallel dual-broadcast so delay or network timeout on one endpoint does not prevent delivery to the other
-  return Promise.allSettled(relays.map((url) => publishToRelay(url, event)));
+  // Parallel multi-relay broadcast so delay or network timeout on one endpoint does not prevent delivery to the others
+  return Promise.allSettled(relays.map((url) => publishToRelay(url, event, timeoutMs)));
 }
 
 export default function QuickDispatchModal({
@@ -215,17 +259,26 @@ export default function QuickDispatchModal({
     }
     setBusy(true);
     setErrorMessage(null);
-    setStatusMessage(null);
+    setStatusMessage("Signing with Primary Identity...");
 
     try {
+      const hashtags = extractHashtags(noteContent);
+      const tags: string[][] = [
+        ...hashtags.map((slug) => ["t", slug]),
+        ["client", "omni_social_v2"],
+      ];
+
       const signedEvent = await invoke<any>("dispatch_nostr_event", {
         kind: 1,
         content: noteContent.trim(),
-        tags: [],
+        tags,
         profileId: activeProfile?.profile_id,
       });
 
+      setStatusMessage("Signed by Primary Identity → Double-Broadcasting to Relays");
       broadcastToRelays(signedEvent);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
       const shortId = signedEvent?.id ? signedEvent.id.slice(0, 8) : "ok";
       setStatusMessage(`✅ Event published to mesh (ID: ${shortId}...)`);
       setNoteContent("");
@@ -248,29 +301,16 @@ export default function QuickDispatchModal({
     }
     setBusy(true);
     setErrorMessage(null);
-    setStatusMessage(null);
+    setStatusMessage("Signing with Primary Identity...");
 
     try {
       const fileBytes = await selectedFile.arrayBuffer();
       const sha256 = await computeSha256Hex(fileBytes);
 
-      // Upload raw binary to local Blossom Personal Data Store
-      try {
-        await fetch(`http://127.0.0.1:9002/${sha256}`, {
-          method: "PUT",
-          headers: {
-            "Content-Type": selectedFile.type || "application/octet-stream",
-          },
-          body: fileBytes,
-        });
-      } catch {
-        // Blossom local daemon might be offline; continue to sign event
-      }
-
       const tags = [
         ["url", `http://127.0.0.1:9002/${sha256}`],
-        ["x", sha256],
         ["m", selectedFile.type || "application/octet-stream"],
+        ["x", sha256],
         ["size", String(selectedFile.size)],
         ["alt", mediaAlt.trim() || selectedFile.name],
       ];
@@ -282,7 +322,24 @@ export default function QuickDispatchModal({
         profileId: activeProfile?.profile_id,
       });
 
+      setStatusMessage("Signed by Primary Identity → Uploading to Blossom...");
+      // Upload raw binary to local Blossom Personal Data Store
+      try {
+        await fetch(`http://127.0.0.1:9002/${sha256}`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": selectedFile.type || "application/octet-stream",
+          },
+          body: fileBytes,
+        });
+      } catch {
+        // Blossom local daemon might be offline; continue to broadcast event
+      }
+
+      setStatusMessage("Signed by Primary Identity → Uploading to Blossom → Double-Broadcasting to Relays");
       broadcastToRelays(signedEvent);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
       const shortId = signedEvent?.id ? signedEvent.id.slice(0, 8) : "ok";
       setStatusMessage(`✅ Media drop published to mesh (ID: ${shortId}...)`);
       setSelectedFile(null);
@@ -306,23 +363,24 @@ export default function QuickDispatchModal({
     }
     setBusy(true);
     setErrorMessage(null);
-    setStatusMessage(null);
+    setStatusMessage("Signing with Primary Identity...");
 
     try {
-      const pollId = `poll-${Date.now()}`;
+      const pollUuid = generateUuid();
       const expiresTs = Math.floor(Date.now() / 1000) + durationHours * 3600;
 
       const tags: string[][] = [
-        ["d", pollId],
+        ["d", pollUuid],
         ["title", pollTitle.trim()],
-        ["fidelity_min", minFidelity.toLowerCase()],
+        ["fidelity_min", mapFidelityTier(minFidelity)],
+        ...pollOptions
+          .map((opt) => opt.trim())
+          .filter(Boolean)
+          .map((opt) => ["option", opt]),
         ["expires", String(expiresTs)],
+        ["org", "iyou"],
         ["alt", `Civic Poll: ${pollTitle.trim()}`],
       ];
-
-      pollOptions.forEach((opt, idx) => {
-        tags.push(["option", String(idx + 1), opt.trim()]);
-      });
 
       const signedEvent = await invoke<any>("dispatch_nostr_event", {
         kind: 30023,
@@ -331,7 +389,24 @@ export default function QuickDispatchModal({
         profileId: activeProfile?.profile_id,
       });
 
+      setStatusMessage("Signed by Primary Identity → Seating in iyou_poly...");
+      // Direct Ingest Webhook: seat the poll immediately in iyou_poly's database
+      try {
+        await fetch("http://127.0.0.1:8002/api/nostr/ingest/", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(signedEvent),
+        });
+      } catch {
+        // Fail-safe: iyou_poly daemon may be offline or unreachable
+      }
+
+      setStatusMessage("Signed by Primary Identity → Double-Broadcasting to Relays");
       broadcastToRelays(signedEvent);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
       const shortId = signedEvent?.id ? signedEvent.id.slice(0, 8) : "ok";
       setStatusMessage(`✅ Civic Poll published to mesh (ID: ${shortId}...)`);
       setPollTitle("");
@@ -889,6 +964,7 @@ export default function QuickDispatchModal({
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "1rem" }}>
                 <div>
                   <label
+                    htmlFor="min-fidelity-select"
                     style={{
                       display: "block",
                       fontSize: "0.82rem",
@@ -900,6 +976,7 @@ export default function QuickDispatchModal({
                     Minimum Fidelity Tier
                   </label>
                   <select
+                    id="min-fidelity-select"
                     value={minFidelity}
                     onChange={(e) => setMinFidelity(e.target.value)}
                     style={{

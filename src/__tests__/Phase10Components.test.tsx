@@ -207,7 +207,7 @@ describe("QuickDispatchModal Phase 10", () => {
       expect(mockInvoke).toHaveBeenCalledWith("dispatch_nostr_event", expect.objectContaining({
         kind: 1,
         content: "Hello sovereign world!",
-        tags: [],
+        tags: [["client", "omni_social_v2"]],
       }));
       expect(screen.getByText(/Event published to mesh/i)).toBeInTheDocument();
     });
@@ -377,7 +377,7 @@ describe("Reactive Persona Switching in QuickDispatchModal", () => {
       expect(mockInvoke).toHaveBeenCalledWith("dispatch_nostr_event", {
         kind: 1,
         content: "Anonymous dispatch note",
-        tags: [],
+        tags: [["client", "omni_social_v2"]],
         profileId: "burner_matrix_2",
       });
     });
