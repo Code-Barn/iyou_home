@@ -946,10 +946,17 @@ publish_release_assets() {
 # Backticks are backslash-escaped: the heredoc delimiter is unquoted so the
 # shell variables expand, which would otherwise trigger command substitution.
 build_p2p_mirror_block() {
+  # NOTE: the Magnet URI line is intentionally NOT wrapped in markdown backticks.
+  # iyou_idp's download_modal.js scrapes this body with
+  #   /magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s"'<>]*/
+  # whose trailing character class excludes whitespace, quotes and angle brackets
+  # -- but NOT the backtick. Wrapping the magnet in `code` therefore makes the
+  # client copy a trailing "`" into the magnet, corrupting the ws= web-seed
+  # parameter. Leave the magnet bare.
   cat <<EOF
 
 ### P2P & Decentralized Mirrors
-- **Magnet URI**: \`${MAGNET_LINK:-[NOT_GENERATED]}\`
+- **Magnet URI**: ${MAGNET_LINK:-[NOT_GENERATED]}
 - **IPFS Gateway**: ${IPFS_GATEWAY_URL:-[NOT_GENERATED]}
 - **IPFS CID**: \`${IPFS_ROOT_CID:-[NOT_GENERATED]}\`
 
