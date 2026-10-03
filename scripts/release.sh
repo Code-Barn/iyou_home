@@ -1633,7 +1633,19 @@ if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
   notes="${RELEASE_NOTES:-Automated Sovereign Desktop Build}"
   # Embed the P2P mirror metadata directly in the body so the CORS-friendly
   # `releases/latest` endpoint exposes the magnet link to mirror clients.
-  notes="${notes}$(build_p2p_mirror_block)"
+  #
+  # Only when the mirror variables are actually populated. On this branch the
+  # BitTorrent/IPFS stages have NOT run yet -- generate_bittorrent_and_mirrors
+  # is invoked further down the publish path, not here -- so embedding
+  # unconditionally would bake [NOT_GENERATED] placeholders into a release body
+  # that has already been published. When the magnet is not ready, leave the
+  # body alone: sync_release_p2p_body() appends the real block later, from
+  # publish_release_assets(), once the mirrors have actually been generated.
+  if [[ -n "${MAGNET_LINK:-}" && "${MAGNET_LINK}" != "[NOT_GENERATED]" ]]; then
+    notes="${notes}$(build_p2p_mirror_block)"
+  else
+    log "Mirror metadata not generated yet — deferring body embed to publish_release_assets"
+  fi
   initial_assets=(
     "$RELEASE_DIR/iyou-home_${VERSION}_amd64.deb"
     "$RELEASE_DIR/iyou-home_${VERSION}_amd64.AppImage"
