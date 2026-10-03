@@ -929,6 +929,88 @@ publish_release_assets() {
   fi
   log "Uploading final verified assets to release v${VERSION} on ${REPO}"
   gh release upload "v${VERSION}" "${FINAL_RELEASE_ASSETS[@]}" --repo "$REPO" --clobber
+
+  # The body is the only channel mirror clients actually read, so keep it in
+  # sync on every publish, not just on first release creation.
+  sync_release_p2p_body
+}
+
+# Build the "P2P & Decentralized Mirrors" markdown block for the release body.
+#
+# This mirrors the MIRRORS.txt written by generate_bittorrent_and_mirrors(),
+# which is why a complete manifest can be embedded even when MIRRORS.txt is not
+# present in the payload tree at publish time. Every field uses a `:-` default
+# because `set -u` is active and the BitTorrent/IPFS stages are each allowed to
+# be skipped, leaving their variables unset.
+#
+# Backticks are backslash-escaped: the heredoc delimiter is unquoted so the
+# shell variables expand, which would otherwise trigger command substitution.
+build_p2p_mirror_block() {
+  cat <<EOF
+
+### P2P & Decentralized Mirrors
+- **Magnet URI**: \`${MAGNET_LINK:-[NOT_GENERATED]}\`
+- **IPFS Gateway**: ${IPFS_GATEWAY_URL:-[NOT_GENERATED]}
+- **IPFS CID**: \`${IPFS_ROOT_CID:-[NOT_GENERATED]}\`
+
+<details><summary>Full P2P manifest (MIRRORS.txt)</summary>
+
+\`\`\`
+RELEASE_VERSION=v${VERSION}
+MAGNET_LINK=${MAGNET_LINK:-[NOT_GENERATED]}
+TORRENT_FILE=${TORRENT_FILE:-iyou-home_${VERSION}.torrent}
+IPFS_ROOT_CID=${IPFS_ROOT_CID:-[NOT_GENERATED]}
+IPFS_GATEWAY_URL=${IPFS_GATEWAY_URL:-[NOT_GENERATED]}
+IPFS_ALT_GATEWAY_URL=${IPFS_ALT_GATEWAY_URL:-}
+IPFS_NATIVE_URI=${IPFS_NATIVE_URI:-}
+WEB_SEED_URL=${WEB_SEED_URL:-}
+\`\`\`
+
+</details>
+EOF
+}
+
+# Ensure the GitHub Release body exposes the P2P mirror metadata.
+#
+# Why the body and not just an asset: download_modal.js in the web satellites
+# reads `release.body` from GitHub's CORS-friendly `releases/latest` endpoint
+# and parses the magnet link out of it. A magnet published only as a
+# MIRRORS.txt/torrent *asset* is invisible to that client, so `releases/latest`
+# would advertise no way to reach the P2P mirrors at all.
+#
+# This is required on the "release already exists" path, which is the normal
+# case: .github/workflows/release.yml uses softprops/action-gh-release@v2 on tag
+# push, so the release (and its auto-generated body) is created by CI before this
+# script runs. Without the sync, the magnet would essentially never be embedded.
+#
+# Appends to the existing body rather than replacing it, so maintainer-written
+# release notes survive, and is idempotent so re-runs never duplicate the block.
+sync_release_p2p_body() {
+  local tag="v${VERSION}"
+  local existing_body magnet block
+
+  magnet="${MAGNET_LINK:-}"
+  if [[ -z "${magnet}" || "${magnet}" == "[NOT_GENERATED]" ]]; then
+    warn "MAGNET_LINK is unavailable — cannot embed P2P metadata in ${tag} body"
+    return 0
+  fi
+
+  existing_body="$(gh release view "${tag}" --repo "${REPO}" --json body --jq '.body' 2>/dev/null || true)"
+
+  if grep -qF -- "${magnet}" <<<"${existing_body}"; then
+    log "P2P mirror metadata already present in ${tag} body — nothing to do"
+    return 0
+  fi
+
+  block="$(build_p2p_mirror_block)"
+  log "Embedding P2P & decentralized mirror metadata into ${tag} release body..."
+  if [[ -n "${existing_body}" ]]; then
+    gh release edit "${tag}" --repo "${REPO}" --notes "${existing_body}${block}" \
+      || warn "Failed to update ${tag} release body — magnet link absent from releases/latest"
+  else
+    gh release edit "${tag}" --repo "${REPO}" --notes "${block}" \
+      || warn "Failed to set ${tag} release body — magnet link absent from releases/latest"
+  fi
 }
 
 # Automate BitTorrent seeding on QNAP NAS
@@ -1549,6 +1631,9 @@ if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
   git push "$REMOTE" "refs/tags/v${VERSION}:refs/tags/v${VERSION}" || log "tag already present on remote"
 
   notes="${RELEASE_NOTES:-Automated Sovereign Desktop Build}"
+  # Embed the P2P mirror metadata directly in the body so the CORS-friendly
+  # `releases/latest` endpoint exposes the magnet link to mirror clients.
+  notes="${notes}$(build_p2p_mirror_block)"
   initial_assets=(
     "$RELEASE_DIR/iyou-home_${VERSION}_amd64.deb"
     "$RELEASE_DIR/iyou-home_${VERSION}_amd64.AppImage"
@@ -1563,8 +1648,13 @@ if [[ "${SKIP_UPLOAD:-0}" != "1" ]]; then
   if ! gh release view "v${VERSION}" --repo "$REPO" >/dev/null 2>&1; then
     log "Creating initial release v${VERSION} with available macOS & Linux assets..."
     gh release create "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --title "iyou_home v${VERSION}" --notes "$notes"
-  elif (( ${#initial_args[@]} > 0 )); then
-    gh release upload "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --clobber
+  else
+    if (( ${#initial_args[@]} > 0 )); then
+      gh release upload "v${VERSION}" "${initial_args[@]}" --repo "$REPO" --clobber
+    fi
+    # CI normally creates the release first (softprops/action-gh-release@v2), so
+    # the `--notes` above is skipped and the existing body carries no magnet.
+    sync_release_p2p_body
   fi
 fi
 
