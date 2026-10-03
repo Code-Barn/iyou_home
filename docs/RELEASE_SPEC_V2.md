@@ -531,7 +531,7 @@ Validated `SHA256SUMS_LINUX.txt` (clean native build on `dc13`, `sha256sum -c` p
 - **Source tree:** `dc13:~/build-smoke/release-artifacts/` (mirrored to `release-artifacts/SHA256SUMS_LINUX.txt`).
 - **Toolchain:** rustc/cargo 1.98.0, node v20.19.2, patchelf 0.18.0.
 - **Result:** `npm ci` clean, `npm run tauri build` exit 0; canonical matrix `iyou-home_0.2.0_amd64.deb` + `iyou-home_0.2.0_amd64.AppImage` confirmed.
-- **Published (2026-09-13):** Final v0.2.0 assets — the above Linux bundles plus `iyou-home_0.2.0_x64.dmg` (`d98669ecc515a47115aab961b71296456bddfc6c7ac245e6f657b9892472d34c`) — uploaded to the GitHub Release `v0.2.0` via `scripts/release.sh`; `release-artifacts/SHA256SUMS.txt` is the consolidated manifest for all uploaded binaries.
+- **Published (2026-09-13):** Final v0.2.0 assets — the above Linux bundles plus `iyou-home_0.2.0_x64.dmg` (`d98669ecc515a47115aab961b71296456bddfc6c7ac245e6f657b9892472d34c`) — uploaded to the GitHub Release `v0.2.0` via `scripts/release.sh`; the consolidated manifest covering all uploaded binaries is published as the `SHA256SUMS.txt` **release asset**. The manifest is a gitignored build artifact (nothing under `release-artifacts/` is tracked); the release asset — also carried in the IPFS directory and BitTorrent payload — is the canonical copy.
 
 ### 10.2 Local macOS Multi-Architecture & Universal DMGs
 - **Universal & Native macOS Targets (`package.json`):**

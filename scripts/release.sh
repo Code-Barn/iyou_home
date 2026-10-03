@@ -724,13 +724,34 @@ generate_bittorrent_and_mirrors() {
   TORRENT_FILE="iyou-home_${VERSION}.torrent"
   TORRENT_PATH="$RELEASE_DIR/$TORRENT_FILE"
 
+  # Reproducible-build epoch for the torrent metainfo.
+  #
+  # The metainfo's "creation date" sits at the TOP level of the torrent dict,
+  # outside the "info" dict, so it does not affect the BTIH (which is
+  # sha1(bencode(info_dict)) and the info dict carries no timestamp). It DOES
+  # change the .torrent file bytes on every run, which is enough to change any
+  # CID computed over a payload that contains the .torrent.
+  #
+  # Pin it to the release commit's own timestamp so repeated runs over an
+  # unchanged commit produce byte-identical torrents. SOURCE_DATE_EPOCH wins if
+  # the caller set it, per the reproducible-builds convention.
+  local torrent_epoch="${SOURCE_DATE_EPOCH:-}"
+  if [[ -z "$torrent_epoch" ]]; then
+    torrent_epoch="$(git log -1 --format=%ct 2>/dev/null || true)"
+  fi
+  if [[ ! "$torrent_epoch" =~ ^[0-9]+$ ]]; then
+    # Not a git checkout, or git unavailable: fall back to a fixed constant
+    # (2024-10-01T00:00:00Z) so the value is at least stable within a run.
+    torrent_epoch=1727800000
+    warn "Could not determine a commit epoch; defaulting creation date to ${torrent_epoch}"
+  fi
+
   if [[ -n "$PYTHON_BIN" ]]; then
     log "Generating BitTorrent metainfo using $PYTHON_BIN (bencode engine)..."
-    eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" "$REPO" << 'PYEOF'
+    eval "$($PYTHON_BIN - "$RELEASE_DIR" "$VERSION" "$REPO" "$torrent_epoch" << 'PYEOF'
 import os
 import sys
 import hashlib
-import time
 import urllib.parse
 
 def bencode(val):
@@ -759,6 +780,12 @@ def bencode(val):
 release_dir = sys.argv[1]
 version = sys.argv[2]
 repo = sys.argv[3] if len(sys.argv) > 3 else "Code-Barn/iyou_home"
+# creation-date epoch, supplied by the caller (SOURCE_DATE_EPOCH or the git
+# commit time) so the metainfo is byte-reproducible across runs.
+try:
+    creation_epoch = int(sys.argv[4])
+except (IndexError, ValueError):
+    creation_epoch = 1727800000
 torrent_name = f"iyou-home_{version}.torrent"
 torrent_path = os.path.join(release_dir, torrent_name)
 web_seed_url = f"https://github.com/{repo}/releases/download/v{version}/"
@@ -823,7 +850,7 @@ torrent_dict = {
     "announce-list": [[tr] for tr in trackers],
     "comment": f"iyou_home v{version} sovereign release",
     "created by": "iyou_home release automation",
-    "creation date": int(time.time()),
+    "creation date": creation_epoch,
     "info": info_dict,
     "url-list": [web_seed_url],
 }
@@ -855,36 +882,95 @@ PYEOF
   fi
 
   # IPFS Root CID & Gateways
+  #
+  # There is exactly ONE definition of the IPFS payload. The previous
+  # implementation had two divergent branches:
+  #
+  #   * a local branch running `ipfs add "$RELEASE_DIR"` with NO excludes, which
+  #     hashed the directory by name and included MIRRORS.txt (a file that
+  #     embeds the CID itself, i.e. self-referential);
+  #   * a remote branch that tar-streamed the directory CONTENTS with excludes.
+  #
+  # Both are gone. The same filtered tar is now built once and streamed to
+  # whichever node is available, so the same commit yields the same CID
+  # regardless of whether the operator has the ipfs CLI installed locally.
+  #
+  # Determinism rules for the exclusion list:
+  #   *.torrent   the metainfo embeds a creation timestamp, so its bytes differ
+  #               on every run for byte-identical payloads (the BTIH is stable
+  #               because it covers only the info dict, but the CID covers the
+  #               whole file).
+  #   MIRRORS.txt embeds the CID itself, so including it is self-referential.
+  #   .DS_Store   macOS metadata noise.
   IPFS_ROOT_CID=""
-  if command -v ipfs >/dev/null 2>&1; then
-    log "Computing deterministic IPFS root CID via local ipfs CLI..."
-    IPFS_ROOT_CID="$(ipfs add -r -Q --only-hash "$RELEASE_DIR" 2>/dev/null || true)"
-  elif ssh -o BatchMode=yes -o ConnectTimeout=5 dc13 'export PATH="$PATH:/usr/local/bin"; which ipfs' >/dev/null 2>&1; then
-    log "Computing deterministic IPFS root CID via runner dc13..."
-    local tar_flags=(--exclude='.DS_Store' --exclude='MIRRORS.txt')
-    if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
-      tar_flags+=(--no-xattrs)
-    fi
-    IPFS_ROOT_CID="$(tar "${tar_flags[@]}" -czf - -C "$RELEASE_DIR" . | ssh -o BatchMode=yes dc13 '
-      export PATH="$PATH:/usr/local/bin"
-      TMPDIR=$(mktemp -d)
-      tar -xzf - -C "$TMPDIR"
-      ipfs add -r -Q --only-hash "$TMPDIR" 2>/dev/null || true
-      rm -rf "$TMPDIR"
-    ')"
+  IPFS_PINNED="no"
+  local ipfs_tar_flags=(--exclude='.DS_Store' --exclude='MIRRORS.txt' --exclude='*.torrent')
+  if tar --version 2>/dev/null | head -n1 | grep -qi bsdtar; then
+    ipfs_tar_flags+=(--no-xattrs)
   fi
 
-  if [[ -n "$IPFS_ROOT_CID" && "$IPFS_ROOT_CID" =~ ^Qm[1-9A-HJ-NP-Za-km-z]{44}|^bafy[a-z0-9]+ ]]; then
+  # Add AND pin. `ipfs add` without --only-hash stores the blocks on the node
+  # and pins the resulting root, which is what makes the advertised gateway URL
+  # actually resolvable. The old code only ever passed --only-hash, which
+  # computes a CID but publishes nothing, so the release body advertised an
+  # IPFS mirror that no gateway could serve.
+  #
+  # If storing/pinning fails we still report a CID (hash-only) but flag it
+  # unpinned, because an unpinned CID is not gateway-resolvable and must not be
+  # presented as if it were.
+  #
+  # NOTE: this snippet is transported as a single-quoted argument, so it must
+  # not contain single quotes.
+  local ipfs_import='
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:$PATH"
+WORK=$(mktemp -d)
+tar -xzf - -C "$WORK"
+if CID=$(ipfs add -r --pin=true -Q "$WORK" 2>/dev/null) && [ -n "$CID" ]; then
+  PINNED=yes
+else
+  CID=$(ipfs add -r -Q --only-hash "$WORK" 2>/dev/null || true)
+  PINNED=no
+fi
+rm -rf "$WORK"
+printf "%s\n" "$CID"
+printf "__IPFS_PINNED__%s\n" "$PINNED"
+'
+
+  local ipfs_out=""
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 dc13 'export PATH="$PATH:/usr/local/bin"; command -v ipfs' >/dev/null 2>&1; then
+    log "Importing payload to IPFS via runner dc13 (adds + pins)..."
+    ipfs_out="$(tar "${ipfs_tar_flags[@]}" -czf - -C "$RELEASE_DIR" . | ssh -o BatchMode=yes dc13 "sh -c '$ipfs_import'")"
+  elif command -v ipfs >/dev/null 2>&1; then
+    log "Importing payload to local IPFS node (adds + pins)..."
+    ipfs_out="$(tar "${ipfs_tar_flags[@]}" -czf - -C "$RELEASE_DIR" . | sh -c "$ipfs_import")"
+  fi
+
+  if [[ -n "$ipfs_out" ]]; then
+    IPFS_ROOT_CID="$(printf '%s\n' "$ipfs_out" | head -n1)"
+    case "$(printf '%s\n' "$ipfs_out" | tail -n1)" in
+      __IPFS_PINNED__yes) IPFS_PINNED="yes" ;;
+      *)                  IPFS_PINNED="no" ;;
+    esac
+  fi
+
+  if [[ -n "$IPFS_ROOT_CID" && "$IPFS_ROOT_CID" =~ ^(Qm[1-9A-HJ-NP-Za-km-z]{44}|bafy[a-z0-9]+)$ ]]; then
     IPFS_GATEWAY_URL="https://ipfs.io/ipfs/${IPFS_ROOT_CID}/"
     IPFS_ALT_GATEWAY_URL="https://dweb.link/ipfs/${IPFS_ROOT_CID}/"
     IPFS_NATIVE_URI="ipfs://${IPFS_ROOT_CID}/"
     log "IPFS Root CID: ${IPFS_ROOT_CID}"
     log "IPFS Gateway URL: ${IPFS_GATEWAY_URL}"
+    if [[ "$IPFS_PINNED" == "yes" ]]; then
+      log "IPFS pin status: pinned on node (gateway-resolvable)"
+    else
+      warn "IPFS CID computed but NOT pinned/stored on the node; gateway URL will not resolve"
+      warn "until an out-of-band pin of ${IPFS_ROOT_CID} completes."
+    fi
   else
     IPFS_ROOT_CID="[PENDING_CLUSTER_PIN]"
     IPFS_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
     IPFS_ALT_GATEWAY_URL="[PENDING_CLUSTER_PIN]"
     IPFS_NATIVE_URI="[PENDING_CLUSTER_PIN]"
+    IPFS_PINNED="no"
     log "IPFS CLI not available locally or on runner dc13; marked [PENDING_CLUSTER_PIN]"
   fi
 
@@ -898,6 +984,7 @@ IPFS_ROOT_CID=${IPFS_ROOT_CID}
 IPFS_GATEWAY_URL=${IPFS_GATEWAY_URL}
 IPFS_ALT_GATEWAY_URL=${IPFS_ALT_GATEWAY_URL}
 IPFS_NATIVE_URI=${IPFS_NATIVE_URI}
+IPFS_PINNED=${IPFS_PINNED:-no}
 EOF
 
   log "MIRRORS.txt:"
@@ -1474,7 +1561,10 @@ case "$BUMP_ARG" in
       ' "$NEW_VERSION"
 
       # 4. Update src-tauri/Cargo.lock
-      cargo check --manifest-path src-tauri/Cargo.toml --quiet
+      # Not --quiet: a cold Tauri dependency build takes minutes, and --quiet
+      # prints nothing at all, which is indistinguishable from a hung script.
+      # --message-format short keeps output to one line per crate.
+      cargo check --manifest-path src-tauri/Cargo.toml --message-format short
 
       # 5. Commit the 5 manifests
       git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock

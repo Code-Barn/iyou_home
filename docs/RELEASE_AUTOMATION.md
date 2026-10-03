@@ -136,8 +136,13 @@ What it does, in order:
    downloads the freshly built `iyou-home_${VERSION}_x64-setup.exe` directly into the release
    payload folder, and validates that its commit matches the release tag.
 7. **Checksums (`generate_checksums`)** — compiled *after* the Windows `.exe` is retrieved.
-   Writes the canonical `release-artifacts/SHA256SUMS.txt` with verified SHA-256 digests
+   Writes `release-artifacts/SHA256SUMS.txt` with verified SHA-256 digests
    across all 4 primary platforms (macOS DMG, Windows EXE, Debian DEB, AppImage) plus RPM.
+   This manifest is a **build artifact, not a tracked source file**: `release-artifacts/` is
+   gitignored and nothing under it is committed. The canonical, authoritative copy is the
+   `SHA256SUMS.txt` **release asset** attached to the GitHub Release, which is also carried
+   in the IPFS directory and the BitTorrent payload for the same version. Always verify
+   against the downloaded release asset, never against a working-tree path.
 8. **Peer-to-Peer Mirrors & BEP 19 Web Seeding (`generate_bittorrent_and_mirrors`)** — packages all installer
    binaries into `release-artifacts/iyou-home_${VERSION}.torrent` embedded with public trackers
    (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.demonii.com:1337/announce`,
@@ -202,10 +207,15 @@ release-artifacts/
 ├── iyou-home_<V>_x64-setup.exe      # Windows NSIS standalone installer
 ├── iyou-home_<V>.torrent            # BitTorrent metainfo bundle
 ├── MIRRORS.txt                      # P2P mirrors manifest (magnet & IPFS)
-├── SHA256SUMS.txt                   # Local/Linux manifest
+├── SHA256SUMS.txt                   # Consolidated manifest (all platforms)
 ├── SHA256SUMS_LINUX.txt             # Linux CI manifest
 └── SHA256SUMS_WINDOWS.txt           # Windows CI manifest
 ```
+
+All three manifests above are **gitignored build artifacts**. They are not tracked in the
+repository; their canonical distribution is as **release assets** on the GitHub Release,
+mirrored into the IPFS directory and the BitTorrent payload for that version. Verify
+against the downloaded asset.
 
 Verify a download against the published manifest:
 
