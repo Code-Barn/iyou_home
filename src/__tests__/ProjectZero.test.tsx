@@ -78,6 +78,53 @@ const mockContacts: PeerContact[] = [
   },
 ];
 
+// EmailOwnershipCredentials (iyou_idp) stored against the signing persona.
+// Two categories so trust-tier defaulting is observable in assertions.
+const mockEmailCredentials = [
+  {
+    vc_id: "vc-email-personal",
+    issuer_did: "did:web:iyou.me",
+    subject_did: "did:key:z6MkPrimary11111111111111111111111111",
+    credential_type: "EmailOwnershipCredential",
+    fidelity_score: null,
+    expiration_date: null,
+    raw_payload: JSON.stringify({
+      "@context": ["https://www.w3.org/2018/credentials/v1"],
+      id: "urn:uuid:email-personal",
+      type: ["VerifiableCredential", "EmailOwnershipCredential"],
+      issuer: "did:web:iyou.me",
+      credentialSubject: {
+        id: "did:key:z6MkPrimary11111111111111111111111111",
+        email: "alice@personal.example",
+        email_type: "personal",
+        verified_at: "2026-10-02T20:30:00Z",
+      },
+      proof: { type: "RsaSignature2018" },
+    }),
+  },
+  {
+    vc_id: "vc-email-work",
+    issuer_did: "did:web:iyou.me",
+    subject_did: "did:key:z6MkPrimary11111111111111111111111111",
+    credential_type: "EmailOwnershipCredential",
+    fidelity_score: null,
+    expiration_date: null,
+    raw_payload: JSON.stringify({
+      "@context": ["https://www.w3.org/2018/credentials/v1"],
+      id: "urn:uuid:email-work",
+      type: ["VerifiableCredential", "EmailOwnershipCredential"],
+      issuer: "did:web:iyou.me",
+      credentialSubject: {
+        id: "did:key:z6MkPrimary11111111111111111111111111",
+        email: "alice@work.example",
+        email_type: "work",
+        verified_at: "2026-10-02T20:31:00Z",
+      },
+      proof: { type: "RsaSignature2018" },
+    }),
+  },
+];
+
 const mockInvoke = vi.hoisted(() =>
   vi.fn((cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
@@ -133,6 +180,8 @@ const mockInvoke = vi.hoisted(() =>
           created_at: 1000,
           updated_at: 1000,
         });
+      case "get_credentials":
+        return Promise.resolve(mockEmailCredentials);
       case "list_roles":
         return Promise.resolve([]);
       case "list_businesses":
@@ -336,5 +385,254 @@ describe("ProjectZero Suite", () => {
         screen.getByText("✓ Cryptographic Verification Succeeded!"),
       ).toBeInTheDocument();
     });
+  });
+
+  // ---------- Selective disclosure: email claims mapped to contact trust ----------
+
+  /** Open ProjectZero, switch to Contact Enclave, and open the Disclosure modal. */
+  async function openDisclosureModal() {
+    await act(async () => {
+      render(<ProjectZero />);
+    });
+    const contactTabBtn = await screen.findByRole("button", {
+      name: /Contact Enclave/i,
+    });
+    await act(async () => {
+      fireEvent.click(contactTabBtn);
+    });
+    const disclosureBtn = await screen.findByRole("button", {
+      name: /Selective Disclosure Cards/i,
+    });
+    await act(async () => {
+      fireEvent.click(disclosureBtn);
+    });
+    expect(
+      screen.getByRole("heading", { name: "Selective Disclosure Cards" }),
+    ).toBeInTheDocument();
+    // Both email credentials must be loaded before defaults are asserted.
+    await waitFor(() => {
+      expect(screen.getAllByTestId("email-credential-option")).toHaveLength(2);
+    });
+  }
+
+  /** Point the target-peer field at a known contact so its trust tier applies. */
+  async function targetContact(peerId: string) {
+    const input = screen.getByPlaceholderText(/did:key:z6MkTargetPeer/i);
+    await act(async () => {
+      fireEvent.change(input, { target: { value: peerId } });
+    });
+  }
+
+  function emailOptionFor(email: string): HTMLElement {
+    return screen
+      .getAllByTestId("email-credential-option")
+      .find((el) => el.textContent?.includes(email))!;
+  }
+
+  it("auto-selects personal email only for a Level0 Inner Circle contact", async () => {
+    await openDisclosureModal();
+    await targetContact("did:key:z6MkPeerAlice000000000000000000000000");
+
+    await waitFor(() => {
+      expect(
+        emailOptionFor("alice@personal.example").querySelector("input"),
+      ).toBeChecked();
+    });
+    expect(
+      emailOptionFor("alice@work.example").querySelector("input"),
+    ).not.toBeChecked();
+  });
+
+  it("auto-selects work email only for a Level0_5 Trusted Alliance contact", async () => {
+    await openDisclosureModal();
+    await targetContact("did:key:z6MkPeerBob111111111111111111111111");
+
+    await waitFor(() => {
+      expect(
+        emailOptionFor("alice@work.example").querySelector("input"),
+      ).toBeChecked();
+    });
+    expect(
+      emailOptionFor("alice@personal.example").querySelector("input"),
+    ).not.toBeChecked();
+  });
+
+  it("selects no email credentials for a Level1 Peer contact", async () => {
+    await openDisclosureModal();
+    await targetContact("did:key:z6MkPeerCharlie22222222222222222222");
+
+    await waitFor(() => {
+      expect(
+        emailOptionFor("alice@personal.example").querySelector("input"),
+      ).not.toBeChecked();
+    });
+    expect(
+      emailOptionFor("alice@work.example").querySelector("input"),
+    ).not.toBeChecked();
+  });
+
+  it("attaches only the selected email claims to the signed disclosure card", async () => {
+    await openDisclosureModal();
+    await targetContact("did:key:z6MkPeerAlice000000000000000000000000");
+    await waitFor(() => {
+      expect(
+        emailOptionFor("alice@personal.example").querySelector("input"),
+      ).toBeChecked();
+    });
+
+    mockInvoke.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Generate Signed Card" }));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "generate_disclosure_card",
+        expect.objectContaining({
+          disclosedEmailCredentials: [
+            expect.objectContaining({
+              vc_id: "vc-email-personal",
+              email: "alice@personal.example",
+              email_type: "personal",
+            }),
+          ],
+        }),
+      );
+    });
+  });
+
+  it("honors manual toggling off a trust-tier default before signing", async () => {
+    await openDisclosureModal();
+    await targetContact("did:key:z6MkPeerAlice000000000000000000000000");
+    await waitFor(() => {
+      expect(
+        emailOptionFor("alice@personal.example").querySelector("input"),
+      ).toBeChecked();
+    });
+
+    // Deselect the defaulted personal claim; nothing should be disclosed.
+    await act(async () => {
+      fireEvent.click(
+        emailOptionFor("alice@personal.example").querySelector("input")!,
+      );
+    });
+
+    mockInvoke.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Generate Signed Card" }));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "generate_disclosure_card",
+        expect.objectContaining({ disclosedEmailCredentials: [] }),
+      );
+    });
+  });
+
+  it("allows manually adding a work email claim for a Level1 peer", async () => {
+    await openDisclosureModal();
+    await targetContact("did:key:z6MkPeerCharlie22222222222222222222");
+    await waitFor(() => {
+      expect(
+        emailOptionFor("alice@work.example").querySelector("input"),
+      ).not.toBeChecked();
+    });
+
+    // Opt-in override: a peer may still receive a work claim if the user ticks it.
+    await act(async () => {
+      fireEvent.click(
+        emailOptionFor("alice@work.example").querySelector("input")!,
+      );
+    });
+
+    mockInvoke.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Generate Signed Card" }));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "generate_disclosure_card",
+        expect.objectContaining({
+          disclosedEmailCredentials: [
+            expect.objectContaining({ email_type: "work" }),
+          ],
+        }),
+      );
+    });
+  });
+
+  it("discloses no email when no target contact is selected", async () => {
+    await openDisclosureModal();
+
+    mockInvoke.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Generate Signed Card" }));
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "generate_disclosure_card",
+        expect.objectContaining({ disclosedEmailCredentials: [] }),
+      );
+    });
+  });
+
+  it("still applies tier defaults when the contact is chosen before credentials resolve", async () => {
+    // Regression guard: the credential fetch is async. If the user selects the
+    // contact while `get_credentials` is still in flight, the tier default must
+    // still be applied once the credentials land. Keying the defaulting effect
+    // on the contact alone used to latch the empty selection here.
+    let resolveCreds!: (v: unknown[]) => void;
+    const deferredCreds = new Promise<unknown[]>((res) => {
+      resolveCreds = res;
+    });
+    const baseImpl = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_credentials") return deferredCreds;
+      return baseImpl(cmd, args);
+    });
+
+    try {
+      await act(async () => {
+        render(<ProjectZero />);
+      });
+      const contactTabBtn = await screen.findByRole("button", {
+        name: /Contact Enclave/i,
+      });
+      await act(async () => {
+        fireEvent.click(contactTabBtn);
+      });
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: /Selective Disclosure Cards/i }),
+        );
+      });
+
+      // Select the Level0 contact while credentials are still unresolved.
+      await act(async () => {
+        fireEvent.change(screen.getByPlaceholderText(/did:key:z6MkTargetPeer/i), {
+          target: { value: "did:key:z6MkPeerAlice000000000000000000000000" },
+        });
+      });
+
+      // Now let the credentials arrive.
+      await act(async () => {
+        resolveCreds(mockEmailCredentials);
+        await deferredCreds;
+      });
+
+      await waitFor(() => {
+        expect(
+          emailOptionFor("alice@personal.example").querySelector("input"),
+        ).toBeChecked();
+      });
+      expect(
+        emailOptionFor("alice@work.example").querySelector("input"),
+      ).not.toBeChecked();
+    } finally {
+      mockInvoke.mockImplementation(baseImpl);
+    }
   });
 });

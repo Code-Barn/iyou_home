@@ -15,7 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Profile, PeerContact } from "../../lib/types";
@@ -26,6 +26,103 @@ interface DisclosureModalProps {
   profiles: Profile[];
   contacts: PeerContact[];
   onRefresh: () => void | Promise<void>;
+}
+
+/**
+ * Email categories disclosed by default for each trust tier.
+ *
+ * `Level1` peers are omitted by default: a disclosure card is a durable signed
+ * artifact that a peer can retain and correlate, so email is never volunteered
+ * to an unvetted peer without the user explicitly opting in per-credential.
+ */
+const TIER_DEFAULT_EMAIL_CATEGORIES: Record<string, string[]> = {
+  level0: ["personal"],
+  // Normalized `Level0_5` / `level0_5` collapses to `level05` (the underscore is
+  // stripped), which is why this key is not spelled `level0_5`.
+  level05: ["work"],
+  level1: [],
+};
+
+/**
+ * Normalize a trust tier to a stable comparison key.
+ *
+ * Wire values are dual-cased across the codebase: the Rust `TrustLevel` enum
+ * serializes `Level0` / `Level0_5` / `Level1`, while stored contacts and older
+ * fixtures use `level0` / `level0_5` / `level1`. Lowercasing and stripping
+ * non-alphanumerics collapses `Level0_5` and `level0_5` to the same key.
+ */
+function normalizeTrustLevel(trustLevel: string | undefined | null): string {
+  return String(trustLevel || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/** Categories defaulted for a contact's trust tier; unknown tiers disclose nothing. */
+export function defaultEmailCategoriesForTrustLevel(
+  trustLevel: string | undefined | null,
+): string[] {
+  return TIER_DEFAULT_EMAIL_CATEGORIES[normalizeTrustLevel(trustLevel)] ?? [];
+}
+
+interface EmailOwnershipCredentialOption {
+  vc_id: string;
+  email: string | null;
+  email_type: string;
+  verified_at: string | null;
+}
+
+/**
+ * Project EmailOwnershipCredential rows into selectable options.
+ *
+ * Only credentials whose `type` array includes `EmailOwnershipCredential` are
+ * returned; `email_type` and `verified_at` are read from `raw_payload` because
+ * the vault's credential row carries no dedicated column for them. Rows with an
+ * unparseable payload are skipped rather than surfaced as blank rows.
+ */
+export function toEmailOwnershipOptions(
+  creds: Array<Record<string, unknown>>,
+): EmailOwnershipCredentialOption[] {
+  const out: EmailOwnershipCredentialOption[] = [];
+  for (const cred of creds || []) {
+    const rawPayload = typeof cred?.raw_payload === "string" ? cred.raw_payload : "";
+    let parsed: Record<string, any> | null = null;
+    try {
+      parsed = rawPayload ? JSON.parse(rawPayload) : null;
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) continue;
+
+    const rawTypes: unknown[] = Array.isArray(parsed.type)
+      ? parsed.type
+      : typeof parsed.type === "string"
+        ? [parsed.type]
+        : [];
+
+    const isEmailOwnership =
+      cred?.credential_type === "EmailOwnershipCredential" ||
+      rawTypes.includes("EmailOwnershipCredential");
+    if (!isEmailOwnership) continue;
+
+    const subject =
+      parsed.credentialSubject && typeof parsed.credentialSubject === "object"
+        ? parsed.credentialSubject
+        : {};
+
+    out.push({
+      vc_id: String(cred.vc_id ?? ""),
+      email: typeof subject.email === "string" && subject.email ? subject.email : null,
+      email_type:
+        typeof subject.email_type === "string" && subject.email_type
+          ? subject.email_type.toLowerCase()
+          : "unknown",
+      verified_at:
+        typeof subject.verified_at === "string" && subject.verified_at
+          ? subject.verified_at
+          : null,
+    });
+  }
+  return out;
 }
 
 export default function DisclosureModal({
@@ -53,6 +150,71 @@ export default function DisclosureModal({
   const [isGenerating, setIsGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [copySuccess, setCopySuccess] = useState(false);
+
+  // EmailOwnershipCredential disclosure state
+  const [emailOptions, setEmailOptions] = useState<EmailOwnershipCredentialOption[]>([]);
+  const [selectedEmailVcIds, setSelectedEmailVcIds] = useState<string[]>([]);
+
+  // Resolve the target contact from the free-text DID field so email defaults
+  // follow the *contact's* trust tier rather than the cosmetic tier dropdown.
+  const targetContact = contacts.find(
+    (c) => c.peer_id === targetPeerDid.trim(),
+  );
+  const targetTrustLevel = targetContact?.trust_level ?? null;
+
+  // Load EmailOwnershipCredentials for the signing persona whenever it changes.
+  useEffect(() => {
+    let cancelled = false;
+    if (!signingProfileId) {
+      setEmailOptions([]);
+      return;
+    }
+    const load = async () => {
+      try {
+        const creds = await invoke<Array<Record<string, unknown>>>("get_credentials", {
+          profileId: signingProfileId,
+        });
+        if (!cancelled) setEmailOptions(toEmailOwnershipOptions(creds || []));
+      } catch {
+        // A missing/failed credential read must not block card generation;
+        // the card simply discloses no email claims.
+        if (!cancelled) setEmailOptions([]);
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [signingProfileId]);
+
+  /**
+   * Apply trust-tier defaults for the current disclosure context.
+   *
+   * The context is the pair (target contact, available credential set). Keying on
+   * both — rather than on the contact alone — matters because the credential
+   * fetch is async: if the user picks a contact *before* `get_credentials`
+   * resolves, keying on the contact alone would latch the empty selection and
+   * permanently skip the tier default once the credentials arrived.
+   *
+   * Re-applying is skipped while the context is unchanged, so manual checkbox
+   * toggles within one contact survive re-renders and credential refetches.
+   */
+  const emailContextKey = `${targetContact?.peer_id ?? "none"}::${emailOptions
+    .map((o) => o.vc_id)
+    .join(",")}`;
+  const lastEmailContextRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (lastEmailContextRef.current === emailContextKey) return;
+    lastEmailContextRef.current = emailContextKey;
+
+    // A new context supersedes any manual overrides from the previous one.
+    const defaults = defaultEmailCategoriesForTrustLevel(targetTrustLevel);
+    setSelectedEmailVcIds(
+      emailOptions.filter((o) => defaults.includes(o.email_type)).map((o) => o.vc_id),
+    );
+  }, [isOpen, emailContextKey, emailOptions, targetTrustLevel]);
 
   // Tab 2 (Import) State
   const [importJsonText, setImportJsonText] = useState("");
@@ -97,6 +259,12 @@ export default function DisclosureModal({
     );
   };
 
+  const handleToggleEmailCredential = (vcId: string) => {
+    setSelectedEmailVcIds((prev) =>
+      prev.includes(vcId) ? prev.filter((id) => id !== vcId) : [...prev, vcId],
+    );
+  };
+
   const handleGenerateCard = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsGenerating(true);
@@ -112,6 +280,18 @@ export default function DisclosureModal({
       new Set([...selectedPersonaAliases, ...extra]),
     );
 
+    // Only explicitly-selected email claims are attached. Manual deselection
+    // of a trust-tier default is honored here, since this reads the live
+    // checkbox state rather than recomputing the tier default.
+    const selectedEmailCredentials = emailOptions
+      .filter((o) => selectedEmailVcIds.includes(o.vc_id))
+      .map((o) => ({
+        vc_id: o.vc_id,
+        email: o.email,
+        email_type: o.email_type,
+        verified_at: o.verified_at,
+      }));
+
     const selectedProfile =
       profiles.find((p) => p.profile_id === signingProfileId) ||
       profiles.find((p) => p.level === 1 || p.derivation_index === 1) ||
@@ -126,6 +306,7 @@ export default function DisclosureModal({
         displayName: name,
         disclosedAliases: allAliases,
         tier: selectedTier,
+        disclosedEmailCredentials: selectedEmailCredentials,
       });
 
       const parsed = JSON.parse(cardJson);
@@ -440,6 +621,92 @@ export default function DisclosureModal({
                     );
                   })}
                 </div>
+              </div>
+
+              <div className="form-group" style={{ marginBottom: "1.25rem" }}>
+                <label>
+                  Email Ownership Claims to Disclose (optional)
+                </label>
+                <div
+                  className="email-ownership-selector"
+                  style={{
+                    background: "#f9fafb",
+                    padding: "0.75rem",
+                    borderRadius: "6px",
+                    border: "1px solid #e5e7eb",
+                    maxHeight: "180px",
+                    overflowY: "auto",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "0.5rem",
+                  }}
+                >
+                  {emailOptions.length === 0 ? (
+                    <span style={{ fontSize: "0.8rem", color: "#6b7280" }}>
+                      No EmailOwnershipCredentials stored for this persona.
+                    </span>
+                  ) : (
+                    emailOptions.map((opt) => {
+                      const isChecked = selectedEmailVcIds.includes(opt.vc_id);
+                      return (
+                        <label
+                          key={opt.vc_id}
+                          data-testid="email-credential-option"
+                          style={{
+                            display: "flex",
+                            alignItems: "flex-start",
+                            gap: "0.5rem",
+                            fontSize: "0.85rem",
+                            cursor: "pointer",
+                            padding: "0.3rem",
+                            borderRadius: "4px",
+                            background: isChecked ? "#ede9fe" : "transparent",
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => handleToggleEmailCredential(opt.vc_id)}
+                            style={{ marginTop: "0.2rem" }}
+                          />
+                          <div>
+                            <strong>{opt.email ?? "— email not disclosed —"}</strong>{" "}
+                            <span style={{ color: "#6b7280", fontSize: "0.75rem" }}>
+                              ({opt.email_type})
+                            </span>
+                            {opt.verified_at && (
+                              <div
+                                style={{
+                                  fontSize: "0.7rem",
+                                  color: "#6b7280",
+                                }}
+                              >
+                                Verified: {opt.verified_at}
+                              </div>
+                            )}
+                          </div>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+                {targetTrustLevel ? (
+                  <p
+                    className="muted"
+                    style={{ fontSize: "0.75rem", marginTop: "0.35rem" }}
+                  >
+                    Defaults applied for {String(targetTrustLevel)}. You can toggle
+                    any claim before signing.
+                  </p>
+                ) : (
+                  <p
+                    className="muted"
+                    style={{ fontSize: "0.75rem", marginTop: "0.35rem" }}
+                  >
+                    Select a known contact to apply trust-tier defaults, or
+                    toggle claims manually.
+                  </p>
+                )}
               </div>
 
               <div className="form-group" style={{ marginBottom: "1.25rem" }}>

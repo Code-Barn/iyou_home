@@ -16,6 +16,7 @@
  */
 
 import { useState, useEffect, useRef } from "react";
+import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Profile } from "../lib/types";
 import { isExternallySignable } from "../lib/enclaveFilters";
@@ -68,6 +69,116 @@ function levelLabel(level: number): string {
   if (level === 0) return "L0 Anchor";
   if (level === 1) return "L1 Public";
   return `L${level} Burner`;
+}
+
+const EMAIL_OWNERSHIP_TYPE = "EmailOwnershipCredential";
+
+export type EmailCategory = "personal" | "work" | "alias" | "unknown";
+
+interface EmailOwnershipInfo {
+  email: string | null;
+  emailCategory: EmailCategory;
+  verifiedAt: string | null;
+  issuer: string | null;
+}
+
+/**
+ * Detect an iyou_idp `EmailOwnershipCredential` and project its subject fields.
+ *
+ * The vault's `VaultCredential` row has no dedicated column for `email_type` or
+ * `verified_at`, so both live only inside `raw_payload`. Type detection is
+ * deliberately redundant: the `import_verifiable_credential` path records
+ * `credential_type === "EmailOwnershipCredential"`, but the `save_credential`
+ * path records the first entry of the `type` array, which for this credential is
+ * `"VerifiableCredential"`. Checking both keeps the card rendering stable
+ * regardless of which import path stored it.
+ *
+ * Returns `null` only for a non-EmailOwnershipCredential, or when `raw_payload`
+ * is not parseable JSON at all — callers render the generic card in that case.
+ *
+ * A recognized EmailOwnershipCredential whose `credentialSubject` is missing or
+ * missing individual fields still returns a populated record: the card renders
+ * with explicit "— not disclosed —" placeholders and an `unknown` category
+ * badge. That is deliberate, so an issuer-signed-but-incomplete email claim is
+ * visibly incomplete rather than silently indistinguishable from a
+ * non-email credential.
+ */
+export function extractEmailOwnership(
+  cred: Pick<VaultCredential, "credential_type" | "raw_payload">,
+): EmailOwnershipInfo | null {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cred.raw_payload);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const rawTypes: unknown[] = Array.isArray(parsed.type)
+    ? parsed.type
+    : typeof parsed.type === "string"
+      ? [parsed.type]
+      : [];
+
+  const isEmailOwnership =
+    cred.credential_type === EMAIL_OWNERSHIP_TYPE ||
+    rawTypes.includes(EMAIL_OWNERSHIP_TYPE);
+  if (!isEmailOwnership) return null;
+
+  const subject =
+    parsed.credentialSubject && typeof parsed.credentialSubject === "object"
+      ? parsed.credentialSubject
+      : null;
+
+  const issuerRaw =
+    typeof parsed.issuer === "string"
+      ? parsed.issuer
+      : parsed.issuer && typeof parsed.issuer === "object"
+        ? parsed.issuer.id
+        : null;
+
+  const rawCategory = typeof subject?.email_type === "string" ? subject.email_type.toLowerCase() : "";
+
+  return {
+    email: typeof subject?.email === "string" && subject.email ? subject.email : null,
+    emailCategory:
+      rawCategory === "personal" || rawCategory === "work" || rawCategory === "alias"
+        ? rawCategory
+        : "unknown",
+    verifiedAt:
+      typeof subject?.verified_at === "string" && subject.verified_at
+        ? subject.verified_at
+        : null,
+    issuer: typeof issuerRaw === "string" && issuerRaw ? issuerRaw : null,
+  };
+}
+
+function emailCategoryBadge(category: EmailCategory): {
+  label: string;
+  style: CSSProperties;
+} {
+  switch (category) {
+    case "personal":
+      return {
+        label: "personal",
+        style: { background: "#d1fae5", color: "#065f46", border: "1px solid #6ee7b7" },
+      };
+    case "work":
+      return {
+        label: "work",
+        style: { background: "#fef3c7", color: "#92400e", border: "1px solid #fcd34d" },
+      };
+    case "alias":
+      return {
+        label: "alias",
+        style: { background: "#e0f2fe", color: "#075985", border: "1px solid #7dd3fc" },
+      };
+    default:
+      return {
+        label: "unknown",
+        style: { background: "#f1f5f9", color: "#334155", border: "1px solid #cbd5e1" },
+      };
+  }
 }
 
 export default function TrustAssets() {
@@ -342,6 +453,7 @@ export default function TrustAssets() {
           const didMismatch =
             !!selectedProfile && cred.subject_did !== selectedProfile.did;
           const badge = fidelityBadge(cred.fidelity_score);
+          const emailInfo = extractEmailOwnership(cred);
 
           return (
             <div
@@ -350,13 +462,34 @@ export default function TrustAssets() {
             >
               <div className="credential-header">
                 <h3 style={{ margin: 0, fontSize: "1rem" }}>
-                  {cred.credential_type}
+                  {emailInfo ? "Email Ownership" : cred.credential_type}
                 </h3>
-                {badge && (
-                  <span className={`fidelity-badge ${badge.tierClass}`}>
-                    {badge.label}
-                  </span>
-                )}
+                {emailInfo
+                  ? (() => {
+                      const cat = emailCategoryBadge(emailInfo.emailCategory);
+                      return (
+                        <span
+                          className="email-category-badge"
+                          data-testid="email-category-badge"
+                          style={{
+                            ...cat.style,
+                            padding: "0.15rem 0.55rem",
+                            borderRadius: "999px",
+                            fontSize: "0.72rem",
+                            fontWeight: 700,
+                            textTransform: "uppercase",
+                            letterSpacing: "0.03em",
+                          }}
+                        >
+                          {cat.label}
+                        </span>
+                      );
+                    })()
+                  : badge && (
+                      <span className={`fidelity-badge ${badge.tierClass}`}>
+                        {badge.label}
+                      </span>
+                    )}
                 {expired && (
                   <span className="expired-badge">EXPIRED</span>
                 )}
@@ -381,20 +514,41 @@ export default function TrustAssets() {
                 </div>
               )}
 
-              <div className="credential-meta">
-                <div>
-                  <strong>Issuer:</strong>{" "}
-                  <code>{cred.issuer_did}</code>
+              {emailInfo ? (
+                <div className="credential-meta">
+                  <div>
+                    <strong>Verified Email:</strong>{" "}
+                    <code data-testid="email-ownership-email">
+                      {emailInfo.email ?? "— not disclosed —"}
+                    </code>
+                  </div>
+                  <div>
+                    <strong>Issuer:</strong>{" "}
+                    <code>{emailInfo.issuer ?? cred.issuer_did}</code>
+                  </div>
+                  <div>
+                    <strong>Verified:</strong>{" "}
+                    <span data-testid="email-ownership-verified-at">
+                      {emailInfo.verifiedAt ?? "— not disclosed —"}
+                    </span>
+                  </div>
                 </div>
-                <div>
-                  <strong>Subject:</strong>{" "}
-                  <code>{cred.subject_did}</code>
+              ) : (
+                <div className="credential-meta">
+                  <div>
+                    <strong>Issuer:</strong>{" "}
+                    <code>{cred.issuer_did}</code>
+                  </div>
+                  <div>
+                    <strong>Subject:</strong>{" "}
+                    <code>{cred.subject_did}</code>
+                  </div>
+                  <div>
+                    <strong>Expiration:</strong>{" "}
+                    {cred.expiration_date || "Never"}
+                  </div>
                 </div>
-                <div>
-                  <strong>Expiration:</strong>{" "}
-                  {cred.expiration_date || "Never"}
-                </div>
-              </div>
+              )}
 
               <button onClick={() => setModalCredential(cred)}>
                 View Raw Credential

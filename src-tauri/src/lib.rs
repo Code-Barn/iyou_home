@@ -2467,6 +2467,7 @@ fn generate_disclosure_card(
     display_name: String,
     disclosed_aliases: Vec<String>,
     tier: Option<String>,
+    disclosed_email_credentials: Option<Vec<serde_json::Value>>,
 ) -> Result<String, String> {
     let (signing_key, did) = resolve_profile_keypair(&app, profile_id)?;
     let card_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
@@ -2477,6 +2478,18 @@ fn generate_disclosure_card(
         "name": display_name,
         "disclosed_aliases": disclosed_aliases,
     });
+
+    // Email claims are attached ONLY when the user explicitly selected them in
+    // the Disclosure UI. Trust-tier defaults are a UI convenience, never a
+    // server-side guarantee, so this layer treats an absent or empty list as
+    // "disclose nothing" and omits the key entirely. A disclosure card is a
+    // durable, retainable, correlatable signed artifact, so failing closed here
+    // is the only safe default: an absent key can never be misread as
+    // "everything is approved".
+    let email_claims = disclosed_email_credentials.unwrap_or_default();
+    if !email_claims.is_empty() {
+        subject["disclosed_email_credentials"] = serde_json::Value::Array(email_claims);
+    }
     if let Some(ref target) = target_peer_did {
         if !target.is_empty() {
             subject["target_peer_did"] = serde_json::Value::String(target.clone());
