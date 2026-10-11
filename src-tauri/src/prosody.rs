@@ -609,75 +609,74 @@ fn extract_xml_element(input: &str) -> Option<(String, &str)> {
     let start = input.find('<')?;
     let rest = &input[start..];
 
-    // Skip processing instructions
+    // Skip comments and processing instructions at root
     if rest.starts_with("<?") {
         let end = rest.find("?>")? + 2;
         return Some((input[start..start + end].to_string(), &input[start + end..]));
     }
-
-    if !rest.starts_with('<') {
-        return None;
-    }
-
-    let after_lt = &rest[1..];
-    let tag_end = after_lt.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
-    let tag_name = &after_lt[..tag_end];
-
-    // Self-closing: <tag ... />
-    if rest.contains("/>") && !rest[..rest.find("/>")? + 2].contains(&format!("</{}", tag_name)) {
-        let end = rest.find("/>")? + 2;
+    if rest.starts_with("<!--") {
+        let end = rest.find("-->")? + 3;
         return Some((input[start..start + end].to_string(), &input[start + end..]));
     }
 
-    let mut depth = 1i32;
-    let mut pos = 1;
-    while depth > 0 && pos < rest.len() {
-        if let Some(lt_pos) = rest[pos..].find('<') {
-            let abs_pos = pos + lt_pos;
-            if rest[abs_pos..].starts_with("<![CDATA[") {
-                if let Some(cdata_end) = rest[abs_pos..].find("]]>") {
-                    pos = abs_pos + cdata_end + 3;
+    let first_close = rest.find('>')?;
+    let tag_header = rest[..first_close].trim_end();
+
+    if tag_header.starts_with("</") {
+        return None;
+    }
+
+    // Self-closing root tag (e.g. <presence/>, <r/>)
+    if tag_header.ends_with('/') {
+        let end = start + first_close + 1;
+        return Some((input[start..end].to_string(), &input[end..]));
+    }
+
+    let mut depth = 1usize;
+    let mut pos = first_close + 1;
+
+    while pos < rest.len() {
+        if let Some(lt_offset) = rest[pos..].find('<') {
+            let abs_lt = pos + lt_offset;
+            let after_lt = &rest[abs_lt..];
+
+            // Skip CDATA, comments <!-- ... --> and processing instructions <? ... ?>
+            if after_lt.starts_with("<![CDATA[") {
+                if let Some(cdata_end) = after_lt.find("]]>") {
+                    pos = abs_lt + cdata_end + 3;
                     continue;
                 }
             }
-            if rest[abs_pos..].starts_with("<!--") {
-                if let Some(comment_end) = rest[abs_pos..].find("-->") {
-                    pos = abs_pos + comment_end + 3;
+            if after_lt.starts_with("<!--") {
+                if let Some(comment_end) = after_lt.find("-->") {
+                    pos = abs_lt + comment_end + 3;
                     continue;
                 }
             }
-            if rest[abs_pos..].starts_with("<?") {
-                if let Some(pi_end) = rest[abs_pos..].find("?>") {
-                    pos = abs_pos + pi_end + 2;
+            if after_lt.starts_with("<?") {
+                if let Some(pi_end) = after_lt.find("?>") {
+                    pos = abs_lt + pi_end + 2;
                     continue;
                 }
             }
-            if rest[abs_pos..].starts_with("/>") {
-                pos = abs_pos + 2;
-                continue;
-            }
-            if rest[abs_pos..].starts_with(&format!("</{}", tag_name))
-                || rest[abs_pos..].starts_with("</stream")
-            {
-                depth -= 1;
+
+            let gt_offset = after_lt.find('>')?;
+            let tag_content = after_lt[1..gt_offset].trim();
+
+            if tag_content.starts_with('/') {
+                // Closing tag (e.g., </resource>, </bind>, </iq>)
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    let close_end = rest[abs_pos..].find('>')? + 1;
-                    let end = abs_pos + close_end;
-                    return Some((input[start..start + end].to_string(), &input[start + end..]));
+                    let end = start + abs_lt + gt_offset + 1;
+                    return Some((input[start..end].to_string(), &input[end..]));
                 }
-                pos = abs_pos + 1;
-            } else {
-                let tag_start = abs_pos + 1;
-                let after_lt2 = &rest[tag_start..];
-                let next_tag_end =
-                    after_lt2.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
-                if after_lt2.get(..next_tag_end).map_or(false, |name| {
-                    !name.starts_with('/') && !name.starts_with('?') && !name.starts_with('!')
-                }) {
-                    depth += 1;
-                }
-                pos = abs_pos + 1;
+            } else if !tag_content.ends_with('/') {
+                // Normal child opening tag (e.g., <bind ...>, <resource>)
+                depth += 1;
             }
+            // Self-closing child tags (<.../>) do not change depth
+
+            pos = abs_lt + gt_offset + 1;
         } else {
             break;
         }
@@ -702,10 +701,16 @@ fn extract_bind_resource(stanza: &str) -> Option<String> {
 }
 
 fn extract_iq_id(stanza: &str) -> Option<&str> {
-    let id_pos = stanza.find("id='")?;
-    let val_start = id_pos + 4;
-    let val_end = stanza[val_start..].find('\'')?;
-    Some(&stanza[val_start..val_start + val_end])
+    for quote in ['\'', '"'] {
+        let pattern = format!("id={}", quote);
+        if let Some(id_pos) = stanza.find(&pattern) {
+            let val_start = id_pos + pattern.len();
+            if let Some(val_end) = stanza[val_start..].find(quote) {
+                return Some(&stanza[val_start..val_start + val_end]);
+            }
+        }
+    }
+    None
 }
 
 fn extract_message_body(stanza: &str) -> Option<String> {
@@ -876,5 +881,30 @@ mod tests {
         unregister_client(&routes, "bb@127.0.0.1", &tx_a);
         assert!(routes.lock().unwrap().contains_key("bb@127.0.0.1"));
         assert!(!routes.lock().unwrap().contains_key(""));
+    }
+
+    #[test]
+    fn extracts_nested_xml_element_and_iq_id() {
+        let xml = "<iq type=\"set\" id=\"bind_1\"><bind xmlns=\"urn:ietf:params:xml:ns:xmpp-bind\"><resource>web</resource></bind></iq>";
+        let parsed = extract_xml_element(xml);
+        assert!(parsed.is_some());
+        let (stanza, rest) = parsed.unwrap();
+        assert_eq!(stanza, xml);
+        assert_eq!(rest, "");
+        assert_eq!(extract_iq_id(xml), Some("bind_1"));
+
+        // Single-quote id extraction
+        let xml_sq = "<iq type='set' id='bind_sq'><bind><resource>web</resource></bind></iq>";
+        assert_eq!(extract_iq_id(xml_sq), Some("bind_sq"));
+
+        // Self-closing elements
+        assert_eq!(
+            extract_xml_element("<presence/>"),
+            Some(("<presence/>".to_string(), ""))
+        );
+
+        // Nested message elements
+        let msg = "<message type=\"chat\" to=\"user@127.0.0.1\"><body>hello world</body></message>";
+        assert_eq!(extract_xml_element(msg), Some((msg.to_string(), "")));
     }
 }
