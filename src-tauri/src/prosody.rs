@@ -37,19 +37,37 @@ const CLIENT_NS: &str = "jabber:client";
 const SASL_NS: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const BIND_NS: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 
+#[allow(dead_code)]
+pub const MUC_DOMAIN_SUFFIX: &str = "@conference.127.0.0.1";
+
 /// Live client session registry: normalized bare JID -> outbound channel.
 type ClientRoutes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
 
+#[derive(Clone, Debug)]
+pub struct RoomOccupant {
+    pub bare_jid: String,
+    pub nickname: String,
+    pub tx: mpsc::UnboundedSender<Message>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MucRoom {
+    pub room_bare_jid: String,
+    pub occupants: HashMap<String, RoomOccupant>, // keyed by bare_jid
+}
+
+pub type RoomRegistry = Arc<Mutex<HashMap<String, MucRoom>>>;
+
 /// Per-connection handshake/routing state shared by the WS and raw-TCP paths.
-struct ClientSession {
+pub struct ClientSession {
     /// Device identity authenticated via SASL (64-lowercase-hex public key).
-    auth_hex: Option<String>,
+    pub auth_hex: Option<String>,
     /// Full bound JID: `{hex}@127.0.0.1/{resource}`.
-    bound_jid: String,
+    pub bound_jid: String,
     /// Routing key: `{hex}@127.0.0.1`.
-    bound_bare: String,
+    pub bound_bare: String,
     /// Channel the writer task drains into the socket.
-    own_tx: mpsc::UnboundedSender<Message>,
+    pub own_tx: mpsc::UnboundedSender<Message>,
 }
 
 /// Normalize a recipient JID to the bare `{user}@{domain}` routing key.
@@ -181,6 +199,121 @@ fn stamp_stanza_from(stanza: &str, from_jid: &str) -> String {
     stanza.to_string()
 }
 
+/// Extract an attribute value from the opening tag of an XML element.
+pub fn extract_stanza_attr<'a>(stanza: &'a str, attr: &str) -> Option<&'a str> {
+    let first_gt = stanza.find('>')?;
+    let header = &stanza[..first_gt];
+    for quote in ['\'', '"'] {
+        for pattern in [
+            format!("{}={}", attr, quote),
+            format!("{} = {}", attr, quote),
+            format!("{} ={}", attr, quote),
+            format!("{}= {}", attr, quote),
+        ] {
+            if let Some(pos) = header.find(pattern.as_str()) {
+                let val_start = pos + pattern.len();
+                if let Some(val_end) = header[val_start..].find(quote) {
+                    return Some(&header[val_start..val_start + val_end]);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_stanza_to(stanza: &str) -> Option<&str> {
+    extract_stanza_attr(stanza, "to")
+}
+
+pub fn extract_stanza_type(stanza: &str) -> Option<&str> {
+    extract_stanza_attr(stanza, "type")
+}
+
+/// Rewrite or stamp the `from` attribute on a stanza's root element.
+pub fn rewrite_message_from(stanza: &str, new_from: &str) -> String {
+    let first_gt = match stanza.find('>') {
+        Some(pos) => pos,
+        None => return stanza.to_string(),
+    };
+    let tag_header = &stanza[..first_gt];
+
+    for quote in ['"', '\''] {
+        for pattern in [
+            format!("from={}", quote),
+            format!("from = {}", quote),
+            format!("from ={}", quote),
+            format!("{}= {}", "from", quote),
+        ] {
+            if let Some(pos) = tag_header.find(&pattern) {
+                let val_start = pos + pattern.len();
+                if let Some(val_len) = tag_header[val_start..].find(quote) {
+                    let val_end = val_start + val_len;
+                    let mut out = String::with_capacity(stanza.len() + new_from.len());
+                    out.push_str(&tag_header[..pos]);
+                    out.push_str(&format!("from={}{}{}", quote, new_from, quote));
+                    out.push_str(&tag_header[val_end + 1..]);
+                    out.push_str(&stanza[first_gt..]);
+                    return out;
+                }
+            }
+        }
+    }
+
+    // No from attribute in the opening tag; stamp it before '>' or '/>'
+    let attr = format!(" from='{}'", new_from);
+    if let Some(slash) = tag_header.rfind('/') {
+        if slash == tag_header.len() - 1 {
+            return format!("{}{}{}", &tag_header[..slash], attr, &stanza[slash..]);
+        }
+    }
+    format!("{}{}{}", tag_header, attr, &stanza[first_gt..])
+}
+
+/// Remove a disconnected session from any MUC rooms it joined.
+pub fn unregister_occupant_from_rooms(
+    rooms: &RoomRegistry,
+    bare: &str,
+    own_tx: &mpsc::UnboundedSender<Message>,
+) {
+    if bare.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = rooms.lock() {
+        let mut empty_rooms = Vec::new();
+        for (room_jid, room) in map.iter_mut() {
+            if let Some(occ) = room.occupants.get(bare) {
+                if occ.tx.same_channel(own_tx) {
+                    let nick = occ.nickname.clone();
+                    room.occupants.remove(bare);
+                    let unavail = format!(
+                        "<presence from=\"{}/{}\" type=\"unavailable\"/>",
+                        room.room_bare_jid, nick
+                    );
+                    for remaining in room.occupants.values() {
+                        let _ = remaining.tx.send(Message::Text(unavail.clone()));
+                    }
+                    if room.occupants.is_empty() {
+                        empty_rooms.push(room_jid.clone());
+                    }
+                }
+            }
+        }
+        for empty in empty_rooms {
+            map.remove(&empty);
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn start_prosody_daemon(
+    listener: TcpListener,
+    shutdown_rx: watch::Receiver<bool>,
+    xmpp_pass: String,
+    cert_dir: std::path::PathBuf,
+) {
+    start_xmpp_server(listener, shutdown_rx, xmpp_pass, cert_dir).await;
+}
+
 pub async fn start_xmpp_server(
     listener: TcpListener,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -188,6 +321,7 @@ pub async fn start_xmpp_server(
     cert_dir: std::path::PathBuf,
 ) {
     let clients: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+    let rooms: RoomRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // SEC-002: runtime cert resolution with ephemeral fallback (fail-closed).
     let (certs, key) = match resolve_tls_assets(&cert_dir) {
@@ -221,10 +355,11 @@ pub async fn start_xmpp_server(
                         let acceptor = acceptor.clone();
                         let pass = xmpp_pass.clone();
                         let clients = clients.clone();
+                        let rooms = rooms.clone();
                         tokio::spawn(async move {
                             match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
-                                    handle_connection(tls_stream, pass, clients).await;
+                                    handle_connection(tls_stream, pass, clients, rooms).await;
                                 }
                                 Err(e) => {
                                     eprintln!("XMPP TLS handshake failed from {:?}: {}", peer, e);
@@ -245,7 +380,12 @@ pub async fn start_xmpp_server(
     }
 }
 
-async fn handle_connection<S>(mut stream: S, password: String, clients: ClientRoutes)
+async fn handle_connection<S>(
+    mut stream: S,
+    password: String,
+    clients: ClientRoutes,
+    rooms: RoomRegistry,
+)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -278,10 +418,10 @@ where
 
     if is_websocket_upgrade(data) {
         let buffered = ReadBuffered::new(stream, head[..n].to_vec());
-        handle_xmpp_ws_connection(buffered, password, clients).await;
+        handle_xmpp_ws_connection(buffered, password, clients, rooms).await;
     } else {
         let buffered = ReadBuffered::new(stream, head[..n].to_vec());
-        handle_xmpp_connection(buffered, password, clients).await;
+        handle_xmpp_connection(buffered, password, clients, rooms).await;
     }
 }
 
@@ -306,7 +446,12 @@ fn is_websocket_upgrade(data: &[u8]) -> bool {
 
 // -- WebSocket XMPP handler --
 
-async fn handle_xmpp_ws_connection<S>(stream: S, password: String, clients: ClientRoutes)
+async fn handle_xmpp_ws_connection<S>(
+    stream: S,
+    password: String,
+    clients: ClientRoutes,
+    rooms: RoomRegistry,
+)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -392,13 +537,14 @@ where
 
         input.push_str(&text);
 
-        if !process_xmpp_buffer(&mut input, &mut session, &password, &clients).await {
+        if !process_xmpp_buffer(&mut input, &mut session, &password, &clients, &rooms).await {
             break;
         }
     }
 
     // Clean up this session's routing entry (only if still owned by it).
     unregister_client(&clients, &session.bound_bare, &session.own_tx);
+    unregister_occupant_from_rooms(&rooms, &session.bound_bare, &session.own_tx);
     println!(
         "DEBUG: XMPP session closed (bare={})",
         if session.bound_bare.is_empty() { "unbound" } else { &session.bound_bare }
@@ -407,7 +553,12 @@ where
 
 // -- Raw TCP XMPP handler --
 
-async fn handle_xmpp_connection<S>(stream: S, password: String, clients: ClientRoutes)
+async fn handle_xmpp_connection<S>(
+    stream: S,
+    password: String,
+    clients: ClientRoutes,
+    rooms: RoomRegistry,
+)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -460,7 +611,7 @@ where
         input.push_str(&String::from_utf8_lossy(&buf[..n]));
 
         let was_auth = session.auth_hex.is_some();
-        if !process_xmpp_buffer(&mut input, &mut session, &password, &clients).await {
+        if !process_xmpp_buffer(&mut input, &mut session, &password, &clients, &rooms).await {
             break;
         }
 
@@ -482,15 +633,17 @@ where
     }
 
     unregister_client(&clients, &session.bound_bare, &session.own_tx);
+    unregister_occupant_from_rooms(&rooms, &session.bound_bare, &session.own_tx);
 }
 
 // -- Shared XMPP processing logic (both WS and raw TCP) --
 
-async fn process_xmpp_buffer(
+pub async fn process_xmpp_buffer(
     input: &mut String,
     session: &mut ClientSession,
     password: &str,
     clients: &ClientRoutes,
+    rooms: &RoomRegistry,
 ) -> bool {
     loop {
         // Check for stream close
@@ -562,9 +715,157 @@ async fn process_xmpp_buffer(
                     }
                 }
             } else if stanza.contains("<presence") {
-                send_ws(session, "<presence xmlns='jabber:client'/>");
+                let to_dest = extract_stanza_to(&stanza).unwrap_or("").trim().to_string();
+                if to_dest.contains("@conference.") || to_dest.contains(MUC_DOMAIN_SUFFIX) {
+                    let (room_bare_jid, nickname) = match to_dest.split_once('/') {
+                        Some((room, nick)) => (normalize_bare_jid(room), nick.trim().to_string()),
+                        None => (normalize_bare_jid(&to_dest), String::new()),
+                    };
+
+                    let is_unavailable = extract_stanza_type(&stanza) == Some("unavailable")
+                        || stanza.contains("type=\"unavailable\"")
+                        || stanza.contains("type='unavailable'");
+
+                    let bound_bare = if !session.bound_bare.is_empty() {
+                        session.bound_bare.clone()
+                    } else if let Some(auth) = &session.auth_hex {
+                        format!("{}@{}", auth, XMPP_SERVER)
+                    } else {
+                        format!("anonymous@{}", XMPP_SERVER)
+                    };
+
+                    if is_unavailable {
+                        if let Ok(mut map) = rooms.lock() {
+                            if let Some(room) = map.get_mut(&room_bare_jid) {
+                                let effective_nick = if !nickname.is_empty() {
+                                    nickname.clone()
+                                } else if let Some(occ) = room.occupants.get(&bound_bare) {
+                                    occ.nickname.clone()
+                                } else {
+                                    bound_bare.split('@').next().unwrap_or("guest").to_string()
+                                };
+                                let occupant_full_to = if !nickname.is_empty() {
+                                    to_dest.clone()
+                                } else {
+                                    format!("{}/{}", room_bare_jid, effective_nick)
+                                };
+
+                                room.occupants.remove(&bound_bare);
+                                let unavail_stanza = format!(
+                                    "<presence from=\"{}\" type=\"unavailable\"/>",
+                                    occupant_full_to
+                                );
+                                for remaining in room.occupants.values() {
+                                    let _ = remaining.tx.send(Message::Text(unavail_stanza.clone()));
+                                }
+                                if room.occupants.is_empty() {
+                                    map.remove(&room_bare_jid);
+                                }
+                            }
+                        }
+                    } else {
+                        let effective_nick = if !nickname.is_empty() {
+                            nickname.clone()
+                        } else {
+                            bound_bare.split('@').next().unwrap_or("guest").to_string()
+                        };
+                        let occupant_full_to = if !nickname.is_empty() {
+                            to_dest.clone()
+                        } else {
+                            format!("{}/{}", room_bare_jid, effective_nick)
+                        };
+
+                        if let Ok(mut map) = rooms.lock() {
+                            let room = map.entry(room_bare_jid.clone()).or_insert_with(|| MucRoom {
+                                room_bare_jid: room_bare_jid.clone(),
+                                occupants: HashMap::new(),
+                            });
+
+                            let existing_occupants: Vec<String> = room
+                                .occupants
+                                .values()
+                                .filter(|occ| occ.bare_jid != bound_bare)
+                                .map(|occ| occ.nickname.clone())
+                                .collect();
+
+                            room.occupants.insert(
+                                bound_bare.clone(),
+                                RoomOccupant {
+                                    bare_jid: bound_bare.clone(),
+                                    nickname: effective_nick.clone(),
+                                    tx: session.own_tx.clone(),
+                                },
+                            );
+
+                            let join_stanza = format!("<presence from=\"{}\"/>", occupant_full_to);
+                            for occ in room.occupants.values() {
+                                let _ = occ.tx.send(Message::Text(join_stanza.clone()));
+                            }
+
+                            for existing_nick in existing_occupants {
+                                let echo_stanza =
+                                    format!("<presence from=\"{}/{}\"/>", room_bare_jid, existing_nick);
+                                let _ = session.own_tx.send(Message::Text(echo_stanza));
+                            }
+                        }
+                    }
+                } else {
+                    send_ws(session, "<presence xmlns='jabber:client'/>");
+                }
             } else if stanza.contains("<message") {
-                if let Some(body) = extract_message_body(&stanza) {
+                let is_groupchat =
+                    stanza.contains("type=\"groupchat\"") || stanza.contains("type='groupchat'");
+
+                if is_groupchat {
+                    let to = extract_stanza_to(&stanza).unwrap_or("").trim().to_string();
+                    let to_bare = normalize_bare_jid(&to);
+                    let from_bare = if !session.bound_bare.is_empty() {
+                        session.bound_bare.clone()
+                    } else if let Some(auth) = &session.auth_hex {
+                        format!("{}@{}", auth, XMPP_SERVER)
+                    } else {
+                        format!("anonymous@{}", XMPP_SERVER)
+                    };
+
+                    let mut sent = false;
+                    let mut not_in_room = false;
+
+                    if let Ok(map) = rooms.lock() {
+                        if let Some(room) = map.get(&to_bare) {
+                            if let Some(occupant) = room.occupants.get(&from_bare) {
+                                let sender_nickname = &occupant.nickname;
+                                let from_jid = format!("{}/{}", room.room_bare_jid, sender_nickname);
+                                let rewritten = rewrite_message_from(&stanza, &from_jid);
+                                for occ in room.occupants.values() {
+                                    let _ = occ.tx.send(Message::Text(rewritten.clone()));
+                                }
+                                sent = true;
+                            } else {
+                                not_in_room = true;
+                            }
+                        }
+                    }
+
+                    if !sent {
+                        if not_in_room {
+                            send_ws(
+                                session,
+                                &format!(
+                                    "<message type='error' to='{}'><error type='cancel'><not-acceptable/></error></message>",
+                                    from_bare
+                                ),
+                            );
+                        } else {
+                            send_ws(
+                                session,
+                                &format!(
+                                    "<message type='error' to='{}'><error type='cancel'><service-unavailable/></error></message>",
+                                    from_bare
+                                ),
+                            );
+                        }
+                    }
+                } else if let Some(body) = extract_message_body(&stanza) {
                     let to = extract_message_to(&stanza).unwrap_or("").trim().to_string();
                     let to_bare = normalize_bare_jid(&to);
                     let from_jid = session.bound_jid.clone();
@@ -722,16 +1023,7 @@ fn extract_message_body(stanza: &str) -> Option<String> {
 }
 
 fn extract_message_to(stanza: &str) -> Option<&str> {
-    for quote in ['\'', '"'] {
-        let pattern = format!("to={}", quote);
-        if let Some(pos) = stanza.find(&pattern) {
-            let val_start = pos + pattern.len();
-            if let Some(val_end) = stanza[val_start..].find(quote) {
-                return Some(&stanza[val_start..val_start + val_end]);
-            }
-        }
-    }
-    None
+    extract_stanza_to(stanza)
 }
 
 pub fn generate_password() -> String {
@@ -906,5 +1198,315 @@ mod tests {
         // Nested message elements
         let msg = "<message type=\"chat\" to=\"user@127.0.0.1\"><body>hello world</body></message>";
         assert_eq!(extract_xml_element(msg), Some((msg.to_string(), "")));
+    }
+
+    #[test]
+    fn test_muc_rewrite_message_from_variants() {
+        // Case 1: No from attribute
+        let in1 = "<message type=\"groupchat\" to=\"room@conference.127.0.0.1\"><body>hi</body></message>";
+        let out1 = rewrite_message_from(in1, "room@conference.127.0.0.1/alice");
+        assert!(out1.contains("from='room@conference.127.0.0.1/alice'"));
+        assert!(out1.contains("<body>hi</body>"));
+
+        // Case 2: Existing double-quoted from
+        let in2 = "<message from=\"alice@127.0.0.1/res\" type=\"groupchat\" to=\"room@conference.127.0.0.1\"><body>hi</body></message>";
+        let out2 = rewrite_message_from(in2, "room@conference.127.0.0.1/alice");
+        assert_eq!(out2, "<message from=\"room@conference.127.0.0.1/alice\" type=\"groupchat\" to=\"room@conference.127.0.0.1\"><body>hi</body></message>");
+
+        // Case 3: Existing single-quoted from
+        let in3 = "<message type='groupchat' to='room@conference.127.0.0.1' from='alice@127.0.0.1/res'><body>hi</body></message>";
+        let out3 = rewrite_message_from(in3, "room@conference.127.0.0.1/alice");
+        assert_eq!(out3, "<message type='groupchat' to='room@conference.127.0.0.1' from='room@conference.127.0.0.1/alice'><body>hi</body></message>");
+
+        // Case 4: Self-closing tag
+        let in4 = "<message type=\"groupchat\" to=\"room@conference.127.0.0.1\"/>";
+        let out4 = rewrite_message_from(in4, "room@conference.127.0.0.1/alice");
+        assert_eq!(out4, "<message type=\"groupchat\" to=\"room@conference.127.0.0.1\" from='room@conference.127.0.0.1/alice'/>");
+
+        // Case 5: Body contains from="something"
+        let in5 = "<message type=\"groupchat\" to=\"room@conference.127.0.0.1\"><body>from=\"test\" in body</body></message>";
+        let out5 = rewrite_message_from(in5, "room@conference.127.0.0.1/alice");
+        assert!(out5.starts_with("<message type=\"groupchat\" to=\"room@conference.127.0.0.1\" from='room@conference.127.0.0.1/alice'>"));
+        assert!(out5.contains("<body>from=\"test\" in body</body>"));
+    }
+
+    #[test]
+    fn test_extract_stanza_attributes() {
+        let s1 = "<presence to=\"lounge@conference.127.0.0.1/alice\"/>";
+        assert_eq!(extract_stanza_to(s1), Some("lounge@conference.127.0.0.1/alice"));
+        assert_eq!(extract_stanza_type(s1), None);
+
+        let s2 = "<presence to='lounge@conference.127.0.0.1/bob' type='unavailable'/>";
+        assert_eq!(extract_stanza_to(s2), Some("lounge@conference.127.0.0.1/bob"));
+        assert_eq!(extract_stanza_type(s2), Some("unavailable"));
+
+        let s3 = "<message to = \"room@conference.127.0.0.1\" type = 'groupchat'><body>hello</body></message>";
+        assert_eq!(extract_stanza_to(s3), Some("room@conference.127.0.0.1"));
+        assert_eq!(extract_stanza_type(s3), Some("groupchat"));
+        assert_eq!(MUC_DOMAIN_SUFFIX, "@conference.127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn test_muc_room_occupant_insertion_and_presence_fan_out() {
+        let clients: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let rooms: RoomRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Message>();
+        let mut session_a = ClientSession {
+            auth_hex: Some("aaaa".to_string()),
+            bound_jid: "aaaa@127.0.0.1/web".to_string(),
+            bound_bare: "aaaa@127.0.0.1".to_string(),
+            own_tx: tx_a,
+        };
+
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Message>();
+        let mut session_b = ClientSession {
+            auth_hex: Some("bbbb".to_string()),
+            bound_jid: "bbbb@127.0.0.1/mobile".to_string(),
+            bound_bare: "bbbb@127.0.0.1".to_string(),
+            own_tx: tx_b,
+        };
+
+        // 1. Alice joins room
+        let mut buf_a = "<presence to=\"general@conference.127.0.0.1/alice\"/>".to_string();
+        assert!(process_xmpp_buffer(&mut buf_a, &mut session_a, "pass", &clients, &rooms).await);
+
+        // Verify room and occupant in registry
+        {
+            let map = rooms.lock().unwrap();
+            let room = map.get("general@conference.127.0.0.1").expect("Room should exist");
+            assert_eq!(room.occupants.len(), 1);
+            let occ = room.occupants.get("aaaa@127.0.0.1").expect("Alice should be occupant");
+            assert_eq!(occ.nickname, "alice");
+            assert_eq!(occ.bare_jid, "aaaa@127.0.0.1");
+        }
+
+        // Alice receives her own join presence
+        let msg_a1 = rx_a.try_recv().expect("Alice should receive join presence");
+        assert_eq!(
+            msg_a1.to_text().unwrap(),
+            "<presence from=\"general@conference.127.0.0.1/alice\"/>"
+        );
+        assert!(rx_a.try_recv().is_err()); // No other messages
+
+        // 2. Bob joins room
+        let mut buf_b = "<presence to=\"general@conference.127.0.0.1/bob\"/>".to_string();
+        assert!(process_xmpp_buffer(&mut buf_b, &mut session_b, "pass", &clients, &rooms).await);
+
+        // Verify room occupants
+        {
+            let map = rooms.lock().unwrap();
+            let room = map.get("general@conference.127.0.0.1").unwrap();
+            assert_eq!(room.occupants.len(), 2);
+            assert!(room.occupants.contains_key("aaaa@127.0.0.1"));
+            assert!(room.occupants.contains_key("bbbb@127.0.0.1"));
+        }
+
+        // Alice receives Bob's join presence broadcast
+        let msg_a2 = rx_a.try_recv().expect("Alice should receive Bob's presence broadcast");
+        assert_eq!(
+            msg_a2.to_text().unwrap(),
+            "<presence from=\"general@conference.127.0.0.1/bob\"/>"
+        );
+
+        // Bob receives his own join presence broadcast
+        let msg_b1 = rx_b.try_recv().expect("Bob should receive his own presence broadcast");
+        assert_eq!(
+            msg_b1.to_text().unwrap(),
+            "<presence from=\"general@conference.127.0.0.1/bob\"/>"
+        );
+
+        // Bob receives Alice's echoed existing occupant presence
+        let msg_b2 = rx_b.try_recv().expect("Bob should receive Alice's echoed presence");
+        assert_eq!(
+            msg_b2.to_text().unwrap(),
+            "<presence from=\"general@conference.127.0.0.1/alice\"/>"
+        );
+
+        // Channels should now be empty
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_muc_groupchat_message_fan_out() {
+        let clients: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let rooms: RoomRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Message>();
+        let mut session_a = ClientSession {
+            auth_hex: Some("aaaa".to_string()),
+            bound_jid: "aaaa@127.0.0.1/web".to_string(),
+            bound_bare: "aaaa@127.0.0.1".to_string(),
+            own_tx: tx_a,
+        };
+
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Message>();
+        let mut session_b = ClientSession {
+            auth_hex: Some("bbbb".to_string()),
+            bound_jid: "bbbb@127.0.0.1/mobile".to_string(),
+            bound_bare: "bbbb@127.0.0.1".to_string(),
+            own_tx: tx_b,
+        };
+
+        let (tx_c, mut rx_c) = mpsc::unbounded_channel::<Message>();
+        let mut session_c = ClientSession {
+            auth_hex: Some("cccc".to_string()),
+            bound_jid: "cccc@127.0.0.1/desktop".to_string(),
+            bound_bare: "cccc@127.0.0.1".to_string(),
+            own_tx: tx_c,
+        };
+
+        // Alice and Bob join
+        let mut join_a = "<presence to=\"lounge@conference.127.0.0.1/alice\"/>".to_string();
+        process_xmpp_buffer(&mut join_a, &mut session_a, "pass", &clients, &rooms).await;
+        let mut join_b = "<presence to=\"lounge@conference.127.0.0.1/bob\"/>".to_string();
+        process_xmpp_buffer(&mut join_b, &mut session_b, "pass", &clients, &rooms).await;
+
+        // Drain join presences
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        // Alice sends groupchat message
+        let mut msg_stanza = "<message type=\"groupchat\" to=\"lounge@conference.127.0.0.1\"><body>Hello everyone!</body></message>".to_string();
+        process_xmpp_buffer(&mut msg_stanza, &mut session_a, "pass", &clients, &rooms).await;
+
+        // Both Alice and Bob should receive the groupchat message with rewritten from
+        let got_a = rx_a.try_recv().expect("Alice should receive reflected groupchat message");
+        let got_b = rx_b.try_recv().expect("Bob should receive groupchat message");
+
+        let text_a = got_a.to_text().unwrap();
+        let text_b = got_b.to_text().unwrap();
+
+        assert_eq!(text_a, text_b);
+        assert!(text_a.contains("from='lounge@conference.127.0.0.1/alice'") || text_a.contains("from=\"lounge@conference.127.0.0.1/alice\""));
+        assert!(text_a.contains("type=\"groupchat\"") || text_a.contains("type='groupchat'"));
+        assert!(text_a.contains("<body>Hello everyone!</body>"));
+
+        // Charlie (not an occupant) tries to send groupchat message to lounge
+        let mut intruder_stanza = "<message type=\"groupchat\" to=\"lounge@conference.127.0.0.1\"><body>Intruder here</body></message>".to_string();
+        process_xmpp_buffer(&mut intruder_stanza, &mut session_c, "pass", &clients, &rooms).await;
+
+        // Charlie receives error stanza
+        let err_c = rx_c.try_recv().expect("Charlie should receive error");
+        assert!(err_c.to_text().unwrap().contains("<not-acceptable/>"));
+
+        // Occupants receive nothing from intruder
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+
+        // Message to non-existent room
+        let mut nonexist_stanza = "<message type=\"groupchat\" to=\"ghost@conference.127.0.0.1\"><body>Ghost room</body></message>".to_string();
+        process_xmpp_buffer(&mut nonexist_stanza, &mut session_a, "pass", &clients, &rooms).await;
+        let err_a = rx_a.try_recv().expect("Alice should receive service-unavailable");
+        assert!(err_a.to_text().unwrap().contains("<service-unavailable/>"));
+    }
+
+    #[tokio::test]
+    async fn test_muc_room_deletion_when_last_occupant_leaves() {
+        let clients: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let rooms: RoomRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Message>();
+        let mut session_a = ClientSession {
+            auth_hex: Some("aaaa".to_string()),
+            bound_jid: "aaaa@127.0.0.1/web".to_string(),
+            bound_bare: "aaaa@127.0.0.1".to_string(),
+            own_tx: tx_a,
+        };
+
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Message>();
+        let mut session_b = ClientSession {
+            auth_hex: Some("bbbb".to_string()),
+            bound_jid: "bbbb@127.0.0.1/mobile".to_string(),
+            bound_bare: "bbbb@127.0.0.1".to_string(),
+            own_tx: tx_b,
+        };
+
+        // Alice and Bob join
+        let mut join_a = "<presence to=\"ephemeral@conference.127.0.0.1/alice\"/>".to_string();
+        process_xmpp_buffer(&mut join_a, &mut session_a, "pass", &clients, &rooms).await;
+        let mut join_b = "<presence to=\"ephemeral@conference.127.0.0.1/bob\"/>".to_string();
+        process_xmpp_buffer(&mut join_b, &mut session_b, "pass", &clients, &rooms).await;
+
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        // Bob leaves
+        let mut leave_b = "<presence to=\"ephemeral@conference.127.0.0.1/bob\" type=\"unavailable\"/>".to_string();
+        process_xmpp_buffer(&mut leave_b, &mut session_b, "pass", &clients, &rooms).await;
+
+        // Alice receives Bob's unavailable presence
+        let unavail_b = rx_a.try_recv().expect("Alice should receive Bob's departure");
+        assert_eq!(
+            unavail_b.to_text().unwrap(),
+            "<presence from=\"ephemeral@conference.127.0.0.1/bob\" type=\"unavailable\"/>"
+        );
+
+        // Room still exists with Alice
+        {
+            let map = rooms.lock().unwrap();
+            let room = map.get("ephemeral@conference.127.0.0.1").expect("Room should still exist");
+            assert_eq!(room.occupants.len(), 1);
+            assert!(room.occupants.contains_key("aaaa@127.0.0.1"));
+            assert!(!room.occupants.contains_key("bbbb@127.0.0.1"));
+        }
+
+        // Alice leaves (last occupant)
+        let mut leave_a = "<presence to=\"ephemeral@conference.127.0.0.1/alice\" type=\"unavailable\"/>".to_string();
+        process_xmpp_buffer(&mut leave_a, &mut session_a, "pass", &clients, &rooms).await;
+
+        // Room should be completely deleted from registry
+        {
+            let map = rooms.lock().unwrap();
+            assert!(!map.contains_key("ephemeral@conference.127.0.0.1"));
+            assert!(map.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_muc_transient_cleanup_on_disconnect() {
+        let clients: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let rooms: RoomRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Message>();
+        let mut session_a = ClientSession {
+            auth_hex: Some("aaaa".to_string()),
+            bound_jid: "aaaa@127.0.0.1/web".to_string(),
+            bound_bare: "aaaa@127.0.0.1".to_string(),
+            own_tx: tx_a,
+        };
+
+        let (tx_b, _rx_b) = mpsc::unbounded_channel::<Message>();
+        let mut session_b = ClientSession {
+            auth_hex: Some("bbbb".to_string()),
+            bound_jid: "bbbb@127.0.0.1/mobile".to_string(),
+            bound_bare: "bbbb@127.0.0.1".to_string(),
+            own_tx: tx_b,
+        };
+
+        // Alice and Bob join
+        let mut join_a = "<presence to=\"transient@conference.127.0.0.1/alice\"/>".to_string();
+        process_xmpp_buffer(&mut join_a, &mut session_a, "pass", &clients, &rooms).await;
+        let mut join_b = "<presence to=\"transient@conference.127.0.0.1/bob\"/>".to_string();
+        process_xmpp_buffer(&mut join_b, &mut session_b, "pass", &clients, &rooms).await;
+
+        while rx_a.try_recv().is_ok() {}
+
+        // Bob disconnects without explicit presence
+        unregister_occupant_from_rooms(&rooms, &session_b.bound_bare, &session_b.own_tx);
+
+        // Alice receives unavailable presence for Bob
+        let unavail = rx_a.try_recv().expect("Alice should receive Bob's disconnect presence");
+        assert_eq!(
+            unavail.to_text().unwrap(),
+            "<presence from=\"transient@conference.127.0.0.1/bob\" type=\"unavailable\"/>"
+        );
+
+        // Alice disconnects
+        unregister_occupant_from_rooms(&rooms, &session_a.bound_bare, &session_a.own_tx);
+
+        // Room is deleted
+        assert!(rooms.lock().unwrap().is_empty());
     }
 }
