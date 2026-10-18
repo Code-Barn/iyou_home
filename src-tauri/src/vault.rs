@@ -28,6 +28,7 @@ use k256::schnorr::SigningKey as SecpSigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 // Identity Graduation transit crypto (AGENT.md §16 / AUTH_FLOW_SPECIFICATION §16).
@@ -1692,6 +1693,59 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
     vault.profiles.sort_by_key(|p| p.derivation_index);
 
     Ok(new_persona)
+}
+
+pub fn create_ephemeral_burner(vault: &mut VaultStore, challenge_context: &str) -> Result<Profile, String> {
+    let seed = bs58::decode(&vault.root_seed_base58)
+        .into_vec()
+        .map_err(|_| "Invalid root seed encoding".to_string())?;
+    if seed.len() != 32 {
+        return Err("Root seed must be 32 bytes".to_string());
+    }
+
+    let max_index = vault
+        .profiles
+        .iter()
+        .map(|p| p.derivation_index)
+        .max()
+        .unwrap_or(1);
+    let derivation_index = std::cmp::max(2, max_index + 1);
+
+    let challenge = if challenge_context.is_empty() {
+        "ephemeral".to_string()
+    } else {
+        challenge_context.to_string()
+    };
+    let uuid = uuid::Uuid::new_v4();
+    let profile_id = format!("burner_{}_{}", challenge.replace(|c: char| !c.is_alphanumeric(), "_"), uuid.simple());
+
+    let kp = derive_deterministic_keypair(&seed, derivation_index);
+    let nostr_pk = derive_secp256k1_pubkey_hex(&seed, derivation_index);
+
+    let profile = Profile {
+        profile_id,
+        profile_name: "Ephemeral Burner".to_string(),
+        derivation_index,
+        did: kp.did,
+        credentials: vec![],
+        nostr_pubkey_hex: nostr_pk,
+        level: 2,
+        is_system_reserved: false,
+        active: false,
+        imported_seed_b58: None,
+        imported_nostr_sk_hex: None,
+        handle: None,
+        display_name: None,
+        avatar_url: None,
+        banner_url: None,
+        bio: None,
+        nip05: None,
+    };
+
+    vault.profiles.push(profile.clone());
+    vault.profiles.sort_by_key(|p| p.derivation_index);
+
+    Ok(profile)
 }
 
 pub fn derive_dependent_identity(
@@ -5149,5 +5203,29 @@ mod tests {
         assert!(projection.get("credentials").is_none());
         assert_eq!(projection["did"], primary.did);
         assert_eq!(projection["nostr_pubkey_hex"], primary.nostr_pubkey_hex);
+    }
+
+    #[test]
+    fn test_create_ephemeral_burner_derives_level2_identity() {
+        let mut vault = rfc006_test_vault();
+        let initial_len = vault.profiles.len();
+        let burner = create_ephemeral_burner(&mut vault, "https://wun.iyou.me/login?challenge=abc")
+            .expect("ephemeral burner derivation succeeds");
+
+        assert_eq!(vault.profiles.len(), initial_len + 1);
+        assert_eq!(burner.level, 2);
+        assert!(!burner.is_system_reserved);
+        assert!(!burner.active);
+        assert!(burner.derivation_index >= 2);
+        assert!(burner.profile_id.starts_with("burner_"));
+        assert!(burner.did.starts_with("did:key:z6Mk"));
+        assert_eq!(burner.nostr_pubkey_hex.len(), 64);
+
+        // Second ephemeral burner advances derivation index monotonically
+        let burner2 = create_ephemeral_burner(&mut vault, "")
+            .expect("second ephemeral burner succeeds");
+        assert_eq!(burner2.derivation_index, burner.derivation_index + 1);
+        assert_ne!(burner2.did, burner.did);
+        assert_ne!(burner2.profile_id, burner.profile_id);
     }
 }

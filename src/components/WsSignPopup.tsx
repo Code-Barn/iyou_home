@@ -127,6 +127,7 @@ export default function WsSignPopup({
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [autoSign, setAutoSign] = useState(false);
+  const [useEphemeralBurner, setUseEphemeralBurner] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string>("primary");
   const [selectedProfileId, setSelectedProfileId] = useState<string>("");
@@ -175,12 +176,28 @@ export default function WsSignPopup({
     }
     setIsProcessing(true);
 
-    const effectiveProfileId =
+    let effectiveProfileId =
       targetProfileIdArg !== undefined
         ? targetProfileIdArg
         : (currentSigningProfile?.profile_id || activeProfileId || null);
 
     try {
+      if (approved && useEphemeralBurner && targetProfileIdArg === undefined) {
+        const challengeContext =
+          activeReq.type === "sign" || activeReq.type === "POLY_CREDENTIAL_REQUEST"
+            ? activeReq.challenge
+            : activeReq.type;
+        const burner = await invoke<Profile>("create_ephemeral_burner_cmd", {
+          challenge: challengeContext || null,
+        });
+        if (burner?.profile_id) {
+          effectiveProfileId = burner.profile_id;
+          const updated = [...profilesRef.current, burner];
+          profilesRef.current = updated;
+          setProfiles(updated);
+        }
+      }
+
       if (import.meta.env.DEV)
         console.log("[TAURI_SIGN] Triggering response submission with profile:", effectiveProfileId);
 
@@ -224,11 +241,13 @@ export default function WsSignPopup({
     } catch (err) {
       console.error("[TAURI_ERROR] Core socket write failed:", err);
       setIsProcessing(false);
+      setUseEphemeralBurner(false);
       setRequest(null);
       return;
     }
 
     setIsProcessing(false);
+    setUseEphemeralBurner(false);
     setRequest(null);
   };
 
@@ -498,16 +517,18 @@ export default function WsSignPopup({
                 id="signing-persona-select"
                 aria-label="Signing Persona"
                 value={effectiveSelectedId}
+                disabled={useEphemeralBurner}
                 onChange={(e) => setSelectedProfileId(e.target.value)}
                 style={{
                   padding: "0.4rem 0.75rem",
                   borderRadius: "6px",
                   border: "1px solid #93c5fd",
-                  background: "white",
+                  background: useEphemeralBurner ? "#f3f4f6" : "white",
                   fontSize: "0.85rem",
                   fontWeight: 500,
                   color: "#1e40af",
-                  cursor: "pointer",
+                  cursor: useEphemeralBurner ? "not-allowed" : "pointer",
+                  opacity: useEphemeralBurner ? 0.65 : 1,
                 }}
               >
                 {profiles.map((p) => (
@@ -519,7 +540,7 @@ export default function WsSignPopup({
               </select>
             </div>
 
-            {currentSigningProfile && (
+            {currentSigningProfile && !useEphemeralBurner && (
               <div
                 style={{
                   display: "flex",
@@ -554,6 +575,31 @@ export default function WsSignPopup({
                 </div>
               </div>
             )}
+
+            <label
+              htmlFor="ephemeral-burner-toggle"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "0.5rem",
+                fontSize: "0.82rem",
+                color: "#065f46",
+                background: useEphemeralBurner ? "#ecfdf5" : "rgba(255, 255, 255, 0.6)",
+                padding: "0.45rem 0.65rem",
+                borderRadius: "6px",
+                border: useEphemeralBurner ? "1px solid #6ee7b7" : "1px solid #dbeafe",
+                cursor: "pointer",
+                fontWeight: 500,
+              }}
+            >
+              <input
+                id="ephemeral-burner-toggle"
+                type="checkbox"
+                checked={useEphemeralBurner}
+                onChange={(e) => setUseEphemeralBurner(e.target.checked)}
+              />
+              <span>🎭 Derive one-time ephemeral burner (Level 2) for this request</span>
+            </label>
           </div>
         )}
 

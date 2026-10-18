@@ -33,6 +33,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
+use crate::vault::Profile;
 mod biometrics;
 mod blossom;
 pub mod bridge;
@@ -3789,6 +3790,16 @@ fn dispatch_nostr_event(
     Ok(event)
 }
 
+
+
+#[tauri::command]
+fn create_ephemeral_burner_cmd(app: AppHandle, challenge: Option<String>) -> Result<Profile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let ctx = challenge.unwrap_or_default();
+    let profile = vault::create_ephemeral_burner(&mut vault, &ctx)?;
+    vault::save_vault(&app, &vault)?;
+    Ok(profile)
+}
 #[tauri::command]
 fn get_enclave_diagnostics(
     app: AppHandle,
@@ -4118,6 +4129,7 @@ pub fn run() {
             trigger_manual_sync,
             get_ecosystem_footprint,
             dispatch_nostr_event,
+            create_ephemeral_burner_cmd,
             get_enclave_diagnostics,
             record_backup_timestamp,
             get_relay_mesh,

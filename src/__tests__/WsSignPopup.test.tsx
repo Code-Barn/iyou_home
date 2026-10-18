@@ -63,6 +63,15 @@ const mockInvoke = vi.hoisted(() =>
         return Promise.resolve(mockProfiles);
       case "get_active_did":
         return Promise.resolve("did:key:z6MkBurner22222222222222222222222222"); // Burner Alpha is active
+      case "create_ephemeral_burner_cmd":
+        return Promise.resolve({
+          profile_id: "burner_ephemeral_test_99",
+          profile_name: "Ephemeral Burner",
+          derivation_index: 5,
+          did: "did:key:z6MkEphemeralBurner5555555555555555",
+          level: 2,
+          is_system_reserved: false,
+        } as Profile);
       case "submit_ws_response":
       case "submit_ws_event_response":
       case "submit_ws_credential_response":
@@ -235,6 +244,46 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
         challenge: "challenge-to-deny",
         approved: false,
         profileId: "burner_alpha",
+      });
+    });
+  });
+
+  it("derives an ephemeral burner via create_ephemeral_burner_cmd when toggle is checked", async () => {
+    await act(async () => {
+      render(<WsSignPopup />);
+    });
+
+    await act(async () => {
+      channelCallback?.(
+        JSON.stringify({
+          __type__: "sign",
+          challenge: "ephemeral-challenge-xyz",
+        }),
+      );
+    });
+
+    const toggle = screen.getByLabelText(/Derive one-time ephemeral burner/i) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    expect(toggle.checked).toBe(true);
+
+    const approveBtn = screen.getByRole("button", { name: /Approve & Sign/i });
+    await act(async () => {
+      fireEvent.click(approveBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("create_ephemeral_burner_cmd", {
+        challenge: "ephemeral-challenge-xyz",
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("submit_ws_response", {
+        id: "",
+        challenge: "ephemeral-challenge-xyz",
+        approved: true,
+        profileId: "burner_ephemeral_test_99",
       });
     });
   });

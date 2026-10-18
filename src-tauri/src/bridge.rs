@@ -800,6 +800,77 @@ where
                     continue;
                 }
 
+                if json["type"] == "DERIVE_EPHEMERAL_BURNER" {
+                    if crate::enclave_is_locked(&app_handle) {
+                        println!("DEBUG: Rejected DERIVE_EPHEMERAL_BURNER — enclave locked");
+                        crate::focus_main_window(&app_handle);
+                        let _ = response_tx.send(Message::Text(
+                            crate::enclave_locked_error().to_string().into(),
+                        ));
+                        continue;
+                    }
+                    let challenge = json["challenge"].as_str().map(|s| s.to_string());
+                    let app_handle_clone = app_handle.clone();
+                    let response_tx_clone = response_tx.clone();
+                    tokio::spawn(async move {
+                        match crate::vault::load_vault(&app_handle_clone) {
+                            Ok(mut vault) => {
+                                let ctx = challenge.unwrap_or_default();
+                                match crate::vault::create_ephemeral_burner(&mut vault, &ctx) {
+                                    Ok(burner) => {
+                                        if let Err(e) = crate::vault::save_vault(&app_handle_clone, &vault) {
+                                            eprintln!("DERIVE_EPHEMERAL_BURNER failed to persist: {}", e);
+                                            let _ = response_tx_clone.send(Message::Text(
+                                                serde_json::json!({
+                                                    "type": "error",
+                                                    "message": format!("Failed to persist vault: {}", e)
+                                                })
+                                                .to_string()
+                                                .into(),
+                                            ));
+                                            return;
+                                        }
+                                        let payload = serde_json::json!({
+                                            "type": "ephemeral_burner_derived",
+                                            "profile": {
+                                                "profile_id": burner.profile_id,
+                                                "did": burner.did,
+                                                "derivation_index": burner.derivation_index,
+                                                "nostr_pubkey_hex": burner.nostr_pubkey_hex,
+                                                "level": 2
+                                            }
+                                        });
+                                        let _ = response_tx_clone.send(Message::Text(payload.to_string().into()));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("DERIVE_EPHEMERAL_BURNER failed: {}", e);
+                                        let _ = response_tx_clone.send(Message::Text(
+                                            serde_json::json!({
+                                                "type": "error",
+                                                "message": e
+                                            })
+                                            .to_string()
+                                            .into(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("DERIVE_EPHEMERAL_BURNER failed to load vault: {}", e);
+                                let _ = response_tx_clone.send(Message::Text(
+                                    serde_json::json!({
+                                        "type": "error",
+                                        "message": format!("Failed to load vault: {}", e)
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ));
+                            }
+                        }
+                    });
+                    continue;
+                }
+
                 if is_sign && (json["challenge"].is_string() || json["data"].is_string() || json["message"].is_string()) {
                     let challenge = json["challenge"]
                         .as_str()
