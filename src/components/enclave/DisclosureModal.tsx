@@ -162,7 +162,8 @@ export default function DisclosureModal({
   );
   const targetTrustLevel = targetContact?.trust_level ?? null;
 
-  // Load EmailOwnershipCredentials for the signing persona whenever it changes.
+  // Load EmailOwnershipCredentials for the signing persona whenever it changes,
+  // scoped to credentials linked to the active profile (or unassigned credentials).
   useEffect(() => {
     let cancelled = false;
     if (!signingProfileId) {
@@ -174,7 +175,23 @@ export default function DisclosureModal({
         const creds = await invoke<Array<Record<string, unknown>>>("get_credentials", {
           profileId: signingProfileId,
         });
-        if (!cancelled) setEmailOptions(toEmailOwnershipOptions(creds || []));
+        if (!cancelled) {
+          const allOptions = toEmailOwnershipOptions(creds || []);
+          const currentProfile = profiles.find((p) => p.profile_id === signingProfileId);
+          const activeLinkedIds = currentProfile?.linked_credential_ids ?? [];
+          const assignedToOtherIds = new Set(
+            profiles
+              .filter((p) => p.profile_id !== signingProfileId)
+              .flatMap((p) => p.linked_credential_ids ?? []),
+          );
+
+          const scopedOptions =
+            activeLinkedIds.length > 0
+              ? allOptions.filter((opt) => activeLinkedIds.includes(opt.vc_id))
+              : allOptions.filter((opt) => !assignedToOtherIds.has(opt.vc_id));
+
+          setEmailOptions(scopedOptions);
+        }
       } catch {
         // A missing/failed credential read must not block card generation;
         // the card simply discloses no email claims.
@@ -185,7 +202,7 @@ export default function DisclosureModal({
     return () => {
       cancelled = true;
     };
-  }, [signingProfileId]);
+  }, [signingProfileId, profiles]);
 
   /**
    * Apply trust-tier defaults for the current disclosure context.
@@ -199,7 +216,7 @@ export default function DisclosureModal({
    * Re-applying is skipped while the context is unchanged, so manual checkbox
    * toggles within one contact survive re-renders and credential refetches.
    */
-  const emailContextKey = `${targetContact?.peer_id ?? "none"}::${emailOptions
+  const emailContextKey = `${signingProfileId}::${targetContact?.peer_id ?? "none"}::${emailOptions
     .map((o) => o.vc_id)
     .join(",")}`;
   const lastEmailContextRef = useRef<string | null>(null);
@@ -670,7 +687,9 @@ export default function DisclosureModal({
                             style={{ marginTop: "0.2rem" }}
                           />
                           <div>
-                            <strong>{opt.email ?? "— email not disclosed —"}</strong>{" "}
+                            <strong data-testid={`disclosure-email-option-${opt.vc_id}`}>
+                              {opt.email ?? "— email not disclosed —"}
+                            </strong>{" "}
                             <span style={{ color: "#6b7280", fontSize: "0.75rem" }}>
                               ({opt.email_type})
                             </span>

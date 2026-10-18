@@ -464,4 +464,90 @@ describe("TrustAssets", () => {
       );
     });
   });
+
+  it("assigns and moves a credential between personas via Tauri IPC and updates UI state", async () => {
+    const linkMock = vi.fn().mockImplementation((args: any) =>
+      Promise.resolve({
+        ...mockProfiles.find((p) => p.profile_id === args.profileId),
+        linked_credential_ids: [args.credentialId],
+      }),
+    );
+    const unlinkMock = vi.fn().mockImplementation((args: any) =>
+      Promise.resolve({
+        ...mockProfiles.find((p) => p.profile_id === args.profileId),
+        linked_credential_ids: [],
+      }),
+    );
+
+    const creds = [
+      {
+        vc_id: "urn:uuid:email-vc-1",
+        issuer_did: "did:web:iyou.me",
+        subject_did: mockDid,
+        credential_type: "EmailOwnershipCredential",
+        fidelity_score: null,
+        expiration_date: null,
+        raw_payload: JSON.stringify(EMAIL_VC),
+      },
+    ];
+
+    (invoke as any).mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "get_active_did") return Promise.resolve(mockDid);
+      if (cmd === "list_profiles") return Promise.resolve(mockProfiles);
+      if (cmd === "get_credentials") return Promise.resolve(creds);
+      if (cmd === "link_credential_to_profile_cmd") return linkMock(args);
+      if (cmd === "unlink_credential_from_profile_cmd") return unlinkMock(args);
+      return Promise.reject(new Error(`unmocked: ${cmd}`));
+    });
+
+    render(<TrustAssets />);
+    await waitFor(() => {
+      expect(screen.getByText("Email Ownership")).toBeInTheDocument();
+    });
+
+    // Initially unassigned
+    expect(
+      screen.getByTestId("assigned-persona-none-urn:uuid:email-vc-1"),
+    ).toHaveTextContent("Unassigned");
+
+    const assignSelect = screen.getByTestId(
+      "persona-assignment-select-urn:uuid:email-vc-1",
+    ) as HTMLSelectElement;
+
+    // Assign to L2 Contextual Alias ("alt" / "Alt Persona")
+    fireEvent.change(assignSelect, { target: { value: "alt" } });
+
+    await waitFor(() => {
+      expect(linkMock).toHaveBeenCalledWith({
+        profileId: "alt",
+        credentialId: "urn:uuid:email-vc-1",
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("assigned-persona-badge-urn:uuid:email-vc-1-alt"),
+      ).toHaveTextContent("Alt Persona");
+    });
+
+    // Move credential to L1 Primary ("primary" / "Primary Identity")
+    fireEvent.change(assignSelect, { target: { value: "primary" } });
+
+    await waitFor(() => {
+      expect(unlinkMock).toHaveBeenCalledWith({
+        profileId: "alt",
+        credentialId: "urn:uuid:email-vc-1",
+      });
+      expect(linkMock).toHaveBeenCalledWith({
+        profileId: "primary",
+        credentialId: "urn:uuid:email-vc-1",
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("assigned-persona-badge-urn:uuid:email-vc-1-primary"),
+      ).toHaveTextContent("Primary Identity");
+    });
+  });
 });

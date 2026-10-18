@@ -83,6 +83,8 @@ pub struct Profile {
     pub bio: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nip05: Option<String>, // canonical "handle@iyou.me" — always derived, never client-supplied
+    #[serde(default)]
+    pub linked_credential_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +294,84 @@ impl VaultStore {
         } else {
             self.profiles.iter().find(|p| p.profile_id == id)
         }
+    }
+
+    /// Link a credential ID to a specific profile (L0 Anchor, L1 Primary, or L2 Contextual Alias).
+    /// Prevents duplicate credential IDs in `linked_credential_ids`.
+    pub fn link_credential_to_profile(
+        &mut self,
+        profile_id: &str,
+        credential_id: &str,
+    ) -> Result<Profile, String> {
+        let pid = profile_id.trim();
+        let cid = credential_id.trim();
+        if pid.is_empty() {
+            return Err("profile_id must not be empty".to_string());
+        }
+        if cid.is_empty() {
+            return Err("credential_id must not be empty".to_string());
+        }
+
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.profile_id == pid)
+            .ok_or_else(|| format!("Profile '{}' not found", pid))?;
+
+        if !profile.linked_credential_ids.iter().any(|id| id == cid) {
+            profile.linked_credential_ids.push(cid.to_string());
+        }
+
+        Ok(profile.clone())
+    }
+
+    /// Unlink a credential ID from a specific profile.
+    pub fn unlink_credential_from_profile(
+        &mut self,
+        profile_id: &str,
+        credential_id: &str,
+    ) -> Result<Profile, String> {
+        let pid = profile_id.trim();
+        let cid = credential_id.trim();
+        if pid.is_empty() {
+            return Err("profile_id must not be empty".to_string());
+        }
+        if cid.is_empty() {
+            return Err("credential_id must not be empty".to_string());
+        }
+
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.profile_id == pid)
+            .ok_or_else(|| format!("Profile '{}' not found", pid))?;
+
+        profile.linked_credential_ids.retain(|id| id != cid);
+
+        Ok(profile.clone())
+    }
+
+    /// Return all VaultCredentials linked to `profile_id` via `linked_credential_ids`.
+    pub fn get_profile_credentials(&self, profile_id: &str) -> Vec<VaultCredential> {
+        let Some(profile) = self.profiles.iter().find(|p| p.profile_id == profile_id) else {
+            return Vec::new();
+        };
+
+        let mut resolved = Vec::new();
+        for cid in &profile.linked_credential_ids {
+            if resolved.iter().any(|c: &VaultCredential| &c.vc_id == cid) {
+                continue;
+            }
+            if let Some(cred) = self
+                .profiles
+                .iter()
+                .flat_map(|p| p.credentials.iter())
+                .find(|c| &c.vc_id == cid)
+            {
+                resolved.push(cred.clone());
+            }
+        }
+        resolved
     }
 }
 
@@ -1023,6 +1103,7 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             banner_url: None,
             bio: None,
             nip05: None,
+            linked_credential_ids: vec![],
         },
         Profile {
             profile_id: DEFAULT_PERSONA_PROFILE_ID.to_string(),
@@ -1042,6 +1123,7 @@ pub fn initial_profiles(seed: &[u8]) -> Vec<Profile> {
             banner_url: None,
             bio: None,
             nip05: None,
+            linked_credential_ids: vec![],
         },
     ]
 }
@@ -1301,6 +1383,7 @@ pub fn heal_reserved_profiles(vault: &mut VaultStore) -> Result<bool, String> {
             banner_url: None,
             bio: None,
             nip05: None,
+            linked_credential_ids: vec![],
         });
         changed = true;
     }
@@ -1456,6 +1539,7 @@ pub fn add_profile(
         banner_url: None,
         bio: None,
         nip05: None,
+        linked_credential_ids: vec![],
     };
 
     vault.profiles.push(profile.clone());
@@ -1687,6 +1771,7 @@ pub fn rotate_public_persona(vault: &mut VaultStore) -> Result<Profile, String> 
         banner_url: None,
         bio: None,
         nip05: None,
+        linked_credential_ids: vec![],
     };
 
     vault.profiles.push(new_persona.clone());
@@ -1740,6 +1825,7 @@ pub fn create_ephemeral_burner(vault: &mut VaultStore, challenge_context: &str) 
         banner_url: None,
         bio: None,
         nip05: None,
+        linked_credential_ids: vec![],
     };
 
     vault.profiles.push(profile.clone());
@@ -1814,6 +1900,7 @@ pub fn import_graduated_dependent(
         banner_url: None,
         bio: None,
         nip05: None,
+        linked_credential_ids: vec![],
     };
 
     // 3. Ingest leaf keypair directly into L1 Primary slot, preserving DID/pubkey continuity
@@ -1839,6 +1926,7 @@ pub fn import_graduated_dependent(
         banner_url: None,
         bio: None,
         nip05: None,
+        linked_credential_ids: vec![],
     };
 
     let sovereign_record = SovereignIdentity {
@@ -3119,6 +3207,7 @@ mod tests {
                 banner_url: None,
                 bio: None,
                 nip05: None,
+                linked_credential_ids: vec![],
             }],
             sovereign_identities: Vec::new(),
             dependents: Vec::new(),
@@ -4206,6 +4295,7 @@ mod tests {
                 banner_url: None,
                 bio: None,
                 nip05: None,
+                linked_credential_ids: vec![],
             }],
             sovereign_identities: vec![],
             dependents: vec![],
@@ -4895,6 +4985,7 @@ mod tests {
             banner_url: None,
             bio: None,
             nip05: None,
+            linked_credential_ids: vec![],
         });
         vault
     }
@@ -5227,5 +5318,137 @@ mod tests {
         assert_eq!(burner2.derivation_index, burner.derivation_index + 1);
         assert_ne!(burner2.did, burner.did);
         assert_ne!(burner2.profile_id, burner.profile_id);
+    }
+
+    #[test]
+    fn test_link_and_unlink_credentials_to_profile_and_persistence() {
+        let mut path = temp_dir();
+        path.push("test_persona_credential_mapping_vault.json");
+        let _ = fs::remove_file(&path);
+
+        let mut vault = rfc006_test_vault();
+
+        let vc_personal = serde_json::json!({
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "id": "urn:uuid:vc-email-personal",
+            "type": ["VerifiableCredential", "EmailOwnershipCredential"],
+            "issuer": "did:web:iyou.me",
+            "issuanceDate": "2026-10-18T00:00:00Z",
+            "credentialSubject": {
+                "id": "did:key:z6MkPrimary",
+                "email": "david@personal.me"
+            },
+            "proof": {
+                "type": "Ed25519Signature2020",
+                "proofValue": "zSig1"
+            }
+        });
+
+        let vc_alias = serde_json::json!({
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "id": "urn:uuid:vc-email-dadbod",
+            "type": ["VerifiableCredential", "EmailOwnershipCredential"],
+            "issuer": "did:web:iyou.me",
+            "issuanceDate": "2026-10-18T00:00:00Z",
+            "credentialSubject": {
+                "id": "did:key:z6MkBurnerAb",
+                "email": "baddod13@gmail.com"
+            },
+            "proof": {
+                "type": "Ed25519Signature2020",
+                "proofValue": "zSig2"
+            }
+        });
+
+        add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, vc_personal)
+            .expect("ingest personal VC");
+        add_credential_to_profile(&mut vault, DEFAULT_PERSONA_PROFILE_ID, vc_alias)
+            .expect("ingest alias VC");
+
+        // Link personal VC to L1 Primary and alias VC to L2 burner_ab
+        let updated_primary = vault
+            .link_credential_to_profile(DEFAULT_PERSONA_PROFILE_ID, "urn:uuid:vc-email-personal")
+            .expect("link to primary succeeds");
+        assert_eq!(
+            updated_primary.linked_credential_ids,
+            vec!["urn:uuid:vc-email-personal".to_string()]
+        );
+
+        // Duplicate link is a no-op (prevents duplicate IDs)
+        let dup_primary = vault
+            .link_credential_to_profile(DEFAULT_PERSONA_PROFILE_ID, "urn:uuid:vc-email-personal")
+            .expect("duplicate link succeeds idempotently");
+        assert_eq!(dup_primary.linked_credential_ids.len(), 1);
+
+        let updated_burner = vault
+            .link_credential_to_profile("burner_ab", "urn:uuid:vc-email-dadbod")
+            .expect("link to L2 burner succeeds");
+        assert_eq!(
+            updated_burner.linked_credential_ids,
+            vec!["urn:uuid:vc-email-dadbod".to_string()]
+        );
+
+        // Level 0 (Anchor) can link credentials locally
+        let updated_anchor = vault
+            .link_credential_to_profile(ANCHOR_PROFILE_ID, "urn:uuid:vc-email-personal")
+            .expect("link to L0 anchor succeeds locally");
+        assert_eq!(
+            updated_anchor.linked_credential_ids,
+            vec!["urn:uuid:vc-email-personal".to_string()]
+        );
+
+        // Security invariant: PublicProfileProjection NEVER exposes linked_credential_ids or credentials
+        let primary_proj = serde_json::to_value(PublicProfileProjection::from(&updated_primary)).unwrap();
+        assert!(primary_proj.get("linked_credential_ids").is_none());
+        assert!(primary_proj.get("credentials").is_none());
+
+        // Scoped retrieval via get_profile_credentials
+        let primary_creds = vault.get_profile_credentials(DEFAULT_PERSONA_PROFILE_ID);
+        assert_eq!(primary_creds.len(), 1);
+        assert_eq!(primary_creds[0].vc_id, "urn:uuid:vc-email-personal");
+
+        let burner_creds = vault.get_profile_credentials("burner_ab");
+        assert_eq!(burner_creds.len(), 1);
+        assert_eq!(burner_creds[0].vc_id, "urn:uuid:vc-email-dadbod");
+
+        // Persist to disk and reload
+        save_vault_inner(&path, &vault).expect("save vault succeeds");
+        let mut reloaded = load_vault_from_path(&path).expect("reload vault succeeds");
+        assert_eq!(
+            reloaded
+                .get_profile_by_id("burner_ab")
+                .unwrap()
+                .linked_credential_ids,
+            vec!["urn:uuid:vc-email-dadbod".to_string()]
+        );
+
+        // Unlink credential from burner_ab
+        let unlinked_burner = reloaded
+            .unlink_credential_from_profile("burner_ab", "urn:uuid:vc-email-dadbod")
+            .expect("unlink from L2 burner succeeds");
+        assert!(unlinked_burner.linked_credential_ids.is_empty());
+        assert!(reloaded.get_profile_credentials("burner_ab").is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_legacy_profile_without_linked_credential_ids_deserializes_cleanly() {
+        let legacy_profile_json = serde_json::json!({
+            "profile_id": "primary",
+            "profile_name": "Primary Identity",
+            "derivation_index": 1,
+            "did": "did:key:z6MkLegacyPrimary",
+            "credentials": [],
+            "nostr_pubkey_hex": "bb".repeat(32),
+            "level": 1,
+            "is_system_reserved": false,
+            "active": true
+        });
+
+        let parsed: Profile = serde_json::from_value(legacy_profile_json)
+            .expect("legacy profile without linked_credential_ids must deserialize");
+        assert!(parsed.linked_credential_ids.is_empty());
+        assert_eq!(parsed.profile_id, "primary");
     }
 }

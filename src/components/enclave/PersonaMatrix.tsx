@@ -116,6 +116,116 @@ export default function PersonaMatrix({
     }
   }, [initialRoles, initialBusinesses]);
 
+  const [profileCredentialsMap, setProfileCredentialsMap] = useState<Record<string, any[]>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const profilesWithLinks = profiles.filter(
+      (p) => Array.isArray(p.linked_credential_ids) && p.linked_credential_ids.length > 0,
+    );
+    if (profilesWithLinks.length === 0) return;
+
+    const loadLinked = async () => {
+      const nextMap: Record<string, any[]> = {};
+      for (const p of profilesWithLinks) {
+        try {
+          const creds = await invoke<any[]>("get_profile_credentials_cmd", {
+            profileId: p.profile_id,
+          });
+          if (Array.isArray(creds) && creds.length > 0) {
+            nextMap[p.profile_id] = creds;
+            continue;
+          }
+        } catch {
+          // Fallback to get_credentials below
+        }
+        try {
+          const creds = await invoke<any[]>("get_credentials", {
+            profileId: p.profile_id,
+          });
+          if (Array.isArray(creds)) {
+            nextMap[p.profile_id] = creds;
+          }
+        } catch {
+          // Ignore if unavailable in mock environment
+        }
+      }
+      if (!cancelled && Object.keys(nextMap).length > 0) {
+        setProfileCredentialsMap((prev) => ({ ...prev, ...nextMap }));
+      }
+    };
+    loadLinked();
+    return () => {
+      cancelled = true;
+    };
+  }, [profiles]);
+
+  const extractEmailFromCred = (cred: any): string | null => {
+    if (!cred) return null;
+    if (typeof cred.email === "string" && cred.email) return cred.email;
+    if (typeof cred.raw_payload === "string" && cred.raw_payload) {
+      try {
+        const parsed = JSON.parse(cred.raw_payload);
+        const email =
+          parsed?.credentialSubject?.email ??
+          parsed?.credentialSubject?.emailAddress ??
+          parsed?.email;
+        if (typeof email === "string" && email) return email;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const getLinkedEmailsForProfile = (p: Profile): string[] => {
+    const linkedIds = p.linked_credential_ids || [];
+    if (linkedIds.length === 0) return [];
+
+    const pool: any[] = [
+      ...(p.credentials || []),
+      ...profiles.flatMap((pr) => pr.credentials || []),
+      ...(profileCredentialsMap[p.profile_id] || []),
+      ...Object.values(profileCredentialsMap).flat(),
+    ];
+
+    const emails: string[] = [];
+    for (const cid of linkedIds) {
+      const matched = pool.find((c) => c && c.vc_id === cid);
+      const email = extractEmailFromCred(matched);
+      if (email && !emails.includes(email)) {
+        emails.push(email);
+      }
+    }
+    return emails;
+  };
+
+  const renderLinkedEmailBadges = (p: Profile) => {
+    const emails = getLinkedEmailsForProfile(p);
+    if (emails.length === 0) return null;
+    return emails.map((email) => (
+      <span
+        key={email}
+        data-testid={`persona-email-badge-${p.profile_id}`}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "0.25rem",
+          background: "#d1fae5",
+          color: "#065f46",
+          border: "1px solid #6ee7b7",
+          padding: "0.15rem 0.55rem",
+          borderRadius: "9999px",
+          fontSize: "0.75rem",
+          fontWeight: 600,
+          fontFamily: "monospace",
+        }}
+      >
+        ✉ {email}
+      </span>
+    ));
+  };
+
   const formatMaskedDid = (did: string): string => {
     if (!did) return "";
     const prefix = did.slice(0, 12);
@@ -558,7 +668,7 @@ export default function PersonaMatrix({
                 marginBottom: "0.5rem",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
                 <strong>{p.profile_name}</strong>
                 <span
                   style={{
@@ -571,6 +681,7 @@ export default function PersonaMatrix({
                 >
                   Derivation Index: #{p.derivation_index}
                 </span>
+                {renderLinkedEmailBadges(p)}
               </div>
               <span style={{ fontSize: "0.8rem", color: "#6d28d9", fontWeight: 600 }}>
                 🔒 Locked Anchor
@@ -767,7 +878,7 @@ export default function PersonaMatrix({
                   gap: "0.5rem",
                 }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
                   <strong style={{ fontSize: "0.95rem" }}>{p.profile_name}</strong>
                   <span
                     style={{
@@ -780,6 +891,7 @@ export default function PersonaMatrix({
                   >
                     Index #{p.derivation_index}
                   </span>
+                  {renderLinkedEmailBadges(p)}
                   {isActive && (
                     <>
                       <span
@@ -1068,7 +1180,7 @@ export default function PersonaMatrix({
                     }}
                   >
                     <div
-                      style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
+                      style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}
                     >
                       <strong style={{ fontSize: "0.95rem" }}>
                         {p.profile_name}
@@ -1084,6 +1196,7 @@ export default function PersonaMatrix({
                       >
                         Index #{p.derivation_index}
                       </span>
+                      {renderLinkedEmailBadges(p)}
                       {isActive && (
                         <span
                           className="active-identity-pill"

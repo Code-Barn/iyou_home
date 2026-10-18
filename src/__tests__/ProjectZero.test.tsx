@@ -18,6 +18,8 @@
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import ProjectZero from "../components/enclave/ProjectZero";
+import PersonaMatrix from "../components/enclave/PersonaMatrix";
+import DisclosureModal from "../components/enclave/DisclosureModal";
 import { Profile, PeerContact } from "../lib/types";
 
 const mockProfiles: Profile[] = [
@@ -634,5 +636,98 @@ describe("ProjectZero Suite", () => {
     } finally {
       mockInvoke.mockImplementation(baseImpl);
     }
+  });
+
+  it("limits credential choices to the active profile's linked credentials and displays linked email badges on PersonaMatrix", async () => {
+    const scopedProfiles: Profile[] = [
+      {
+        profile_id: "anchor",
+        profile_name: "Anchor Identity",
+        derivation_index: 0,
+        did: "did:key:z6MkAnchor000000000000000000000000000000000000",
+        level: 0,
+        is_system_reserved: true,
+        nostr_pubkey_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+        linked_credential_ids: [],
+      },
+      {
+        profile_id: "primary",
+        profile_name: "Public Persona",
+        derivation_index: 1,
+        did: "did:key:z6MkPrimary11111111111111111111111111111111111",
+        level: 1,
+        is_system_reserved: false,
+        nostr_pubkey_hex: "1111111111111111111111111111111111111111111111111111111111111111",
+        linked_credential_ids: ["vc-email-personal"],
+        credentials: [mockEmailCredentials[0]],
+      },
+      {
+        profile_id: "burner_2",
+        profile_name: "Anon Forum Alias",
+        derivation_index: 2,
+        did: "did:key:z6MkBurner222222222222222222222222222222222222",
+        level: 2,
+        is_system_reserved: false,
+        nostr_pubkey_hex: "2222222222222222222222222222222222222222222222222222222222222222",
+        linked_credential_ids: ["vc-email-work"],
+        credentials: [mockEmailCredentials[1]],
+      },
+    ];
+
+    const { unmount } = render(
+      <PersonaMatrix
+        profiles={scopedProfiles}
+        activeDid={scopedProfiles[1].did}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByTestId("persona-email-badge-primary"),
+    ).toHaveTextContent("✉ alice@personal.example");
+    expect(
+      screen.getByTestId("persona-email-badge-burner_2"),
+    ).toHaveTextContent("✉ alice@work.example");
+
+    unmount();
+
+    render(
+      <DisclosureModal
+        isOpen={true}
+        onClose={vi.fn()}
+        profiles={scopedProfiles}
+        contacts={mockContacts}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    // Default active signing profile is "primary", which is linked only to vc-email-personal
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("disclosure-email-option-vc-email-personal"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByTestId("disclosure-email-option-vc-email-work"),
+    ).not.toBeInTheDocument();
+
+    // Switch acting profile in DisclosureModal to "burner_2", which is linked only to vc-email-work
+    const profileSelect = screen
+      .getAllByRole("combobox")
+      .find((el) =>
+        Array.from(el.querySelectorAll("option")).some(
+          (o) => (o as HTMLOptionElement).value === "burner_2",
+        ),
+      ) as HTMLSelectElement;
+    fireEvent.change(profileSelect, { target: { value: "burner_2" } });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("disclosure-email-option-vc-email-work"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByTestId("disclosure-email-option-vc-email-personal"),
+    ).not.toBeInTheDocument();
   });
 });

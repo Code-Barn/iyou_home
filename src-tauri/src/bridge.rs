@@ -1491,6 +1491,7 @@ mod tests {
             banner_url: None,
             bio: None,
             nip05: None,
+            linked_credential_ids: vec![],
         }
     }
 

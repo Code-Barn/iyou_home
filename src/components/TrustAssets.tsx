@@ -316,6 +316,121 @@ export default function TrustAssets() {
     }
   };
 
+  const handleAssignPersona = async (credId: string, targetProfileId: string) => {
+    setError(null);
+    try {
+      const currentlyLinked = profiles.filter((p) =>
+        (p.linked_credential_ids || []).includes(credId),
+      );
+
+      if (!targetProfileId) {
+        for (const lp of currentlyLinked) {
+          const updated = await invoke<Profile | undefined>(
+            "unlink_credential_from_profile_cmd",
+            {
+              profileId: lp.profile_id,
+              credentialId: credId,
+            },
+          );
+          setProfiles((prev) =>
+            prev.map((p) =>
+              p.profile_id === lp.profile_id
+                ? updated && updated.profile_id
+                  ? updated
+                  : {
+                      ...p,
+                      linked_credential_ids: (p.linked_credential_ids || []).filter(
+                        (id) => id !== credId,
+                      ),
+                    }
+                : p,
+            ),
+          );
+        }
+        return;
+      }
+
+      // If moving from another profile, unlink from previous profile(s) first
+      for (const lp of currentlyLinked) {
+        if (lp.profile_id !== targetProfileId) {
+          const unlinked = await invoke<Profile | undefined>(
+            "unlink_credential_from_profile_cmd",
+            {
+              profileId: lp.profile_id,
+              credentialId: credId,
+            },
+          );
+          setProfiles((prev) =>
+            prev.map((p) =>
+              p.profile_id === lp.profile_id
+                ? unlinked && unlinked.profile_id
+                  ? unlinked
+                  : {
+                      ...p,
+                      linked_credential_ids: (p.linked_credential_ids || []).filter(
+                        (id) => id !== credId,
+                      ),
+                    }
+                : p,
+            ),
+          );
+        }
+      }
+
+      const linked = await invoke<Profile | undefined>(
+        "link_credential_to_profile_cmd",
+        {
+          profileId: targetProfileId,
+          credentialId: credId,
+        },
+      );
+      setProfiles((prev) =>
+        prev.map((p) => {
+          if (p.profile_id !== targetProfileId) return p;
+          if (linked && linked.profile_id) return linked;
+          const existing = p.linked_credential_ids || [];
+          return {
+            ...p,
+            linked_credential_ids: existing.includes(credId)
+              ? existing
+              : [...existing, credId],
+          };
+        }),
+      );
+    } catch (err: any) {
+      setError(err.toString());
+    }
+  };
+
+  const handleUnlinkPersona = async (credId: string, profileId: string) => {
+    setError(null);
+    try {
+      const unlinked = await invoke<Profile | undefined>(
+        "unlink_credential_from_profile_cmd",
+        {
+          profileId,
+          credentialId: credId,
+        },
+      );
+      setProfiles((prev) =>
+        prev.map((p) =>
+          p.profile_id === profileId
+            ? unlinked && unlinked.profile_id
+              ? unlinked
+              : {
+                  ...p,
+                  linked_credential_ids: (p.linked_credential_ids || []).filter(
+                    (id) => id !== credId,
+                  ),
+                }
+            : p,
+        ),
+      );
+    } catch (err: any) {
+      setError(err.toString());
+    }
+  };
+
   const filteredCredentials = allCredentials.filter((cred) => {
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
@@ -454,6 +569,9 @@ export default function TrustAssets() {
             !!selectedProfile && cred.subject_did !== selectedProfile.did;
           const badge = fidelityBadge(cred.fidelity_score);
           const emailInfo = extractEmailOwnership(cred);
+          const linkedProfiles = profiles.filter((p) =>
+            (p.linked_credential_ids || []).includes(cred.vc_id),
+          );
 
           return (
             <div
@@ -549,6 +667,91 @@ export default function TrustAssets() {
                   </div>
                 </div>
               )}
+
+              <div
+                className="persona-assignment-row"
+                data-testid={`persona-assignment-${cred.vc_id}`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
+                  gap: "0.5rem",
+                  marginTop: "0.75rem",
+                  marginBottom: "0.75rem",
+                  paddingTop: "0.65rem",
+                  borderTop: "1px solid var(--color-border, #e2e8f0)",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                  <strong style={{ fontSize: "0.82rem" }}>Persona Assignment:</strong>
+                  {linkedProfiles.length === 0 ? (
+                    <span
+                      data-testid={`assigned-persona-none-${cred.vc_id}`}
+                      style={{
+                        fontSize: "0.78rem",
+                        color: "var(--color-text-secondary, #64748b)",
+                        fontStyle: "italic",
+                      }}
+                    >
+                      Unassigned
+                    </span>
+                  ) : (
+                    linkedProfiles.map((lp) => (
+                      <span
+                        key={lp.profile_id}
+                        data-testid={`assigned-persona-badge-${cred.vc_id}-${lp.profile_id}`}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "0.35rem",
+                          background: "#ecfdf5",
+                          color: "#065f46",
+                          border: "1px solid #6ee7b7",
+                          borderRadius: "999px",
+                          padding: "0.15rem 0.55rem",
+                          fontSize: "0.75rem",
+                          fontWeight: 600,
+                        }}
+                      >
+                        {lp.profile_name}
+                        <button
+                          type="button"
+                          aria-label={`Unlink ${lp.profile_name}`}
+                          data-testid={`unlink-persona-btn-${cred.vc_id}-${lp.profile_id}`}
+                          onClick={() => handleUnlinkPersona(cred.vc_id, lp.profile_id)}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            color: "#065f46",
+                            cursor: "pointer",
+                            padding: 0,
+                            fontSize: "0.8rem",
+                            lineHeight: 1,
+                          }}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))
+                  )}
+                </div>
+
+                <select
+                  aria-label="Persona Assignment"
+                  data-testid={`persona-assignment-select-${cred.vc_id}`}
+                  value={linkedProfiles[0]?.profile_id || ""}
+                  onChange={(e) => handleAssignPersona(cred.vc_id, e.target.value)}
+                  style={{ fontSize: "0.82rem", padding: "0.25rem 0.5rem" }}
+                >
+                  <option value="">Unassigned</option>
+                  {profiles.map((p) => (
+                    <option key={p.profile_id} value={p.profile_id}>
+                      {p.profile_name} ({levelLabel(p.level)})
+                    </option>
+                  ))}
+                </select>
+              </div>
 
               <button onClick={() => setModalCredential(cred)}>
                 View Raw Credential

@@ -42,6 +42,7 @@ export interface Profile {
   banner_url?: string;
   bio?: string;
   nip05?: string; // canonical "handle@iyou.me" — derived by the enclave
+  linked_credential_ids?: string[];
 }
 
 export interface RoleProfile {

@@ -2349,7 +2349,52 @@ fn get_credentials(
         .iter()
         .find(|p| p.profile_id == profile_id)
         .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
-    Ok(profile.credentials.clone())
+    let mut creds = profile.credentials.clone();
+    for linked in vault.get_profile_credentials(&profile_id) {
+        if !creds.iter().any(|c| c.vc_id == linked.vc_id) {
+            creds.push(linked);
+        }
+    }
+    Ok(creds)
+}
+
+#[tauri::command]
+fn link_credential_to_profile_cmd(
+    app: AppHandle,
+    profile_id: String,
+    credential_id: String,
+) -> Result<vault::Profile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let updated = vault.link_credential_to_profile(&profile_id, &credential_id)?;
+    vault::save_vault(&app, &vault)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn unlink_credential_from_profile_cmd(
+    app: AppHandle,
+    profile_id: String,
+    credential_id: String,
+) -> Result<vault::Profile, String> {
+    let mut vault = vault::load_vault(&app)?;
+    let updated = vault.unlink_credential_from_profile(&profile_id, &credential_id)?;
+    vault::save_vault(&app, &vault)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn get_profile_credentials_cmd(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<Vec<vault::VaultCredential>, String> {
+    if profile_id.trim().is_empty() {
+        return Err("profile_id must not be empty".to_string());
+    }
+    let vault = vault::load_vault(&app)?;
+    if !vault.profiles.iter().any(|p| p.profile_id == profile_id.trim()) {
+        return Err(format!("Profile '{}' not found", profile_id));
+    }
+    Ok(vault.get_profile_credentials(profile_id.trim()))
 }
 
 #[tauri::command]
@@ -2408,6 +2453,10 @@ fn delete_credential(
             "Credential '{}' not found in profile '{}'",
             vc_id, profile_id
         ));
+    }
+
+    for p in vault.profiles.iter_mut() {
+        p.linked_credential_ids.retain(|id| id != &vc_id);
     }
 
     vault::save_vault(&app, &vault)
@@ -4080,6 +4129,9 @@ pub fn run() {
             save_credential,
             import_verifiable_credential,
             get_credentials,
+            link_credential_to_profile_cmd,
+            unlink_credential_from_profile_cmd,
+            get_profile_credentials_cmd,
             store_credential,
             delete_credential,
             submit_ws_credential_presentation,
