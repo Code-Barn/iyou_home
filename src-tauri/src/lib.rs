@@ -147,9 +147,8 @@ pub fn default_invite_min_contacts() -> u32 {
 
 pub fn default_relay_mesh() -> Vec<String> {
     vec![
+        "ws://127.0.0.1:9003".to_string(),
         "wss://relay.iyou.me".to_string(),
-        "wss://nos.lol".to_string(),
-        "wss://relay.damus.io".to_string(),
     ]
 }
 
@@ -4380,7 +4379,8 @@ mod tests {
         assert!(prefs.app_lock_pin_hash.is_none());
         assert!(prefs.app_lock_prf_hash.is_none());
         assert_eq!(prefs.last_backup_at, 0);
-        assert_eq!(prefs.relay_mesh.len(), 3);
+        assert_eq!(prefs.relay_mesh.len(), 2);
+        assert!(prefs.relay_mesh.contains(&"ws://127.0.0.1:9003".to_string()));
         assert!(prefs.relay_mesh.contains(&"wss://relay.iyou.me".to_string()));
     }
 

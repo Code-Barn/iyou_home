@@ -107,18 +107,18 @@ describe("Quick Dispatch Parity & Contracts", () => {
   });
 
   describe("Multi-Relay Parallel Broadcast Topology", () => {
-    it("includes local relay, project relay, and upstream default relays", () => {
+    it("includes local relay and ecosystem relay in closed ecosystem defaults", () => {
       expect(OUTBOX_RELAY_ENDPOINTS).toContain("ws://127.0.0.1:9003");
       expect(OUTBOX_RELAY_ENDPOINTS).toContain("wss://relay.iyou.me");
-      expect(OUTBOX_RELAY_ENDPOINTS).toContain("wss://nos.lol");
-      expect(OUTBOX_RELAY_ENDPOINTS).toContain("wss://relay.damus.io");
+      expect(OUTBOX_RELAY_ENDPOINTS).not.toContain("wss://nos.lol");
+      expect(OUTBOX_RELAY_ENDPOINTS).not.toContain("wss://relay.damus.io");
       expect(RELAY_ENDPOINTS).toEqual(OUTBOX_RELAY_ENDPOINTS);
     });
 
     it("fans out in parallel across all relays without blocking on individual failures", async () => {
       const mockEvent = { id: "test-event-id", kind: 1, content: "test" };
       const results = await broadcastToRelays(mockEvent, undefined, 100);
-      expect(results.length).toBeGreaterThanOrEqual(4);
+      expect(results.length).toBeGreaterThanOrEqual(2);
       // All results are settled (fulfilled or rejected), none hang or throw
       results.forEach((res) => {
         expect(["fulfilled", "rejected"]).toContain(res.status);
@@ -127,7 +127,7 @@ describe("Quick Dispatch Parity & Contracts", () => {
   });
 
   describe("Kind 1 Note Event Tagging Parity", () => {
-    it("extracts hashtags and appends omni_social_v2 client tag", async () => {
+    it("extracts hashtags and appends iyou tags (both client and t)", async () => {
       const onClose = vi.fn();
       render(<QuickDispatchModal isOpen={true} onClose={onClose} />);
 
@@ -150,7 +150,39 @@ describe("Quick Dispatch Parity & Contracts", () => {
           tags: [
             ["t", "sovereign"],
             ["t", "federation"],
-            ["client", "omni_social_v2"],
+            ["t", "iyou"],
+            ["client", "iyou"],
+          ],
+          profileId: "primary",
+        });
+        expect(screen.getByText(/Event published to mesh/i)).toBeInTheDocument();
+      });
+    });
+
+    it("deduplicates ['t', 'iyou'] tag when #iyou is present in note body", async () => {
+      const onClose = vi.fn();
+      render(<QuickDispatchModal isOpen={true} onClose={onClose} />);
+
+      const textarea = screen.getByPlaceholderText(/What's happening across the sovereign mesh/i);
+      await act(async () => {
+        fireEvent.change(textarea, {
+          target: { value: "Broadcasting with explicit #iyou and #mesh" },
+        });
+      });
+
+      const dispatchBtn = screen.getByRole("button", { name: /Dispatch Note/i });
+      await act(async () => {
+        fireEvent.click(dispatchBtn);
+      });
+
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("dispatch_nostr_event", {
+          kind: 1,
+          content: "Broadcasting with explicit #iyou and #mesh",
+          tags: [
+            ["t", "iyou"],
+            ["t", "mesh"],
+            ["client", "iyou"],
           ],
           profileId: "primary",
         });

@@ -269,9 +269,8 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   app_lock_prf_hash: null,
   last_backup_at: 0,
   relay_mesh: [
+    "ws://127.0.0.1:9003",
     "wss://relay.iyou.me",
-    "wss://nos.lol",
-    "wss://relay.damus.io",
   ],
   update_preferences: {
     policy: "manual",

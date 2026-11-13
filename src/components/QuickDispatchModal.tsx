@@ -30,8 +30,6 @@ type DispatchTab = "note" | "media" | "poll";
 export const OUTBOX_RELAY_ENDPOINTS = [
   "ws://127.0.0.1:9003",
   "wss://relay.iyou.me",
-  "wss://nos.lol",
-  "wss://relay.damus.io",
 ] as const;
 
 export const RELAY_ENDPOINTS = OUTBOX_RELAY_ENDPOINTS;
@@ -167,13 +165,11 @@ export function broadcastToRelays(
   customRelays?: string[],
   timeoutMs = 2500,
 ): Promise<PromiseSettledResult<boolean>[]> {
-  // Always include local enclave relay (:9003), ecosystem mesh relay (relay.iyou.me), and upstream relays
+  // Always include closed-ecosystem relays: local enclave relay (:9003) and ecosystem mesh relay (relay.iyou.me)
   const relays = Array.from(
     new Set([
       "ws://127.0.0.1:9003",
       "wss://relay.iyou.me",
-      "wss://nos.lol",
-      "wss://relay.damus.io",
       ...(customRelays || RELAY_ENDPOINTS),
     ]),
   );
@@ -263,9 +259,10 @@ export default function QuickDispatchModal({
 
     try {
       const hashtags = extractHashtags(noteContent);
+      const tTags = Array.from(new Set([...hashtags, "iyou"])).map((slug) => ["t", slug]);
       const tags: string[][] = [
-        ...hashtags.map((slug) => ["t", slug]),
-        ["client", "omni_social_v2"],
+        ...tTags,
+        ["client", "iyou"],
       ];
 
       const signedEvent = await invoke<any>("dispatch_nostr_event", {
