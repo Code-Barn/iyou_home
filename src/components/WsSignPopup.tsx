@@ -21,14 +21,16 @@ import { Profile } from "../lib/types";
 import { isAnchor } from "../lib/enclaveFilters";
 
 export type SignRequest =
-  | { type: "sign"; challenge: string; profile_id?: string; wasQueued?: boolean }
-  | { type: "sign_event"; event: any; profile_id?: string; wasQueued?: boolean }
+  | { type: "sign"; challenge: string; profile_id?: string; wasQueued?: boolean; conn_id?: number | null; req_id?: string | null }
+  | { type: "sign_event"; event: any; profile_id?: string; wasQueued?: boolean; conn_id?: number | null; req_id?: string | null }
   | {
       type: "sign_credential";
       credential: any;
       holder_did: string;
       profile_id?: string;
       wasQueued?: boolean;
+      conn_id?: number | null;
+      req_id?: string | null;
     }
   | {
       type: "POLY_CREDENTIAL_REQUEST";
@@ -36,6 +38,8 @@ export type SignRequest =
       challenge: string;
       profile_id?: string;
       wasQueued?: boolean;
+      conn_id?: number | null;
+      req_id?: string | null;
     };
 
 export function isEligibleForGraceAutoSign(
@@ -206,6 +210,8 @@ export default function WsSignPopup({
           eventJson: JSON.stringify(activeReq.event),
           approved,
           profileId: effectiveProfileId,
+          connId: activeReq.conn_id ?? null,
+          reqId: activeReq.req_id ?? null,
         });
         if (import.meta.env.DEV) console.log("REACT: submit_ws_event_response succeeded");
       } else if (activeReq.type === "sign_credential") {
@@ -299,14 +305,18 @@ export default function WsSignPopup({
       try {
         const parsed = JSON.parse(data);
         const profile_id = parsed.profile_id || undefined;
+        const conn_id = typeof parsed.conn_id === "number" ? parsed.conn_id : null;
+        const req_id = typeof parsed.req_id === "string" ? parsed.req_id : null;
         if (parsed.__type__ === "sign_event") {
-          incomingReq = { type: "sign_event", event: parsed.event, profile_id };
+          incomingReq = { type: "sign_event", event: parsed.event, profile_id, conn_id, req_id };
         } else if (parsed.__type__ === "sign_credential") {
           incomingReq = {
             type: "sign_credential",
             credential: parsed.credential,
             holder_did: parsed.holder_did,
             profile_id,
+            conn_id,
+            req_id,
           };
         } else if (parsed.__type__ === "POLY_CREDENTIAL_REQUEST") {
           incomingReq = {
@@ -314,11 +324,13 @@ export default function WsSignPopup({
             required_credential_type: parsed.required_credential_type,
             challenge: parsed.challenge,
             profile_id,
+            conn_id,
+            req_id,
           };
         } else if (parsed.__type__ === "sign") {
-          incomingReq = { type: "sign", challenge: parsed.challenge, profile_id };
+          incomingReq = { type: "sign", challenge: parsed.challenge, profile_id, conn_id, req_id };
         } else {
-          incomingReq = { type: "sign", challenge: data, profile_id };
+          incomingReq = { type: "sign", challenge: data, profile_id, conn_id, req_id };
         }
       } catch {
         incomingReq = { type: "sign", challenge: data };

@@ -215,6 +215,48 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
         eventJson: JSON.stringify(mockEvent),
         approved: true,
         profileId: "primary",
+        connId: null,
+        reqId: null,
+      });
+    });
+  });
+
+  it("forwards conn_id and req_id when present in Nostr signing request", async () => {
+    await act(async () => {
+      render(<WsSignPopup />);
+    });
+
+    const mockEvent = {
+      kind: 1,
+      content: "Multi-client routing note",
+      tags: [],
+    };
+
+    await act(async () => {
+      channelCallback?.(
+        JSON.stringify({
+          __type__: "sign_event",
+          event: mockEvent,
+          conn_id: 42,
+          req_id: "req-xyz-789",
+        }),
+      );
+    });
+
+    expect(screen.getByText("Nostr Event Signing Request")).toBeInTheDocument();
+
+    const approveBtn = screen.getByRole("button", { name: /Approve & Sign/i });
+    await act(async () => {
+      fireEvent.click(approveBtn);
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("submit_ws_event_response", {
+        eventJson: JSON.stringify(mockEvent),
+        approved: true,
+        profileId: "burner_alpha",
+        connId: 42,
+        reqId: "req-xyz-789",
       });
     });
   });
@@ -345,6 +387,8 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
           eventJson: JSON.stringify(noteEvent),
           approved: true,
           profileId: "burner_alpha",
+          connId: null,
+          reqId: null,
         });
       });
     });
@@ -441,6 +485,8 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
           eventJson: JSON.stringify(noteEvent),
           approved: true,
           profileId: "burner_alpha",
+          connId: null,
+          reqId: null,
         });
         expect(screen.queryByText("Nostr Event Signing Request")).not.toBeInTheDocument();
       });
@@ -467,6 +513,8 @@ describe("WsSignPopup - Persona Selection in Signing Modal", () => {
           eventJson: JSON.stringify(subsequentEvent),
           approved: true,
           profileId: "burner_alpha",
+          connId: null,
+          reqId: null,
         });
       });
       expect(screen.queryByText("Nostr Event Signing Request")).not.toBeInTheDocument();

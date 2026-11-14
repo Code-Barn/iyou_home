@@ -181,12 +181,13 @@ impl Default for UserPreferences {
 
 pub struct WsState {
     pub response_sender: Mutex<Option<mpsc::UnboundedSender<Message>>>,
+    pub client_senders: Mutex<HashMap<u64, mpsc::UnboundedSender<Message>>>,
     /// Multi-client fan-out registry for `profile_sync` broadcasts (RFC-006
     /// §6.3). Every active Port 9001 connection registers its response sender
     /// here under a monotonic connection id; broadcasts are best-effort to
     /// each live satellite tab, and dead entries are pruned on send failure.
     pub broadcast_clients: Mutex<Vec<(u64, mpsc::UnboundedSender<Message>)>>,
-    /// Monotonic connection id allocator backing `broadcast_clients`.
+    /// Monotonic connection id allocator backing `broadcast_clients` and `client_senders`.
     pub next_conn_id: std::sync::atomic::AtomicU64,
     pub challenge_channel: Mutex<Option<tauri::ipc::Channel<String>>>,
     pub pending_messages: Mutex<Vec<String>>,
@@ -253,6 +254,7 @@ impl Default for WsState {
     fn default() -> Self {
         Self {
             response_sender: Mutex::new(None),
+            client_senders: Mutex::new(HashMap::new()),
             broadcast_clients: Mutex::new(Vec::new()),
             next_conn_id: std::sync::atomic::AtomicU64::new(0),
             challenge_channel: Mutex::new(None),
@@ -1424,14 +1426,26 @@ async fn submit_ws_response(
     app: AppHandle,
     ws_state: State<'_, WsState>,
     profile_id: Option<String>,
+    conn_id: Option<u64>,
+    req_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
-        let guard = ws_state.response_sender.lock().unwrap();
-        guard.clone().ok_or("No WebSocket connected")?
+        let sender_opt = if let Some(cid) = conn_id {
+            ws_state.client_senders.lock().unwrap().get(&cid).cloned()
+        } else {
+            None
+        };
+        sender_opt
+            .or_else(|| ws_state.response_sender.lock().unwrap().clone())
+            .ok_or("No WebSocket connected")?
     };
 
     if !approved {
-        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        let mut denied = serde_json::json!({"status": "denied"});
+        if let Some(ref rid) = req_id {
+            denied["req_id"] = serde_json::Value::String(rid.clone());
+        }
+        let _ = sender.send(Message::Text(denied.to_string().into()));
         println!("WS sign request denied by user");
         return Ok(());
     }
@@ -1448,10 +1462,13 @@ async fn submit_ws_response(
     let vp_value: serde_json::Value = serde_json::from_str(&signed_vp)
         .map_err(|e| format!("Failed to parse signed VP as JSON: {}", e))?;
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "type": "signature",
         "vp": vp_value
     });
+    if let Some(ref rid) = req_id {
+        response["req_id"] = serde_json::Value::String(rid.clone());
+    }
 
     println!("Sending signed VP back to browser");
     let _ = sender.send(Message::Text(response.to_string().into()));
@@ -1465,14 +1482,26 @@ async fn submit_ws_event_response(
     app: AppHandle,
     ws_state: State<'_, WsState>,
     _profile_id: Option<String>,
+    conn_id: Option<u64>,
+    req_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
-        let guard = ws_state.response_sender.lock().unwrap();
-        guard.clone().ok_or("No WebSocket connected")?
+        let sender_opt = if let Some(cid) = conn_id {
+            ws_state.client_senders.lock().unwrap().get(&cid).cloned()
+        } else {
+            None
+        };
+        sender_opt
+            .or_else(|| ws_state.response_sender.lock().unwrap().clone())
+            .ok_or("No WebSocket connected")?
     };
 
     if !approved {
-        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        let mut denied = serde_json::json!({"status": "denied"});
+        if let Some(ref rid) = req_id {
+            denied["req_id"] = serde_json::Value::String(rid.clone());
+        }
+        let _ = sender.send(Message::Text(denied.to_string().into()));
         println!("WS event sign request denied by user");
         return Ok(());
     }
@@ -1489,10 +1518,13 @@ async fn submit_ws_event_response(
     let kind = event["kind"].as_i64().unwrap_or(1);
     let event_id = sign_event_with_vault(&app, &mut event)?;
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "type": "signed_event",
         "event": event
     });
+    if let Some(ref rid) = req_id {
+        response["req_id"] = serde_json::Value::String(rid.clone());
+    }
 
     println!(
         "[SIGN_DEBUG] Kind {} signed with secp256k1 pubkey `{}` (id {})",
@@ -1595,14 +1627,26 @@ async fn submit_ws_credential_response(
     app: AppHandle,
     ws_state: State<'_, WsState>,
     profile_id: Option<String>,
+    conn_id: Option<u64>,
+    req_id: Option<String>,
 ) -> Result<(), String> {
     let sender = {
-        let guard = ws_state.response_sender.lock().unwrap();
-        guard.clone().ok_or("No WebSocket connected")?
+        let sender_opt = if let Some(cid) = conn_id {
+            ws_state.client_senders.lock().unwrap().get(&cid).cloned()
+        } else {
+            None
+        };
+        sender_opt
+            .or_else(|| ws_state.response_sender.lock().unwrap().clone())
+            .ok_or("No WebSocket connected")?
     };
 
     if !approved {
-        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        let mut denied = serde_json::json!({"status": "denied"});
+        if let Some(ref rid) = req_id {
+            denied["req_id"] = serde_json::Value::String(rid.clone());
+        }
+        let _ = sender.send(Message::Text(denied.to_string().into()));
         println!("WS credential sign request denied by user");
         return Ok(());
     }
@@ -1633,10 +1677,13 @@ async fn submit_ws_credential_response(
     let vc_value: serde_json::Value = serde_json::from_str(&signed_vc)
         .map_err(|e| format!("Failed to parse signed VC as JSON: {}", e))?;
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "type": "signed_credential",
         "vc": vc_value
     });
+    if let Some(ref rid) = req_id {
+        response["req_id"] = serde_json::Value::String(rid.clone());
+    }
 
     println!("Sending signed VC back to browser");
     let _ = sender.send(Message::Text(response.to_string().into()));
@@ -1694,6 +1741,8 @@ async fn submit_ws_credential_presentation(
     app: AppHandle,
     ws_state: State<'_, WsState>,
     profile_id: Option<String>,
+    conn_id: Option<u64>,
+    req_id: Option<String>,
 ) -> Result<(), String> {
     if credential_type.is_empty() {
         return Err("credential_type must not be empty".to_string());
@@ -1705,12 +1754,22 @@ async fn submit_ws_credential_presentation(
     let mut guard = PopupGuard::acquire(&*ws_state)?;
 
     let sender = {
-        let guard = ws_state.response_sender.lock().unwrap();
-        guard.clone().ok_or("No WebSocket connected")?
+        let sender_opt = if let Some(cid) = conn_id {
+            ws_state.client_senders.lock().unwrap().get(&cid).cloned()
+        } else {
+            None
+        };
+        sender_opt
+            .or_else(|| ws_state.response_sender.lock().unwrap().clone())
+            .ok_or("No WebSocket connected")?
     };
 
     if !approved {
-        let _ = sender.send(Message::Text("{\"status\":\"denied\"}".into()));
+        let mut denied = serde_json::json!({"status": "denied"});
+        if let Some(ref rid) = req_id {
+            denied["req_id"] = serde_json::Value::String(rid.clone());
+        }
+        let _ = sender.send(Message::Text(denied.to_string().into()));
         println!("WS credential presentation denied by user");
         guard.release();
         return Ok(());

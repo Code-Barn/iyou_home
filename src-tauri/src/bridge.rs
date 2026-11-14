@@ -235,6 +235,18 @@ fn extract_header(http_request: &str, header_name: &str) -> Option<String> {
     None
 }
 
+/// Remove a disconnected connection from the client_senders map, and only
+/// clear response_sender if there are no remaining live connections.
+pub fn unregister_client(ws_state: &WsState, conn_id: u64) {
+    let mut clients = ws_state.client_senders.lock().unwrap();
+    clients.remove(&conn_id);
+    if clients.is_empty() {
+        *ws_state.response_sender.lock().unwrap() = None;
+    } else if let Some(last_sender) = clients.values().next() {
+        *ws_state.response_sender.lock().unwrap() = Some(last_sender.clone());
+    }
+}
+
 async fn handle_ws_connection<S>(stream: S, app_handle: AppHandle)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -284,15 +296,20 @@ where
     let conn_id;
     {
         let ws_state = app_handle.state::<WsState>();
+        conn_id = ws_state
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *ws_state.response_sender.lock().unwrap() = Some(response_tx.clone());
+        ws_state
+            .client_senders
+            .lock()
+            .unwrap()
+            .insert(conn_id, response_tx.clone());
 
         // Register this connection in the `profile_sync` broadcast fan-out
         // registry (RFC-006 §6.3). Every open satellite tab joins here; the
         // monotonic id lets the forwarder task prune exactly this entry on
         // teardown without requiring channel equality.
-        conn_id = ws_state
-            .next_conn_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ws_state
             .broadcast_clients
             .lock()
@@ -361,13 +378,13 @@ where
         // Add a generous buffer for the OS kernel to hand off the bytes
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let ws_state = app_clone.state::<WsState>();
-        *ws_state.response_sender.lock().unwrap() = None;
+        unregister_client(&ws_state, conn_id);
         ws_state
             .broadcast_clients
             .lock()
             .unwrap()
             .retain(|(candidate, _)| *candidate != conn_id);
-        println!("DEBUG: Forwarder Task Exited — response_sender cleared");
+        println!("DEBUG: Forwarder Task Exited — conn {} cleaned up", conn_id);
     });
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -903,6 +920,10 @@ where
                 } else if json["type"] == "sign_event" || json["action"] == "sign_event" {
                     if json["event"].is_object() {
                         let event = json["event"].clone();
+                        let req_id = json["req_id"]
+                            .as_str()
+                            .or_else(|| json["id"].as_str())
+                            .map(|s| s.to_string());
                         println!("Triggering Nostr Event signing for profile '{}'", profile_id);
                         println!("DEBUG: Signing Nostr event via secp256k1 Schnorr (NIP-01 standard)");
 
@@ -921,7 +942,9 @@ where
                                 serde_json::json!({
                                     "__type__": "sign_event",
                                     "event": event,
-                                    "profile_id": profile_id
+                                    "profile_id": profile_id,
+                                    "conn_id": conn_id,
+                                    "req_id": req_id
                                 }),
                             );
                         });
@@ -1108,7 +1131,7 @@ where
     // Allow in-flight responses and popup unmounting frame cycles to flush cleanly over TLS
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let ws_state = app_handle.state::<WsState>();
-    *ws_state.response_sender.lock().unwrap() = None;
+    unregister_client(&ws_state, conn_id);
 }
 
 async fn handle_connection<S>(mut stream: S, app_handle: AppHandle)
@@ -1675,6 +1698,51 @@ mod tests {
         assert_eq!(extract_header(req, "origin"), Some("https://wun.iyou.me".to_string()));
         assert_eq!(extract_header(req, "host"), Some("home.iyou.me:9001".to_string()));
         assert_eq!(extract_header(req, "non-existent"), None);
+    }
+
+    #[test]
+    fn test_multi_client_disconnect_preserves_active_sender() {
+        let ws_state = WsState::default();
+        let (tx1, _rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, _rx2) = mpsc::unbounded_channel::<Message>();
+
+        ws_state.next_conn_id.store(1, std::sync::atomic::Ordering::Relaxed);
+        let conn1 = ws_state
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *ws_state.response_sender.lock().unwrap() = Some(tx1.clone());
+        ws_state
+            .client_senders
+            .lock()
+            .unwrap()
+            .insert(conn1, tx1.clone());
+
+        let conn2 = ws_state
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *ws_state.response_sender.lock().unwrap() = Some(tx2.clone());
+        ws_state
+            .client_senders
+            .lock()
+            .unwrap()
+            .insert(conn2, tx2.clone());
+
+        assert_eq!(conn1, 1);
+        assert_eq!(conn2, 2);
+        assert_eq!(ws_state.client_senders.lock().unwrap().len(), 2);
+
+        // Client 2 disconnects
+        unregister_client(&ws_state, conn2);
+
+        // Client 1 remains intact in both client_senders and response_sender
+        assert_eq!(ws_state.client_senders.lock().unwrap().len(), 1);
+        assert!(ws_state.client_senders.lock().unwrap().contains_key(&conn1));
+        assert!(ws_state.response_sender.lock().unwrap().is_some());
+
+        // Client 1 disconnects
+        unregister_client(&ws_state, conn1);
+        assert_eq!(ws_state.client_senders.lock().unwrap().len(), 0);
+        assert!(ws_state.response_sender.lock().unwrap().is_none());
     }
 }
 
