@@ -9,8 +9,8 @@
 # gathers every platform bundle under release-artifacts/iyou_home_${VERSION}/,
 # computes SHA-256 sums, wraps them in a BitTorrent .torrent + magnet URI
 # (seeded via public trackers & optional seed box), publishes a GitHub Release
-# for tag "v${VERSION}", and automatically patches the SHA-256 verification
-# table in iyou_idp's _download_modal.html.
+# for tag "v${VERSION}", and automatically synchronizes iyou_idp fallbacks
+# (IYOU_HOME_FALLBACK_TAG, IPFS CID & gateway URL, magnet URI, SHA-256 table, and tests).
 #
 # Usage:
 #   ./scripts/release.sh           # bump patch (default: 0.2.0 -> 0.2.1)
@@ -27,7 +27,7 @@
 #   ./scripts/release.sh --sync-windows # download & verify Windows binary from GitHub CI,
 #                                  # regenerate checksums/torrent, upload, and seed
 #   ./scripts/release.sh --seed-qnap # seed release payload to QNAP NAS via SSH
-#   ./scripts/release.sh --patch-idp    # compute SHA-256 sums and patch iyou_idp download modal
+#   ./scripts/release.sh --patch-idp    # synchronize fallback tag, checksums, IPFS CID & magnet in iyou_idp
 #   ./scripts/release.sh --no-wait-windows # trigger/skip waiting for Windows CI
 #   ./scripts/release.sh --no-seed # skip seed-box rsync + transmission registration
 #
@@ -93,58 +93,118 @@ fi
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-# Locate iyou_idp _download_modal.html
-find_idp_download_modal() {
+# Locate iyou_idp repository directory
+find_idp_dir() {
   local candidate_dirs=(
     "${IDP_PATH:-}"
     "$ROOT/../iyou_idp"
     "../iyou_idp"
   )
   for base in "${candidate_dirs[@]}"; do
-    [[ -n "$base" && -d "$base" ]] || continue
-    local p1="$base/auth_bridge/templates/auth_bridge/_download_modal.html"
-    local p2="$base/templates/auth_bridge/_download_modal.html"
-    local p3="$base/templates/_download_modal.html"
-    for p in "$p1" "$p2" "$p3"; do
-      if [[ -f "$p" ]]; then
-        printf '%s\n' "$p"
-        return 0
-      fi
-    done
-    local found
-    found="$(find "$base" -name "_download_modal.html" -print -quit 2>/dev/null || true)"
-    if [[ -n "$found" && -f "$found" ]]; then
-      printf '%s\n' "$found"
+    if [[ -n "$base" && -d "$base" ]]; then
+      (cd "$base" && pwd)
       return 0
     fi
   done
   return 1
 }
 
-# Locate iyou_idp download_modal.js
-find_idp_download_js() {
-  local candidate_dirs=(
-    "${IDP_PATH:-}"
-    "$ROOT/../iyou_idp"
-    "../iyou_idp"
-  )
-  for base in "${candidate_dirs[@]}"; do
-    [[ -n "$base" && -d "$base" ]] || continue
-    local p1="$base/auth_bridge/static/auth_bridge/js/download_modal.js"
-    local p2="$base/static/auth_bridge/js/download_modal.js"
-    for p in "$p1" "$p2"; do
+# Locate iyou_idp _download_modal.html
+find_idp_download_modal() {
+  local idp_dir
+  idp_dir="$(find_idp_dir || true)"
+  if [[ -n "$idp_dir" ]]; then
+    local candidates=(
+      "$idp_dir/auth_bridge/templates/auth_bridge/_download_modal.html"
+      "$idp_dir/templates/auth_bridge/_download_modal.html"
+      "$idp_dir/templates/_download_modal.html"
+    )
+    for p in "${candidates[@]}"; do
       if [[ -f "$p" ]]; then
         printf '%s\n' "$p"
         return 0
       fi
     done
     local found
-    found="$(find "$base" -name "download_modal.js" -print -quit 2>/dev/null || true)"
+    found="$(find "$idp_dir" -name "_download_modal.html" -print -quit 2>/dev/null || true)"
     if [[ -n "$found" && -f "$found" ]]; then
       printf '%s\n' "$found"
       return 0
     fi
-  done
+  fi
+  return 1
+}
+
+# Locate iyou_idp download_modal.js
+find_idp_download_js() {
+  local idp_dir
+  idp_dir="$(find_idp_dir || true)"
+  if [[ -n "$idp_dir" ]]; then
+    local candidates=(
+      "$idp_dir/auth_bridge/static/auth_bridge/js/download_modal.js"
+      "$idp_dir/static/auth_bridge/js/download_modal.js"
+    )
+    for p in "${candidates[@]}"; do
+      if [[ -f "$p" ]]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+    local found
+    found="$(find "$idp_dir" -name "download_modal.js" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" && -f "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Locate iyou_idp context_processors.py
+find_idp_context_processors() {
+  local idp_dir
+  idp_dir="$(find_idp_dir || true)"
+  if [[ -n "$idp_dir" ]]; then
+    local candidates=(
+      "$idp_dir/apps/core/context_processors.py"
+    )
+    for p in "${candidates[@]}"; do
+      if [[ -f "$p" ]]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+    local found
+    found="$(find "$idp_dir" -name "context_processors.py" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" && -f "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Locate iyou_idp tests.py
+find_idp_tests() {
+  local idp_dir
+  idp_dir="$(find_idp_dir || true)"
+  if [[ -n "$idp_dir" ]]; then
+    local candidates=(
+      "$idp_dir/apps/core/tests.py"
+    )
+    for p in "${candidates[@]}"; do
+      if [[ -f "$p" ]]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+    local found
+    found="$(find "$idp_dir" -path "*/apps/core/tests.py" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" && -f "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
   return 1
 }
 
@@ -236,25 +296,45 @@ print(f"{w}|{m}|{d}|{a}")
   fi
 }
 
-# Automate iyou_idp _download_modal.html & download_modal.js updates
+# Automate iyou_idp fallback sync: IYOU_HOME_FALLBACK_TAG, checksums, IPFS CID & magnet in templates, js, and tests
 auto_patch_idp() {
-  log "Automating iyou_idp SHA-256 update in _download_modal.html and download_modal.js"
+  local idp_dir
+  idp_dir="$(find_idp_dir || true)"
+
+  if [[ -z "$idp_dir" || ! -d "$idp_dir" ]]; then
+    warn "Could not locate iyou_idp directory (checked ../iyou_idp and IDP_PATH)."
+    warn "Skipping downstream iyou_idp sync."
+    return 0
+  fi
+
+  log "Synchronizing iyou_idp release fallbacks in: $idp_dir"
   local modal_file
   modal_file="$(find_idp_download_modal || true)"
   local js_file
   js_file="$(find_idp_download_js || true)"
+  local cp_file
+  cp_file="$(find_idp_context_processors || true)"
+  local tests_file
+  tests_file="$(find_idp_tests || true)"
 
-  if [[ -z "$modal_file" || ! -f "$modal_file" ]]; then
-    warn "Could not locate iyou_idp _download_modal.html (checked ../iyou_idp and IDP_PATH)."
-    warn "Skipping automatic download modal patch."
-    return 0
+  [[ -n "$modal_file" ]] && log "  Download modal template : $modal_file"
+  [[ -n "$js_file" ]]    && log "  Download modal script   : $js_file"
+  [[ -n "$cp_file" ]]    && log "  Context processors      : $cp_file"
+  [[ -n "$tests_file" ]] && log "  Core tests              : $tests_file"
+
+  local version="${VERSION:-}"
+  if [[ -z "$version" ]]; then
+    version="$(node -p "require('$ROOT/package.json').version" 2>/dev/null || true)"
   fi
+  [[ -n "$version" ]] || version="0.0.0"
+  local release_dir="${RELEASE_DIR:-$ROOT/release-artifacts/iyou_home_${version}}"
 
-  log "Found download modal at: $modal_file"
-  [[ -n "$js_file" ]] && log "Found download modal script at: $js_file"
+  VERSION="$version"
+  RELEASE_DIR="$release_dir"
+
   compute_primary_hashes
 
-  log "Primary Artifact SHA-256 Hashes for v${VERSION}:"
+  log "Primary Artifact SHA-256 Hashes for v${version}:"
   printf '  Windows (.exe) : %s\n' "${PRIMARY_WIN_SHA:-[NOT_FOUND]}"
   printf '  macOS (.dmg)    : %s\n' "${PRIMARY_MAC_SHA:-[NOT_FOUND]}"
   printf '  Debian (.deb)   : %s\n' "${PRIMARY_DEB_SHA:-[NOT_FOUND]}"
@@ -264,117 +344,355 @@ auto_patch_idp() {
     warn "One or more primary artifact hashes could not be resolved."
   fi
 
-  [[ -n "$PYTHON_BIN" ]] || fail "Python interpreter is required to patch _download_modal.html"
+  local ipfs_cid="${IPFS_ROOT_CID:-}"
+  local magnet_uri="${MAGNET_LINK:-}"
+  local info_hash="${BTIH:-}"
 
-  $PYTHON_BIN - "$modal_file" \
+  # Fallback resolution from MIRRORS.txt
+  if [[ -f "$release_dir/MIRRORS.txt" ]]; then
+    if [[ -z "$ipfs_cid" || "$ipfs_cid" =~ ^\[.*\]$ ]]; then
+      local cid_from_mirrors
+      cid_from_mirrors="$(grep -E '^IPFS_ROOT_CID=' "$release_dir/MIRRORS.txt" | cut -d= -f2- | tr -d ' \r\n' || true)"
+      if [[ -n "$cid_from_mirrors" && ! "$cid_from_mirrors" =~ ^\[.*\]$ ]]; then
+        ipfs_cid="$cid_from_mirrors"
+      fi
+    fi
+    if [[ -z "$magnet_uri" || "$magnet_uri" =~ ^\[.*\]$ ]]; then
+      local mag_from_mirrors
+      mag_from_mirrors="$(grep -E '^MAGNET_LINK=' "$release_dir/MIRRORS.txt" | cut -d= -f2- | tr -d ' \r\n' || true)"
+      if [[ -n "$mag_from_mirrors" && ! "$mag_from_mirrors" =~ ^\[.*\]$ ]]; then
+        magnet_uri="$mag_from_mirrors"
+      fi
+    fi
+  fi
+
+  # Fallback resolution from remote GitHub release metadata
+  if [[ (-z "$ipfs_cid" || "$ipfs_cid" =~ ^\[.*\]$) || (-z "$magnet_uri" || "$magnet_uri" =~ ^\[.*\]$) ]]; then
+    local rel_body
+    rel_body="$(gh release view "v${version}" --repo "${REPO:-Code-Barn/iyou_home}" --json body -q .body 2>/dev/null || true)"
+    if [[ -n "$rel_body" ]]; then
+      if [[ -z "$ipfs_cid" || "$ipfs_cid" =~ ^\[.*\]$ ]]; then
+        local parsed_cid
+        parsed_cid="$(printf '%s\n' "$rel_body" | grep -Eo 'IPFS_ROOT_CID=([a-zA-Z0-9]+)' | head -n1 | cut -d= -f2 || true)"
+        if [[ -z "$parsed_cid" ]]; then
+          parsed_cid="$(printf '%s\n' "$rel_body" | grep -Eo '\*\*IPFS CID\*\*:\s*`?([a-zA-Z0-9]+)`?' | head -n1 | sed -E 's/.*`?([a-zA-Z0-9]{40,})`?/\1/' || true)"
+        fi
+        if [[ -n "$parsed_cid" && "$parsed_cid" =~ ^(Qm[1-9A-HJ-NP-Za-km-z]{44}|bafy[a-z0-9]+)$ ]]; then
+          ipfs_cid="$parsed_cid"
+        fi
+      fi
+      if [[ -z "$magnet_uri" || "$magnet_uri" =~ ^\[.*\]$ ]]; then
+        local parsed_mag
+        parsed_mag="$(printf '%s\n' "$rel_body" | grep -Eo 'magnet:\?xt=urn:btih:[^ \t\r\n`"]+' | head -n1 || true)"
+        if [[ -n "$parsed_mag" ]]; then
+          magnet_uri="$parsed_mag"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ -z "$info_hash" || "$info_hash" =~ ^\[.*\]$ ]]; then
+    if [[ -n "$magnet_uri" ]]; then
+      info_hash="$(printf '%s\n' "$magnet_uri" | grep -Eo 'xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})' | cut -d: -f3 || true)"
+    fi
+  fi
+
+  log "P2P / Decentralized Mirror metadata for iyou_idp sync:"
+  printf '  IPFS Root CID  : %s\n' "${ipfs_cid:-[PENDING_OR_NOT_RESOLVED]}"
+  printf '  BitTorrent BTIH: %s\n' "${info_hash:-[NOT_RESOLVED]}"
+  printf '  Magnet Link    : %s\n' "${magnet_uri:-[NOT_RESOLVED]}"
+
+  [[ -n "$PYTHON_BIN" ]] || fail "Python interpreter is required to patch iyou_idp files"
+
+  $PYTHON_BIN - "$idp_dir" \
+    "${modal_file:-}" \
+    "${js_file:-}" \
+    "${cp_file:-}" \
+    "${tests_file:-}" \
     "${PRIMARY_WIN_SHA:-}" \
     "${PRIMARY_MAC_SHA:-}" \
     "${PRIMARY_DEB_SHA:-}" \
     "${PRIMARY_APP_SHA:-}" \
     "${DRY_RUN:-0}" \
-    "${VERSION}" \
-    "${MAGNET_LINK:-}" \
-    "${js_file:-}" << 'PYEOF'
+    "${version}" \
+    "${magnet_uri:-}" \
+    "${ipfs_cid:-}" \
+    "${info_hash:-}" << 'PYEOF'
 import sys, os, re
 
-modal_path = sys.argv[1]
-win_sha = sys.argv[2].strip() if len(sys.argv) > 2 else ""
-mac_sha = sys.argv[3].strip() if len(sys.argv) > 3 else ""
-deb_sha = sys.argv[4].strip() if len(sys.argv) > 4 else ""
-app_sha = sys.argv[5].strip() if len(sys.argv) > 5 else ""
-dry_run = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
-version = sys.argv[7].strip() if len(sys.argv) > 7 else ""
-magnet_uri = sys.argv[8].strip() if len(sys.argv) > 8 else ""
-js_path = sys.argv[9].strip() if len(sys.argv) > 9 else ""
+idp_dir = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+modal_path = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+js_path = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+cp_path = sys.argv[4].strip() if len(sys.argv) > 4 else ""
+tests_path = sys.argv[5].strip() if len(sys.argv) > 5 else ""
+win_sha = sys.argv[6].strip() if len(sys.argv) > 6 else ""
+mac_sha = sys.argv[7].strip() if len(sys.argv) > 7 else ""
+deb_sha = sys.argv[8].strip() if len(sys.argv) > 8 else ""
+app_sha = sys.argv[9].strip() if len(sys.argv) > 9 else ""
+dry_run = (sys.argv[10] == "1") if len(sys.argv) > 10 else False
+version = sys.argv[11].strip() if len(sys.argv) > 11 else ""
+magnet_uri = sys.argv[12].strip() if len(sys.argv) > 12 else ""
+ipfs_cid = sys.argv[13].strip() if len(sys.argv) > 13 else ""
+btih = sys.argv[14].strip() if len(sys.argv) > 14 else ""
 
-if not os.path.isfile(modal_path):
-    sys.stderr.write(f"[ERROR] Modal file not found: {modal_path}\n")
-    sys.exit(1)
+clean_ver = version.lstrip("v")
+tag_ver = f"v{clean_ver}"
 
-with open(modal_path, "r", encoding="utf-8") as f:
-    original_content = f.read()
+valid_cid = bool(ipfs_cid and not ipfs_cid.startswith("[") and not ipfs_cid.endswith("]"))
+clean_cid = ipfs_cid.strip("/ \t\r\n") if valid_cid else ""
+valid_magnet = bool(magnet_uri and "magnet:?xt=urn:btih:" in magnet_uri and not magnet_uri.startswith("["))
 
-targets = [
-    ("Windows (.exe)", r"(<span[^>]*>Windows\s*\(\.exe\):</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", win_sha),
-    ("macOS (.dmg)",    r"(<span[^>]*>macOS\s*\(\.dmg\):</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", mac_sha),
-    ("Debian (.deb)",   r"(<span[^>]*>Debian\s*\(\.deb\):</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", deb_sha),
-    ("AppImage",        r"(<span[^>]*>AppImage:</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", app_sha),
-]
+if not btih and valid_magnet:
+    m = re.search(r'xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})', magnet_uri)
+    if m:
+        btih = m.group(1).lower()
+valid_btih = bool(btih and re.match(r'^[a-fA-F0-9]{40}$', btih))
 
-print(f"\n--- Checking iyou_idp SHA-256 Table: {modal_path} ---")
-updated_content = original_content
-changes_needed = 0
-
-for label, pattern, new_hash in targets:
-    m = re.search(pattern, updated_content)
-    if not m:
-        sys.stderr.write(f"[ERROR] Could not find row matching '{label}' in {modal_path}\n")
-        sys.exit(1)
-    old_hash = m.group(2)
-    if not new_hash:
-        print(f"  {label:<15} : Current = {old_hash} (No new hash provided)")
-        continue
-    if not re.match(r"^[a-fA-F0-9]{64}$", new_hash):
-        sys.stderr.write(f"[ERROR] Invalid 64-char hex hash for {label}: '{new_hash}'\n")
-        sys.exit(1)
-    if old_hash == new_hash:
-        print(f"  {label:<15} : [OK] {new_hash} (Already up-to-date)")
+# -------------------------------------------------------------
+# 1. context_processors.py
+# -------------------------------------------------------------
+if cp_path and os.path.isfile(cp_path) and clean_ver:
+    with open(cp_path, "r", encoding="utf-8") as f:
+        cp_orig = f.read()
+    cp_pat = r'("IYOU_HOME_FALLBACK_TAG"\s*:\s*")[^"]*(")'
+    if re.search(cp_pat, cp_orig):
+        cp_updated = re.sub(cp_pat, rf'\g<1>{tag_ver}\g<2>', cp_orig)
+        if cp_updated != cp_orig:
+            if not dry_run:
+                tmp_cp = cp_path + ".tmp"
+                with open(tmp_cp, "w", encoding="utf-8") as f:
+                    f.write(cp_updated)
+                os.replace(tmp_cp, cp_path)
+                print(f"[OK] Patched IYOU_HOME_FALLBACK_TAG to '{tag_ver}' in {cp_path}")
+            else:
+                print(f"[DRY-RUN] Would patch IYOU_HOME_FALLBACK_TAG to '{tag_ver}' in {cp_path}")
+        else:
+            print(f"[OK] IYOU_HOME_FALLBACK_TAG in {cp_path} is already '{tag_ver}'")
     else:
-        print(f"  {label:<15} : [UPDATE] {old_hash} -> {new_hash}")
-        changes_needed += 1
-        updated_content = re.sub(pattern, rf"\g<1>{new_hash}\g<3>", updated_content)
+        sys.stderr.write(f"[WARN] Could not find IYOU_HOME_FALLBACK_TAG in {cp_path}\n")
 
-if magnet_uri and "magnet:?xt=urn:btih:" in magnet_uri and not magnet_uri.startswith("["):
-    m_escaped = magnet_uri.replace("&", "&amp;")
-    magnet_pat = r'(<a\s+id="dl-magnet"\s+href=")[^"]*(")'
-    if re.search(magnet_pat, updated_content):
-        updated_content = re.sub(magnet_pat, rf"\g<1>{m_escaped}\g<2>", updated_content)
-        print("  Magnet link     : [UPDATED] with new release magnet URI")
+# -------------------------------------------------------------
+# 2. _download_modal.html
+# -------------------------------------------------------------
+if modal_path and os.path.isfile(modal_path):
+    with open(modal_path, "r", encoding="utf-8") as f:
+        original_content = f.read()
+    updated_content = original_content
+    print(f"\n--- Checking iyou_idp SHA-256 Table: {modal_path} ---")
 
-if dry_run:
-    print(f"\n[DRY-RUN] {changes_needed} hash field(s) would be updated in {modal_path}.")
-else:
-    if changes_needed > 0 or (magnet_uri and updated_content != original_content):
-        tmp_path = modal_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(updated_content)
-        os.replace(tmp_path, modal_path)
-        with open(modal_path, "r", encoding="utf-8") as f:
-            verify_content = f.read()
-        for label, pattern, new_hash in targets:
-            if new_hash:
-                assert new_hash in verify_content, f"Verification failed for {label}"
-        print(f"\n[OK] Successfully patched {changes_needed} hash(es) into {modal_path} (atomic replace).")
+    targets = [
+        ("Windows (.exe)", r"(<span[^>]*>Windows\s*\(\.exe\):</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", win_sha),
+        ("macOS (.dmg)",    r"(<span[^>]*>macOS\s*\(\.dmg\):</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", mac_sha),
+        ("Debian (.deb)",   r"(<span[^>]*>Debian\s*\(\.deb\):</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", deb_sha),
+        ("AppImage",        r"(<span[^>]*>AppImage:</span>\s*<code[^>]*>)([a-fA-F0-9]{64})(</code>)", app_sha),
+    ]
+
+    for label, pattern, new_hash in targets:
+        m = re.search(pattern, updated_content)
+        if not m:
+            sys.stderr.write(f"[ERROR] Could not find row matching '{label}' in {modal_path}\n")
+            continue
+        old_hash = m.group(2)
+        if not new_hash:
+            print(f"  {label:<15} : Current = {old_hash} (No new hash provided)")
+            continue
+        if not re.match(r"^[a-fA-F0-9]{64}$", new_hash):
+            sys.stderr.write(f"[ERROR] Invalid 64-char hex hash for {label}: '{new_hash}'\n")
+            continue
+        if old_hash == new_hash:
+            print(f"  {label:<15} : [OK] {new_hash} (Already up-to-date)")
+        else:
+            print(f"  {label:<15} : [UPDATE] {old_hash} -> {new_hash}")
+            updated_content = re.sub(pattern, rf"\g<1>{new_hash}\g<3>", updated_content)
+
+    # Magnet URI
+    if valid_magnet:
+        m_escaped = magnet_uri.replace("&", "&amp;")
+        magnet_pat = r'(<a\b[^>]*?\bid="dl-magnet"[^>]*?\bhref=")[^"]*(")'
+        if re.search(magnet_pat, updated_content):
+            updated_content = re.sub(magnet_pat, rf"\g<1>{m_escaped}\g<2>", updated_content)
+            print("  Magnet link     : [UPDATED] with new release magnet URI")
+
+    # IPFS Gateway URL
+    if valid_cid:
+        ipfs_url = f"https://ipfs.io/ipfs/{clean_cid}/"
+        ipfs_pat = r'(<a\b[^>]*?\bid="dl-ipfs"[^>]*?\bhref=")[^"]*(")'
+        if re.search(ipfs_pat, updated_content):
+            updated_content = re.sub(ipfs_pat, rf"\g<1>{ipfs_url}\g<2>", updated_content)
+            print(f"  IPFS Gateway    : [UPDATED] with {ipfs_url}")
+
+    if updated_content != original_content:
+        if not dry_run:
+            tmp_path = modal_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(updated_content)
+            os.replace(tmp_path, modal_path)
+            with open(modal_path, "r", encoding="utf-8") as f:
+                verify_content = f.read()
+            for label, pattern, new_hash in targets:
+                if new_hash and re.match(r"^[a-fA-F0-9]{64}$", new_hash):
+                    assert new_hash in verify_content, f"Verification failed for {label}"
+            print(f"[OK] Successfully patched {modal_path} (atomic replace).")
+        else:
+            print(f"\n[DRY-RUN] Changes would be written to {modal_path}.")
     else:
-        print(f"\n[OK] All hashes in {modal_path} are already up-to-date. No write needed.")
+        print(f"\n[OK] All entries in {modal_path} are already up-to-date. No write needed.")
 
-# Also update download_modal.js MAGNET_FALLBACK_URI if js_path is present
-if js_path and os.path.isfile(js_path) and magnet_uri and "magnet:?xt=urn:btih:" in magnet_uri and not magnet_uri.startswith("["):
+# -------------------------------------------------------------
+# 3. download_modal.js
+# -------------------------------------------------------------
+if js_path and os.path.isfile(js_path):
     with open(js_path, "r", encoding="utf-8") as f:
         js_content = f.read()
-    js_pat = r"(var\s+MAGNET_FALLBACK_URI\s*=\s*')[^']+(';)"
-    if re.search(js_pat, js_content):
-        updated_js = re.sub(js_pat, rf"\g<1>{magnet_uri}\g<2>", js_content)
-        if updated_js != js_content:
-            if not dry_run:
-                tmp_js = js_path + ".tmp"
-                with open(tmp_js, "w", encoding="utf-8") as f:
-                    f.write(updated_js)
-                os.replace(tmp_js, js_path)
-                print(f"[OK] Patched MAGNET_FALLBACK_URI in {js_path}")
-            else:
-                print(f"[DRY-RUN] Would patch MAGNET_FALLBACK_URI in {js_path}")
+    updated_js = js_content
+
+    if valid_magnet:
+        js_pat = r"(var\s+MAGNET_FALLBACK_URI\s*=\s*')[^']+(';)"
+        if re.search(js_pat, updated_js):
+            updated_js = re.sub(js_pat, rf"\g<1>{magnet_uri}\g<2>", updated_js)
+
+    if valid_cid:
+        ipfs_url = f"https://ipfs.io/ipfs/{clean_cid}/"
+        js_ipfs_pat = r"(var\s+IPFS_FALLBACK_URL\s*=\s*')[^']+(';)"
+        if re.search(js_ipfs_pat, updated_js):
+            updated_js = re.sub(js_ipfs_pat, rf"\g<1>{ipfs_url}\g<2>", updated_js)
+
+    if updated_js != js_content:
+        if not dry_run:
+            tmp_js = js_path + ".tmp"
+            with open(tmp_js, "w", encoding="utf-8") as f:
+                f.write(updated_js)
+            os.replace(tmp_js, js_path)
+            print(f"[OK] Patched MAGNET_FALLBACK_URI / IPFS_FALLBACK_URL in {js_path}")
         else:
-            print(f"[OK] MAGNET_FALLBACK_URI in {js_path} is already up-to-date.")
+            print(f"[DRY-RUN] Would patch MAGNET_FALLBACK_URI / IPFS_FALLBACK_URL in {js_path}")
+    else:
+        print(f"[OK] MAGNET_FALLBACK_URI and IPFS_FALLBACK_URL in {js_path} are already up-to-date.")
+
+# -------------------------------------------------------------
+# 4. tests.py
+# -------------------------------------------------------------
+if tests_path and os.path.isfile(tests_path):
+    with open(tests_path, "r", encoding="utf-8") as f:
+        tests_orig = f.read()
+    updated_tests = tests_orig
+
+    # a) version tag assertion in test_ecosystem_releases_values
+    if clean_ver:
+        test_tag_pat = r'(self\.assertEqual\(data\["IYOU_HOME_FALLBACK_TAG"\],\s*")[^"]*("\))'
+        if re.search(test_tag_pat, updated_tests):
+            updated_tests = re.sub(test_tag_pat, rf'\g<1>{tag_ver}\g<2>', updated_tests)
+
+    # b) versioned asset URLs in test_download_modal_hydration_fallback
+    if clean_ver:
+        url_pat = r'(https://github\.com/Code-Barn/iyou_home/releases/download/)v[0-9]+\.[0-9]+\.[0-9]+(/iyou-home[-_])[0-9]+\.[0-9]+\.[0-9]+'
+        updated_tests = re.sub(url_pat, rf'\g<1>{tag_ver}\g<2>{clean_ver}', updated_tests)
+
+    # c) IPFS CID / gateway assertion
+    if valid_cid:
+        ipfs_test_pat = r'(self\.assertIn\(\s*["\']https://ipfs\.io/ipfs/)[^/"\']+(?:/*)(["\'],\s*html\s*\))'
+        if re.search(ipfs_test_pat, updated_tests):
+            updated_tests = re.sub(ipfs_test_pat, rf'\g<1>{clean_cid}/\g<2>', updated_tests)
+
+    # d) btih assertion
+    if valid_btih:
+        btih_pat = r'(self\.assertIn\(["\'])[a-fA-F0-9]{40}(["\'],\s*html\s*\))'
+        if re.search(btih_pat, updated_tests):
+            updated_tests = re.sub(btih_pat, rf'\g<1>{btih.lower()}\g<2>', updated_tests)
+
+    # e) expected_sha256 keys and values
+    if clean_ver:
+        sha_key_pat = r'("iyou-home_)[0-9]+\.[0-9]+\.[0-9]+(_(?:x64-setup\.exe|x64\.dmg|amd64\.deb|amd64\.AppImage)":)'
+        updated_tests = re.sub(sha_key_pat, rf'\g<1>{clean_ver}\g<2>', updated_tests)
+
+    if win_sha and re.match(r'^[a-fA-F0-9]{64}$', win_sha):
+        updated_tests = re.sub(r'("iyou-home_[^"]*x64-setup\.exe":\s*\(\s*")[a-fA-F0-9]{64}("\s*\))', rf'\g<1>{win_sha}\g<2>', updated_tests)
+    if mac_sha and re.match(r'^[a-fA-F0-9]{64}$', mac_sha):
+        updated_tests = re.sub(r'("iyou-home_[^"]*x64\.dmg":\s*\(\s*")[a-fA-F0-9]{64}("\s*\))', rf'\g<1>{mac_sha}\g<2>', updated_tests)
+    if deb_sha and re.match(r'^[a-fA-F0-9]{64}$', deb_sha):
+        updated_tests = re.sub(r'("iyou-home_[^"]*amd64\.deb":\s*\(\s*")[a-fA-F0-9]{64}("\s*\))', rf'\g<1>{deb_sha}\g<2>', updated_tests)
+    if app_sha and re.match(r'^[a-fA-F0-9]{64}$', app_sha):
+        updated_tests = re.sub(r'("iyou-home_[^"]*amd64\.AppImage":\s*\(\s*")[a-fA-F0-9]{64}("\s*\))', rf'\g<1>{app_sha}\g<2>', updated_tests)
+
+    if updated_tests != tests_orig:
+        if not dry_run:
+            tmp_tests = tests_path + ".tmp"
+            with open(tmp_tests, "w", encoding="utf-8") as f:
+                f.write(updated_tests)
+            os.replace(tmp_tests, tests_path)
+            print(f"[OK] Patched {tests_path} (fallback tag, URLs, IPFS CID, and checksum assertions).")
+        else:
+            print(f"[DRY-RUN] Would patch {tests_path}.")
+    else:
+        print(f"[OK] All assertions in {tests_path} are already up-to-date.")
 PYEOF
 
-  # If git repo exists in ../iyou_idp, display git diff.
-  # `--no-pager` is essential: this script runs non-interactively (CI, pipes,
-  # subshells), and a default-pager `git diff` blocks forever waiting for the
-  # operator to press `q`.
-  if [[ -d "$ROOT/../iyou_idp/.git" && "${DRY_RUN:-0}" != "1" ]]; then
+  # If git repo exists in iyou_idp, display git diff
+  if [[ -d "$idp_dir/.git" && "${DRY_RUN:-0}" != "1" ]]; then
     log "Git diff in iyou_idp:"
-    git -C "$ROOT/../iyou_idp" --no-pager diff -U1 "$modal_file" ${js_file:+"$js_file"} || true
+    git -C "$idp_dir" --no-pager diff -U1 \
+      ${modal_file:+"$modal_file"} \
+      ${js_file:+"$js_file"} \
+      ${cp_file:+"$cp_file"} \
+      ${tests_file:+"$tests_file"} || true
+  fi
+
+  # Run verification tests in iyou_idp if present
+  if [[ -d "$idp_dir" && "${DRY_RUN:-0}" != "1" ]]; then
+    if command -v uv >/dev/null 2>&1 || [[ -d "$idp_dir/.venv" ]]; then
+      log "Running iyou_idp verification tests (apps.core)..."
+      local test_cmd=()
+      if command -v uv >/dev/null 2>&1; then
+        test_cmd=(uv run python manage.py test apps.core)
+      elif [[ -x "$idp_dir/.venv/bin/python" ]]; then
+        test_cmd=("$idp_dir/.venv/bin/python" manage.py test apps.core)
+      fi
+
+      if (( ${#test_cmd[@]} > 0 )); then
+        if (cd "$idp_dir" && "${test_cmd[@]}"); then
+          log "iyou_idp apps.core tests passed successfully."
+        else
+          warn "iyou_idp apps.core tests failed. Please inspect differences in $idp_dir."
+        fi
+      fi
+    else
+      log "Skipping iyou_idp test verification: neither uv nor .venv found in $idp_dir"
+    fi
+
+    # Print reminder / optional auto-commit summary for iyou_idp
+    if [[ -d "$idp_dir/.git" ]]; then
+      local idp_status
+      idp_status="$(git -C "$idp_dir" status --short 2>/dev/null || true)"
+      if [[ -n "$idp_status" ]]; then
+        printf '\n═══════════════════════════════════════════════════════════════════\n'
+        printf '  iyou_idp Downstream Release Sync Summary\n'
+        printf '    Target Version : v%s\n' "$version"
+        printf '    Directory      : %s\n' "$idp_dir"
+        printf '    Modified files :\n'
+        printf '%s\n' "$idp_status" | sed 's/^/      /'
+        printf '\n  Reminder: commit and push the updated fallbacks in iyou_idp:\n'
+        printf '    git -C "%s" add apps/core/context_processors.py apps/core/tests.py \\\n' "$idp_dir"
+        printf '      auth_bridge/templates/auth_bridge/_download_modal.html auth_bridge/static/auth_bridge/js/download_modal.js\n'
+        printf '    git -C "%s" commit -m "chore(release): sync desktop download modal and fallbacks to iyou_home v%s"\n' "$idp_dir" "$version"
+        printf '    git -C "%s" push\n' "$idp_dir"
+        printf '═══════════════════════════════════════════════════════════════════\n'
+
+        if [[ "${AUTO_COMMIT_IDP:-0}" == "1" ]]; then
+          log "AUTO_COMMIT_IDP=1: committing synchronized fallbacks in iyou_idp..."
+          git -C "$idp_dir" add \
+            apps/core/context_processors.py \
+            apps/core/tests.py \
+            auth_bridge/templates/auth_bridge/_download_modal.html \
+            auth_bridge/static/auth_bridge/js/download_modal.js
+          git -C "$idp_dir" commit -m "chore(release): sync desktop download modal and fallbacks to iyou_home v${version}"
+          log "Committed in iyou_idp: $(git -C "$idp_dir" log -n 1 --oneline)"
+        fi
+      else
+        log "iyou_idp working tree is clean. Fallbacks already synchronized to v${version}."
+      fi
+    fi
+  elif [[ "${DRY_RUN:-0}" == "1" ]]; then
+    log "[DRY-RUN] Verification tests and auto-commit summary skipped in dry-run mode."
   fi
 }
 
@@ -1470,7 +1788,7 @@ if [[ "${BUMP_ARG}" == "--help" || "${BUMP_ARG}" == "-h" ]]; then
   echo "  --dry-run      Evaluate tag/commit alignment and preview modal updates without mutations"
   echo "  --sync-windows Download & verify Windows binary from GitHub CI, regenerate checksums/torrent, upload, and seed"
   echo "  --seed-qnap    Seed release payload to QNAP NAS via SSH"
-  echo "  --patch-idp    Compute SHA-256 sums and patch iyou_idp download modal directly"
+  echo "  --patch-idp    Synchronize fallback tag, checksums, IPFS CID & magnet in iyou_idp"
   echo "  --no-wait-windows  Dispatch Windows build without blocking on completion"
   echo "  --no-seed      Skip rsync to the seed box and transmission registration"
   echo "  --idp-path DIR Explicit path to iyou_idp repository"
@@ -1523,7 +1841,7 @@ case "$BUMP_ARG" in
     SYNC_WINDOWS_ONLY=1
     ;;
   --patch-idp)
-    log "IdP patch mode: updating SHA-256 table in iyou_idp _download_modal.html"
+    log "IdP patch mode: synchronizing fallback tag, IPFS CID, and checksums in iyou_idp"
     PATCH_IDP_ONLY=1
     ;;
   patch|minor|major|[0-9]*)
@@ -1607,7 +1925,7 @@ fi
 # If user invoked specifically with --patch-idp
 if [[ "${PATCH_IDP_ONLY:-0}" == "1" ]]; then
   auto_patch_idp
-  log "IdP download modal patched successfully."
+  log "iyou_idp release fallbacks synchronized and verified successfully."
   exit 0
 fi
 
