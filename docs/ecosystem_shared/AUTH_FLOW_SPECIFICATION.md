@@ -55,7 +55,7 @@ clients. This means:
 - `_scope = "openid profile email"` — default scope set
 - `require_consent = False` / `reuse_consent = True` — consent bypassed entirely for trusted satellites
 
-**Client ID format:** `iyou-{slug}-satellite-client` (e.g., `iyou-wun-satellite-client`)
+**Client ID format:** `{slug}-satellite-client` (e.g., `iyou-wun-satellite-client`)
 
 **Registered redirect URIs:** Each client has one or more `https://{subdomain}.iyou.me/oidc/callback/` URIs.
 
@@ -420,7 +420,7 @@ class User(AbstractBaseUser):
 - `password` field exists (inherited from `AbstractBaseUser`) but is **never used**
   for DID auth; set to unusable on admin elevation
 - `is_staff` / `is_superuser` are exclusively controlled by `ADMIN_DID` matching
-- `is_sovereign = True` blocks all front-channel OIDC code issuance for the DID
+- `is_sovereign = True` marks self-custodied `did:key:` identities; front-channel OIDC code issuance remains available for cryptographically authenticated `did:websocket` / `did:oob_qr` sessions and is blocked only for unverified/password sessions (§16.3)
 - Users are created on first successful DID verification (`get_or_create`)
 
 ---
@@ -811,108 +811,113 @@ response = requests.post(
 )
 ```
 
-### 17.4 Immutable Identity & OIDC URL Contract (No Split-Brain)
-All satellite apps must adhere to the immutable OIDC endpoint topology:
-- **External (Browser-Facing) Authorize Endpoint:**
-  `OIDC_OP_AUTHORIZATION_ENDPOINT = "https://iyou.me/openid/authorize/"`
-- **Internal Cluster Back-Channel Endpoints (Direct Pod-to-Pod via CoreDNS, Port 80 ClusterIP in `identity` namespace):**
-  - `OIDC_OP_TOKEN_ENDPOINT = "http://iyou-idp.identity.svc.cluster.local/openid/token/"`
-  - `OIDC_OP_USER_ENDPOINT = "http://iyou-idp.identity.svc.cluster.local/openid/userinfo/"`
-  - `OIDC_OP_JWKS_ENDPOINT = "http://iyou-idp.identity.svc.cluster.local/openid/jwks/"`
-  *(Note: Must strictly use `/openid/`, NEVER `/oidc/`. Service port is 80, not 8000).*
+### 17.4 Ingress Alignment (No Split-Brain)
+`IDP_BASE_INTERNAL_URL` must default to `IDP_BASE_PUBLIC_URL` (`https://iyou.me`) in local dev and environments where direct ingress is accessible. Internal Kubernetes cluster service URLs (e.g. `http://iyou-idp.mesh.svc.cluster.local:8000`) are strictly injected via Helm in production to prevent split-brain routing and TLS/network mismatches.
 
-### 17.5 App-Scoped Cookies & Resilient Logout
-Session and CSRF cookies must be app-scoped and host-only to prevent cookie collisions across `*.iyou.me`:
-- `SESSION_COOKIE_NAME = env("SESSION_COOKIE_NAME", default=f"{APP_SLUG}_sessionid")`
-- `CSRF_COOKIE_NAME = env("CSRF_COOKIE_NAME", default=f"{APP_SLUG}_csrftoken")`
-- `SESSION_COOKIE_DOMAIN = None` and `CSRF_COOKIE_DOMAIN = None` (Strictly host-only, never wildcard `.iyou.me`)
-- `SESSION_COOKIE_SECURE = not DEBUG` and `CSRF_COOKIE_SECURE = not DEBUG`
-- `SESSION_COOKIE_HTTPONLY = True` and `CSRF_COOKIE_HTTPONLY = False`
+### 17.5 Resilient Cookies & Logout
+Session cookie security and domain isolation must dynamically follow the deployment environment:
+- Set `SESSION_COOKIE_SECURE = not DEBUG`
+- Set `SESSION_COOKIE_DOMAIN = None if DEBUG else ".iyou.me"`
 - `PKCEOIDCLogoutView` must support both `GET` and `POST` methods to prevent HTTP 405 Method Not Allowed errors on user sign-out from varied satellite interfaces.
 
 ---
 
-## 18. Tier 1 Managed Identity Ingress (did:web)
+## 18. Offline Enclave Fallback (`SEC-004` Central SPOF Mitigation)
 
-Tier 1 (`managed_free`) users authenticate with server-managed custodial DIDs of the form `did:web:iyou.me:user:<uuid>`. Unlike Sovereign `did:key:z6Mk...` identifiers (which encode raw Ed25519 public key bytes in multibase Base58btc), `did:web` identifiers contain colons and domain/path segments that cannot be decoded via multibase Base58btc and are prohibited in raw XMPP JID localparts by RFC 7622 nodeprep rules.
+### 18.1 Architectural Threat Model & Motivation
+In standard operations, `iyou_idp` serves as the sole token-issuing authority in the ecosystem. However, a regional outage, network partition, or central cloud failure could render `iyou.me` temporarily unreachable from local meshes, field satellites, or local browser sessions. To mitigate this single point of failure (SPOF) without sacrificing cryptographic guarantees or introducing long-lived credentials, the **SEC-004 Offline Enclave Fallback** contract enables sovereign (`did:key`) desktop identities to authenticate directly with local satellites via their running `iyou_home` desktop enclave (`wss://home.iyou.me:9001`).
 
-### 18.1 SHA-256 Nodeprep 64-Hex Mapping Rule (`decode_public_key`)
-
-To prevent OIDC callback rejection loops and guarantee RFC 7622 nodeprep-safe usernames and JIDs across all Django and XMPP satellites, `decode_public_key(identifier)` in `templates/utils/auth_pkce.py` implements a deterministic SHA-256 digest mapping for `did:web:`:
-
-1. Detect `identifier.startswith("did:web:")`.
-2. Strip prefix (`identifier[len("did:web:"):]`) to verify a non-empty method-specific identifier is present.
-3. Compute the raw 32-byte digest over the full UTF-8 identifier string:
-   ```python
-   raw = hashlib.sha256(identifier.encode("utf-8")).digest()
-   return raw.hex().lower()
-   ```
-4. Return the 64-character lowercase hexadecimal string (`[0-9a-f]{64}`).
-
-This ensures every `did:web:iyou.me:user:<uuid>`, `did:key:z6Mk...`, and `npub1...` normalizes to a uniform 64-hex localpart (`{pubkey_hex}@{domain}`) with zero colons or prohibited codepoints.
-
-### 18.2 Session Identity Metadata Synchronization (`_sync_session_identity_meta`)
-
-All satellite authentication backends (`PKCEAuthenticationBackend` and `IYouOIDCAuthenticationBackend`) must invoke `self._sync_session_identity_meta(claims)` inside both `create_user(claims)` and `update_user(user, claims)` to persist Tier 1 and Sovereign metadata in `request.session`:
-
-```python
-def _sync_session_identity_meta(self, claims: dict) -> None:
-    sub = claims.get("sub", "")
-    tier = claims.get("account_tier") or (
-        "managed_free" if str(sub).startswith("did:web:") else "sovereign"
-    )
-    request.session["account_tier"] = tier
-    request.session["custodial_did"] = sub
-    request.session["did_method"] = claims.get("did_method") or (
-        "web" if str(sub).startswith("did:web:") else "key"
-    )
+```
+┌──────────────┐          WebSocket (Loopback)           ┌──────────────┐
+│  Satellite   │ ◄─────────────────────────────────────► │  iyou_home   │
+│  (Browser/RP)│   `OFFLINE_CHALLENGE_VERIFY` Contract   │ (Desktop WS) │
+└──────────────┘                                         └──────────────┘
+       │                                                         │
+  1. Generate 32B nonce (`challenge`)                            │
+  2. Send `{type: "OFFLINE_CHALLENGE_VERIFY", ...}` ───────────► │
+                                                                 │
+                                                       3. Verify audience & prompt
+                                                       4. Sign compact W3C VP
+  5. ◄──────── Return signed W3C VP assertion ───────────────────┘
+     (`holder`, `challenge`, `audience`, `issued_at`, `expires_at`)
+       │
+  6. Direct Ed25519 multicodec verification (`0xed01`)
+  7. Single-use nonce burn (`offline_nonce:{nonce}`, 300s TTL)
+  8. Enforce security boundaries:
+     - `auth_method` = `"did:offline_enclave"`
+     - `account_tier` = `"sovereign"`
+     - FAIL CLOSED on all `dep.*` dependent-session claims
+  9. Establish ephemeral session with forced OIDC re-validation
+     once `expires_at` elapses or `iyou.me` recovers.
 ```
 
-| Session Variable | Tier 1 Managed Value | Sovereign Value | Purpose |
-|:---|:---|:---|:---|
-| `request.session["account_tier"]` | `"managed_free"` (or claim value) | `"sovereign"` | Drives Custodial Enclave UI & tier-aware feature gates |
-| `request.session["custodial_did"]` | `did:web:iyou.me:user:<uuid>` | `did:key:z6Mk...` | Preserves original OIDC `sub` DID even when `User.username` is a 64-hex JID |
-| `request.session["did_method"]` | `"web"` | `"key"` | Identifies underlying W3C DID method |
+### 18.2 Wire Protocol Specification (`OFFLINE_CHALLENGE_VERIFY`)
 
-Additionally, backends must define an explicit `get_user(self, user_id)` method delegating to `UserModel.objects.filter(pk=user_id).first()` to guarantee session rehydration across requests.
+When `iyou_idp` is detected as unreachable (e.g. repeated connection timeouts or network split), a satellite may initiate the offline fallback handshake over the local loopback WebSocket connection to `iyou_home` (`wss://home.iyou.me:9001` or configured `IDP_HOME_WS_URL`).
 
-### 18.3 Custodial Enclave UI (`_persona_enclave.html`)
+#### Request Frame (Satellite -> Browser -> `iyou_home`)
+The satellite generates a 32-byte cryptographically secure random nonce (`challenge`) and delivers the following JSON frame over the loopback WebSocket:
 
-The canonical Persona Enclave partial (`templates/includes/_persona_enclave.html`) inspects `request.session.account_tier != "sovereign" or is_custodial` to distinguish Tier 1 custodial sessions from Sovereign hardware/bridge sessions:
+```json
+{
+  "type": "OFFLINE_CHALLENGE_VERIFY",
+  "challenge": "e8a1f2c4b69d801247a3e5c9b7d8f1e2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c",
+  "audience": "iyou-wun-satellite-client",
+  "issued_at": 1795123200
+}
+```
 
-- **Custodial Mode (`request.session.account_tier != "sovereign" or is_custodial`):**
-  - Active persona status dot (`#active-persona-dot`): Amber dot (`bg-amber-500`) with `title="Custodial Identity (Tier 1 Managed)"`.
-  - Level badge (`#active-persona-level`): Amber badge rendering `T1` (instead of `L1`).
-  - Bridge status label (`#persona-bridge-status`): Amber label rendering `Custodial Mode (Tier 1)`.
-- **Sovereign Mode (`request.session.account_tier == "sovereign"` and not `is_custodial`):**
-  - Active persona status dot (`#active-persona-dot`): Emerald pulsing dot (`bg-emerald-500 animate-pulse`) with `title="Sovereign Key Active"`.
-  - Level badge (`#active-persona-level`): Violet badge rendering `L1` (or `L{{ active_persona_level }}`).
-  - Bridge status label (`#persona-bridge-status`): Emerald label rendering `Bridge Connected`.
+- `type`: Must be strictly `"OFFLINE_CHALLENGE_VERIFY"`.
+- `challenge`: 32-byte hexadecimal random nonce generated by the relying party satellite.
+- `audience`: Satellite OIDC client ID registered for the service (e.g., `"iyou-wun-satellite-client"`).
+- `issued_at`: UTC epoch timestamp in seconds indicating when the challenge was generated.
 
----
+#### Response Assertion Frame (`iyou_home` -> Satellite)
+Upon receiving the challenge frame, `iyou_home` displays a local system authorization prompt to the operator. Upon confirmation, the enclave signs a compact W3C Verifiable Presentation (VP) containing the assertion and responds over the WebSocket:
 
-## 19. Canonical Satellite App Onboarding Contract (`ONBOARD_APP.md`)
+```json
+{
+  "type": "OFFLINE_CHALLENGE_RESPONSE",
+  "verifiablePresentation": {
+    "@context": ["https://www.w3.org/2018/credentials/v1"],
+    "type": ["VerifiablePresentation", "OfflineEnclavePresentation"],
+    "holder": "did:key:z6MkujsSdMm1j7QqUNaZo8U8kkcJNfFNikUQYJzmZX4wwgND",
+    "challenge": "e8a1f2c4b69d801247a3e5c9b7d8f1e2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c",
+    "audience": "iyou-wun-satellite-client",
+    "issued_at": 1795123200,
+    "expires_at": 1795123500,
+    "proof": {
+      "type": "Ed25519Signature2020",
+      "created": "2026-11-19T22:50:00Z",
+      "verificationMethod": "did:key:z6MkujsSdMm1j7QqUNaZo8U8kkcJNfFNikUQYJzmZX4wwgND#z6MkujsSdMm1j7QqUNaZo8U8kkcJNfFNikUQYJzmZX4wwgND",
+      "proofPurpose": "authentication",
+      "proofValue": "z3sE9...base58_signature..."
+    }
+  }
+}
+```
 
-To eliminate setting drift, inconsistent internal cluster URLs, cookie collisions, and divergent `auth_pkce.py` implementations, every satellite app must follow `docs/ecosystem_shared/ONBOARD_APP.md` verbatim:
+### 18.3 Verification Invariants & Security Boundaries
+A relying party satellite verifying an offline enclave assertion **MUST** strictly enforce the following sequence of checks:
 
-1. **Identity & OIDC URL Contract (Immutable):**
-   - `OIDC_OP_AUTHORIZATION_ENDPOINT = "https://iyou.me/openid/authorize/"`
-   - `OIDC_OP_TOKEN_ENDPOINT = "http://iyou-idp.identity.svc.cluster.local/openid/token/"` (Port 80 ClusterIP)
-   - `OIDC_OP_USER_ENDPOINT = "http://iyou-idp.identity.svc.cluster.local/openid/userinfo/"`
-   - `OIDC_OP_JWKS_ENDPOINT = "http://iyou-idp.identity.svc.cluster.local/openid/jwks/"`
-2. **Satellite Django `config/settings.py` Standard:**
-   - App-scoped cookies (`{APP_SLUG}_sessionid`, `{APP_SLUG}_csrftoken`), `SESSION_COOKIE_DOMAIN = None`, `CSRF_COOKIE_DOMAIN = None`.
-   - `OIDC_RP_CLIENT_ID = f"iyou-{APP_SLUG}-satellite-client"`, `OIDC_RP_CLIENT_SECRET = None`, `OIDC_RP_SIGN_ALGO = "RS256"`, `OIDC_RP_SCOPES = "openid profile email"`.
-   - `AUTHENTICATION_BACKENDS = ["apps.core.auth_pkce.PKCEAuthenticationBackend", "django.contrib.auth.backends.ModelBackend"]`.
-   - `LOGIN_URL = "/oidc/authenticate/"`, `LOGIN_REDIRECT_URL = "/"`, `LOGOUT_REDIRECT_URL = "/"`.
-3. **Standard URL Routing (`config/urls.py`):**
-   - `/oidc/authenticate/` (`oidc_authentication_init`), `/oidc/callback/` (`oidc_authentication_callback`), `/oidc/logout/` (`oidc_logout`), plus compatibility aliases `/accounts/login/` and `/accounts/logout/`.
-4. **Helm `values.yaml` Contract (`k3s_vm/apps/iyou-<slug>/`):**
-   - Injects canonical `OIDC_OP_*` endpoints, `<slug>_sessionid` / `<slug>_csrftoken`, and `SECURE_PROXY_SSL_HEADER: "HTTP_X_FORWARDED_PROTO,https"`.
-5. **Verification Checklist:**
-   - Registered in `iyou-idp` client seeder (`require_consent: False`, `reuse_consent: True`, PKCE public).
-   - Database migrations applied (`auth_user`, `django_session` must exist).
-   - Back-channel smoke test: container can `curl http://iyou-idp.identity.svc.cluster.local/openid/jwks/` with HTTP 200.
-
+1. **Expiry Window Clamp:**
+   The satellite verifies that `expires_at - issued_at <= 300` (maximum 5 minutes duration). Assertions with validity windows exceeding 300 seconds must be rejected immediately.
+2. **Audience Binding:**
+   The satellite verifies that `verifiablePresentation.audience` strictly matches its own registered client ID.
+3. **Single-Use Nonce Tracking:**
+   The satellite stores the nonce in local atomic storage (e.g. Redis key `offline_nonce:{nonce}` with a 300s TTL). If the nonce has already been consumed or does not match an outstanding challenge generated by this satellite, authentication fails with `invalid_grant`.
+4. **Direct Ed25519 Multicodec Verification:**
+   The satellite decodes the `holder` DID (`did:key:z...`), parses the multicodec prefix (`0xed01` for Ed25519), extracts the 32-byte raw public key, and verifies the `proof.proofValue` signature over the canonical JSON payload (or JWS format) without querying any remote registry.
+5. **Session Tier & Auth Method:**
+   Upon successful verification, the satellite establishes an ephemeral local session with:
+   - `auth_method = "did:offline_enclave"`
+   - `account_tier = "sovereign"`
+   - `is_sovereign = True`
+   - `offline_enclave_active = True`
+   - `expires_at = <expires_at_timestamp>`
+6. **Strict Fail-Closed Posture on Dependent Claims (`dep.*`):**
+   Offline enclave assertions **CANNOT** assert or delegate parental guardianship, family-mesh authorizations, or neutral age-bracket permissions (`dep.*` claims). Any request attempting to establish, verify, or act upon dependent claims or `DependentTokenSlot` tokens under `auth_method = "did:offline_enclave"` **MUST FAIL CLOSED** (HTTP 403 / `dependent_claims_offline_prohibited`). Dependent authorization requires online central proof verification and active revocation index queries against `iyou_idp`.
+7. **Forced OIDC Re-Validation:**
+   The offline session is valid strictly until `expires_at` elapses. Furthermore, satellites running background health checks against `IDP_BASE_URL` (`GET /auth/challenge/`) must trigger a standard OIDC PKCE front-channel re-authentication flow as soon as the central IdP becomes reachable again, replacing the degraded offline session with a fully audited central OIDC credential.
 
 

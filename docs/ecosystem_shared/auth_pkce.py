@@ -47,15 +47,22 @@ URLconf (config/urls.py):
     path("oidc/logout/",
          PKCEOIDCLogoutView.as_view(),
          name="oidc_logout"),
+    path("oidc/offline-verify/",
+         PKCEOIDCOfflineFallbackView.as_view(),
+         name="oidc_offline_verify"),
 
 AUTHENTICATION_BACKENDS:
     "apps.core.auth_pkce.PKCEAuthenticationBackend"
     "django.contrib.auth.backends.ModelBackend"
+
+MIDDLEWARE:
+    "apps.core.auth_pkce.OfflineSessionExpiryMiddleware"
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -69,10 +76,14 @@ from django.conf import settings
 from django.contrib import auth
 from django.contrib.auth import get_user_model, logout
 from django.contrib.auth.backends import ModelBackend
-from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.core.cache import cache
+from django.http import HttpRequest, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import redirect
 from django.urls import reverse
 from django.utils.crypto import get_random_string
+from django.utils.decorators import method_decorator
+from django.views import View
+from django.views.decorators.csrf import csrf_exempt
 from mozilla_django_oidc.auth import OIDCAuthenticationBackend
 from mozilla_django_oidc.utils import (
     absolutify,
@@ -89,6 +100,13 @@ try:
 except ImportError:  # pragma: no cover - mozilla-django-oidc >= 5.0
     from mozilla_django_oidc.views import get_next_url
 
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+except ImportError:  # pragma: no cover
+    Ed25519PublicKey = None  # type: ignore[assignment,misc]
+    InvalidSignature = Exception  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -102,6 +120,19 @@ SESSION_KEY_OIDC_LOGIN_NEXT = "oidc_login_next"
 PKCE_VERIFIER_SESSION_KEY = "_pkce_cv"
 PKCE_TIMESTAMP_SESSION_KEY = "_pkce_cv_ts"
 PKCE_DEFAULT_MAX_AGE_SECONDS = 300
+
+# Loop-safe silent SSO (prompt=none) state.  ``sso_silent_attempted`` latches
+# a failed probe for the life of the session; ``sso_silent_inflight`` marks the
+# single redirect so parallel tabs/assets cannot double-fire the probe.
+SESSION_KEY_SSO_SILENT_ATTEMPTED = "sso_silent_attempted"
+SESSION_KEY_SSO_SILENT_INFLIGHT = "sso_silent_inflight"
+SSO_HINT_COOKIE = "iyou_sso_hint"
+SILENT_SSO_ERRORS = {
+    "login_required",
+    "interaction_required",
+    "consent_required",
+    "account_selection_required",
+}
 
 # ---------------------------------------------------------------------------
 # Deterministic Public-Key & DID / JID Normalization Helpers
@@ -135,6 +166,38 @@ def _decode_base58btc(value: str) -> bytes:
     pad = len(value) - len(value.lstrip("1"))
     body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
     return b"\x00" * pad + body
+
+
+def _decode_ed25519_signature(sig_str: str) -> bytes:
+    """Decode a 64-byte Ed25519 signature from hex or base58 (with or without 'z')."""
+    trimmed = str(sig_str).strip()
+    if len(trimmed) == 128:
+        try:
+            raw = bytes.fromhex(trimmed)
+            if len(raw) == 64:
+                return raw
+        except Exception:
+            pass
+    if trimmed.startswith("z"):
+        try:
+            raw = _decode_base58btc(trimmed[1:])
+            if len(raw) == 64:
+                return raw
+        except Exception:
+            pass
+    try:
+        raw = _decode_base58btc(trimmed)
+        if len(raw) == 64:
+            return raw
+    except Exception:
+        pass
+    try:
+        raw = bytes.fromhex(trimmed)
+        if len(raw) == 64:
+            return raw
+    except Exception:
+        pass
+    raise ValueError("Signature must be a 64-byte hex or base58 string")
 
 
 def _bech32_polymod(values: list[int]) -> int:
@@ -316,6 +379,19 @@ class PKCEOIDCAuthenticationRequestView(OIDCAuthenticationRequestView):
 
     http_method_names = ["get"]
 
+    def get_extra_params(self, request):
+        """Attach ``prompt=none`` only to a one-shot silent SSO attempt.
+
+        Interactive clicks on the Layer 1 ``Authenticate`` link never carry
+        ``prompt=none`` because the inflight flag is only set by
+        ``SilentSSOMiddleware``.  Copy the settings dict before mutating it so
+        a global ``OIDC_AUTH_REQUEST_EXTRA_PARAMS`` setting is never changed.
+        """
+        params = dict(super().get_extra_params(request) or {})
+        if request.session.pop(SESSION_KEY_SSO_SILENT_INFLIGHT, False):
+            params["prompt"] = "none"
+        return params
+
     def get(self, request):
         """Intercept the GET, generate PKCE pair, redirect to the OP."""
         try:
@@ -473,6 +549,12 @@ class PKCEOIDCAuthenticationCallbackView(OIDCAuthenticationCallbackView):
 
     def login_success(self):
         """Establish the authenticated Django session and redirect."""
+        # Clear silent-SSO latches so a later logout/re-login starts clean.
+        request = getattr(self, "request", None)
+        if request is not None and hasattr(request, "session"):
+            request.session.pop(SESSION_KEY_SSO_SILENT_ATTEMPTED, None)
+            request.session.pop(SESSION_KEY_SSO_SILENT_INFLIGHT, None)
+
         user = getattr(self, "user", None)
         if user is not None and getattr(self, "request", None) is not None:
             backend_path = getattr(
@@ -483,14 +565,45 @@ class PKCEOIDCAuthenticationCallbackView(OIDCAuthenticationCallbackView):
             auth.login(self.request, user, backend=backend_path)
         return HttpResponseRedirect(self.success_url)
 
+    def login_failure(self):
+        """Recover cleanly from a silent ``prompt=none`` probe.
+
+        iyou_idp answers ``login_required`` / ``interaction_required`` when no
+        master session exists.  That is not an error for a silent attempt:
+        latch the session, restore the originally requested URL, and return
+        the normal unauthenticated page with no error banner.  Interactive
+        failures still fall through to the library's ``login_failure()``.
+        """
+        request = getattr(self, "request", None)
+        if (
+            request is not None
+            and hasattr(request, "session")
+            and request.GET.get("error") in SILENT_SSO_ERRORS
+            and (
+                request.session.pop(SESSION_KEY_SSO_SILENT_INFLIGHT, False)
+                or request.COOKIES.get(SSO_HINT_COOKIE) == "1"
+            )
+        ):
+            request.session[SESSION_KEY_SSO_SILENT_ATTEMPTED] = True
+            next_url = request.session.pop(SESSION_KEY_OIDC_LOGIN_NEXT, None)
+            return HttpResponseRedirect(
+                next_url or getattr(settings, "LOGIN_REDIRECT_URL", "/")
+            )
+        return super().login_failure()
+
 
 # ---------------------------------------------------------------------------
 # Logout View — Dual GET & POST support to prevent HTTP 405
 # ---------------------------------------------------------------------------
 
 class PKCEOIDCLogoutView(OIDCLogoutView):
-    """Seamless GET and POST logout view preventing HTTP 405 Method Not Allowed.
-    Flushes the local Django session and redirects to LOGOUT_REDIRECT_URL.
+    """Seamless GET and POST logout with federated IdP session termination.
+
+    Flushes the local Django session, then chains to the master IdP's
+    ``/auth/logout/?next=...`` so the central OIDC session is destroyed too —
+    preventing a "false logout" where another satellite silently restores the
+    user from the still-authenticated IdP.  The ``iyou_sso_hint`` cookie is
+    removed in the same response so silent SSO cannot reverse the logout.
     """
 
     def get(self, request, *args, **kwargs):
@@ -498,8 +611,329 @@ class PKCEOIDCLogoutView(OIDCLogoutView):
 
     def post(self, request, *args, **kwargs):
         logout(request)
-        redirect_url = getattr(settings, "LOGOUT_REDIRECT_URL", "/")
-        return redirect(redirect_url)
+        idp_base = getattr(settings, "IDP_BASE_PUBLIC_URL", "https://iyou.me").rstrip("/")
+        next_url = getattr(settings, "IDP_LOGOUT_RETURN_URL", "/")
+        response = redirect(f"{idp_base}/auth/logout/?{urlencode({'next': next_url})}")
+        response.delete_cookie(
+            SSO_HINT_COOKIE,
+            domain=None if getattr(settings, "DEBUG", False) else ".iyou.me",
+        )
+        return response
+
+
+# ---------------------------------------------------------------------------
+# Offline Enclave Fallback View (SEC-004)
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PKCEOIDCOfflineFallbackView(View):
+    """Canonical zero-extra-dependency SEC-004 offline enclave fallback endpoint.
+
+    When iyou_idp (https://iyou.me) is unreachable, establishes an ephemeral
+    Level 2 sovereign session (<= 300s TTL) by directly verifying an Ed25519 W3C
+    Verifiable Presentation (VP) assertion signed by the user's local iyou_home
+    desktop enclave bridge (127.0.0.1:9001).
+
+    Gated behind settings.OFFLINE_AUTH_FALLBACK_ENABLED (default True).
+    Fails closed on:
+    - Non-POST requests
+    - did:web or non-z6Mk DID methods
+    - Audience mismatch (against settings.OIDC_RP_CLIENT_ID)
+    - Expired assertions or validity windows > 300s
+    - Replayed nonce challenges (via cache.add atomicity)
+    - Tampered canonical JSON payload or invalid Ed25519 signatures
+    - Dependent claims (dep.* minor/guardian claims strictly prohibited offline)
+    """
+
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        if not getattr(settings, "OFFLINE_AUTH_FALLBACK_ENABLED", True):
+            return JsonResponse(
+                {"error": "offline_fallback_disabled", "message": "Offline fallback authentication is disabled."},
+                status=403,
+            )
+
+        try:
+            raw_body = request.body.decode("utf-8") if isinstance(request.body, bytes) else (request.body or "")
+            body = json.loads(raw_body)
+        except Exception:
+            return JsonResponse(
+                {"error": "invalid_request", "message": "Request body must be valid JSON."},
+                status=400,
+            )
+
+        if not isinstance(body, dict):
+            return JsonResponse(
+                {"error": "invalid_request", "message": "JSON body must be an object."},
+                status=400,
+            )
+
+        vp = body.get("vp")
+        challenge = body.get("challenge")
+
+        if not vp or not isinstance(vp, dict) or not challenge or not isinstance(challenge, str):
+            return JsonResponse(
+                {"error": "invalid_request", "message": "Missing 'vp' object or 'challenge' string."},
+                status=400,
+            )
+
+        # 1. Reject dependent claims immediately (fail-closed on minor/guardian claims)
+        if self._has_dependent_claims(vp):
+            return JsonResponse(
+                {
+                    "error": "dependent_claims_offline_prohibited",
+                    "message": "Offline enclave assertions cannot carry or delegate dependent claims (dep.*).",
+                },
+                status=403,
+            )
+
+        # 2. Verify holder starts with 'did:key:z6Mk' (reject did:web: or other DID methods)
+        holder = vp.get("holder")
+        if not isinstance(holder, str) or not holder.startswith("did:key:z6Mk"):
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": "Holder must start with 'did:key:z6Mk' (Ed25519 did:key).",
+                },
+                status=400,
+            )
+
+        # 3. Verify audience matches settings.OIDC_RP_CLIENT_ID
+        expected_client_id = getattr(settings, "OIDC_RP_CLIENT_ID", None)
+        vp_audience = vp.get("audience")
+        if not expected_client_id or vp_audience != expected_client_id:
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": f"Audience mismatch: expected {expected_client_id!r}, got {vp_audience!r}.",
+                },
+                status=400,
+            )
+
+        # 4. Verify challenge matches VP challenge
+        if vp.get("challenge") != challenge:
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": "Challenge nonce does not match assertion challenge.",
+                },
+                status=400,
+            )
+
+        # 5. Verify issued_at and expires_at: valid integers, 0 < (expires_at - issued_at) <= 300, time.time() < expires_at
+        issued_at = vp.get("issued_at")
+        expires_at = vp.get("expires_at")
+        if (
+            not isinstance(issued_at, int)
+            or isinstance(issued_at, bool)
+            or not isinstance(expires_at, int)
+            or isinstance(expires_at, bool)
+        ):
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": "issued_at and expires_at must be valid integers.",
+                },
+                status=400,
+            )
+
+        ttl = expires_at - issued_at
+        if not (0 < ttl <= 300):
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": f"Assertion TTL ({ttl}s) invalid: must be > 0 and <= 300s.",
+                },
+                status=400,
+            )
+
+        now = time.time()
+        if now >= expires_at:
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": "Assertion has expired.",
+                },
+                status=400,
+            )
+
+        # 6. Single-use nonce check via cache.add (failing closed on replay)
+        cache_key = f"offline_nonce:{challenge}"
+        if not cache.add(cache_key, "1", timeout=300):
+            return JsonResponse(
+                {
+                    "error": "invalid_grant",
+                    "message": "Challenge nonce has already been consumed (replay detected).",
+                },
+                status=400,
+            )
+
+        # 7. Decode Ed25519 public key from 0xed01 multicodec did:key
+        multibase = holder[len("did:key:") :]
+        if not multibase.startswith("z"):
+            return JsonResponse(
+                {"error": "invalid_grant", "message": "did:key multibase must start with 'z'."},
+                status=400,
+            )
+        try:
+            raw_multicodec = _decode_base58btc(multibase[1:])
+        except Exception as exc:
+            return JsonResponse(
+                {"error": "invalid_grant", "message": f"Malformed Base58 in did:key: {exc}"},
+                status=400,
+            )
+
+        if len(raw_multicodec) != 34 or raw_multicodec[0] != 0xED or raw_multicodec[1] != 0x01:
+            return JsonResponse(
+                {"error": "invalid_grant", "message": "Holder multicodec prefix is not Ed25519 (0xed01)."},
+                status=400,
+            )
+
+        raw_pubkey = raw_multicodec[2:]
+        if Ed25519PublicKey is None:  # pragma: no cover
+            return JsonResponse(
+                {"error": "server_error", "message": "cryptography package required for offline verification."},
+                status=500,
+            )
+
+        try:
+            pubkey = Ed25519PublicKey.from_public_bytes(raw_pubkey)
+        except Exception as exc:
+            return JsonResponse(
+                {"error": "invalid_grant", "message": f"Invalid Ed25519 public key bytes: {exc}"},
+                status=400,
+            )
+
+        # 8. Extract signature and verify against canonical JSON
+        proof = vp.get("proof")
+        if not isinstance(proof, dict):
+            return JsonResponse(
+                {"error": "invalid_grant", "message": "Missing or invalid proof block."},
+                status=400,
+            )
+
+        sig_val = proof.get("proofValue") or proof.get("signatureValue")
+        if not sig_val or not isinstance(sig_val, str):
+            return JsonResponse(
+                {"error": "invalid_grant", "message": "Missing proofValue in proof block."},
+                status=400,
+            )
+
+        try:
+            sig_bytes = _decode_ed25519_signature(sig_val)
+        except Exception as exc:
+            return JsonResponse(
+                {"error": "invalid_grant", "message": f"Invalid signature encoding: {exc}"},
+                status=400,
+            )
+
+        canonical_fields = [
+            "@context",
+            "type",
+            "holder",
+            "challenge",
+            "audience",
+            "issued_at",
+            "expires_at",
+            "verifiableCredential",
+            "issuer",
+        ]
+
+        payload_candidates: list[bytes] = []
+        if all(k in vp for k in canonical_fields):
+            canon_dict = {k: vp[k] for k in canonical_fields}
+            payload_candidates.append(json.dumps(canon_dict, separators=(",", ":")).encode("utf-8"))
+
+        non_proof = {k: v for k, v in vp.items() if k != "proof"}
+        payload_candidates.append(json.dumps(non_proof, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        payload_candidates.append(json.dumps(non_proof, separators=(",", ":")).encode("utf-8"))
+
+        verified = False
+        for candidate in payload_candidates:
+            try:
+                pubkey.verify(sig_bytes, candidate)
+                verified = True
+                break
+            except Exception:
+                continue
+
+        if not verified:
+            return JsonResponse(
+                {"error": "invalid_grant", "message": "Ed25519 signature verification failed."},
+                status=400,
+            )
+
+        # 9. Resolve / provision User anchored to holder
+        user = self._resolve_or_create_user(holder)
+
+        # 10. Log in
+        if not hasattr(user, "backend"):
+            user.backend = "apps.core.auth_pkce.PKCEAuthenticationBackend"
+        auth.login(request, user)
+
+        # 11. Establish session state & strip dep.* keys
+        if hasattr(request, "session"):
+            request.session["auth_method"] = "did:offline_enclave"
+            request.session["account_tier"] = "sovereign"
+            request.session["offline_session_expires_at"] = expires_at
+            request.session["expires_at"] = expires_at
+            request.session["is_sovereign"] = True
+            request.session["offline_enclave_active"] = True
+
+            # Explicitly strip and block any dep.* dependent-session keys
+            for skey in list(request.session.keys()):
+                if skey.startswith("dep.") or skey.startswith("dep_") or skey == "dependent_claims":
+                    request.session.pop(skey, None)
+
+            if hasattr(request.session, "save"):
+                request.session.save()
+            request.session.modified = True
+
+        return JsonResponse(
+            {
+                "status": "ok",
+                "authenticated": True,
+                "user": getattr(user, "username", str(user)),
+                "auth_method": "did:offline_enclave",
+                "account_tier": "sovereign",
+                "offline_session_expires_at": expires_at,
+            }
+        )
+
+    @staticmethod
+    def _has_dependent_claims(vp: dict) -> bool:
+        for k in vp:
+            if k.startswith("dep.") or k.startswith("dep_") or k == "dependent_claims":
+                return True
+        vcs = vp.get("verifiableCredential")
+        if isinstance(vcs, list):
+            for vc in vcs:
+                if isinstance(vc, dict):
+                    for k in vc:
+                        if k.startswith("dep.") or k.startswith("dep_") or k == "dependent_claims":
+                            return True
+        return False
+
+    @staticmethod
+    def _resolve_or_create_user(holder: str) -> Any:
+        UserModel = get_user_model()
+        username = PKCEAuthenticationBackend._normalize_sub_to_username(holder)
+        user = None
+        if hasattr(UserModel, "objects"):
+            user = UserModel.objects.filter(username=username).first()
+            if not user:
+                try:
+                    user = UserModel.objects.create_user(username=username)
+                except Exception:
+                    user = UserModel(username=username)
+                    if hasattr(user, "save"):
+                        user.save()
+        if user is None:
+            user = UserModel(username=username) if callable(UserModel) else UserModel
+        if hasattr(user, "set_unusable_password"):
+            user.set_unusable_password()
+        if hasattr(user, "save"):
+            user.save()
+        return user
 
 
 # ---------------------------------------------------------------------------
@@ -1040,3 +1474,111 @@ class PKCEVerifierCleanupMiddleware:
             request.session.modified = True
             return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# Loop-Safe Silent SSO Middleware (prompt=none)
+# ---------------------------------------------------------------------------
+
+class SilentSSOMiddleware:
+    """One-shot, loop-safe ``prompt=none`` probe for anonymous GET requests.
+
+    Must run after ``SessionMiddleware`` and ``AuthenticationMiddleware`` so
+    ``request.session`` and ``request.user`` are available.  A returning
+    visitor whose browser still carries ``iyou_sso_hint=1`` gets exactly one
+    silent chance to re-authenticate from the master IdP session.  Both the
+    in-flight redirect and its eventual outcome are latched in the session,
+    so neither successful nor failed probes can recur in this session.
+
+    OIDC endpoints, admin, static assets and health checks are exempt.  The
+    interactive Layer 1 ``Authenticate`` link remains the user-facing fallback
+    and never receives ``prompt=none``.
+    """
+
+    EXEMPT_PREFIXES = (
+        "/oidc/authenticate/",
+        "/oidc/callback/",
+        "/oidc/logout/",
+        "/auth/logout/",
+        "/admin/",
+        "/static/",
+        "/health",
+    )
+
+    def __init__(self, get_response: Any) -> None:
+        self.get_response = get_response
+        self.enabled = getattr(settings, "SSO_SILENT_ENABLED", True)
+
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        if self.enabled and self._should_probe(request):
+            session = request.session
+            session[SESSION_KEY_SSO_SILENT_INFLIGHT] = True
+            session[SESSION_KEY_OIDC_LOGIN_NEXT] = request.get_full_path()
+            session.save()
+            return HttpResponseRedirect(reverse("oidc_authentication_init"))
+        return self.get_response(request)
+
+    def _should_probe(self, request: HttpRequest) -> bool:
+        if getattr(request, "method", None) != "GET":
+            return False
+        path = str(getattr(request, "path", "") or "")
+        if any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
+            return False
+        if "error" in getattr(request, "GET", {}):
+            return False
+
+        user = getattr(request, "user", None)
+        if user is None or getattr(user, "is_authenticated", False):
+            return False
+        if getattr(request, "COOKIES", {}).get(SSO_HINT_COOKIE) != "1":
+            return False
+
+        session = getattr(request, "session", None)
+        if session is None:
+            return False
+        if session.get(SESSION_KEY_SSO_SILENT_ATTEMPTED):
+            return False
+        if session.get(SESSION_KEY_SSO_SILENT_INFLIGHT):
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Offline Session Expiry Middleware (SEC-004)
+# ---------------------------------------------------------------------------
+
+class OfflineSessionExpiryMiddleware:
+    """Terminates expired SEC-004 offline enclave sessions.
+
+    When ``request.session.get("auth_method") == "did:offline_enclave"`` and
+    ``time.time() >= request.session.get("offline_session_expires_at", 0)``:
+    calls ``logout(request)`` so expired offline sessions cannot persist
+    indefinitely. Also strips any unauthorized ``dep.*`` dependent-session keys.
+    """
+
+    def __init__(self, get_response: Any) -> None:
+        self.get_response = get_response
+
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        self.process_request(request)
+        return self.get_response(request)
+
+    def process_request(self, request: HttpRequest) -> None:
+        session = getattr(request, "session", None)
+        if session is None:
+            return
+
+        if session.get("auth_method") == "did:offline_enclave":
+            # Strip any dep.* dependent-session keys (fail-closed isolation)
+            for key in list(session.keys()):
+                if key.startswith("dep.") or key.startswith("dep_") or key == "dependent_claims":
+                    session.pop(key, None)
+                    session.modified = True
+
+            try:
+                expires_at = float(session.get("offline_session_expires_at", 0))
+            except (ValueError, TypeError):
+                expires_at = 0.0
+
+            if time.time() >= expires_at:
+                logout(request)
