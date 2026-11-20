@@ -341,6 +341,7 @@ where
                                 || t.contains("\"profile_sync\"")
                                 || t.contains("\"signature\"")
                                 || t.contains("\"OMNI_SIGN_RESPONSE\"")
+                                || t.contains("\"OFFLINE_ASSERTION\"")
                         }
                         _ => false,
                     };
@@ -760,6 +761,41 @@ where
                     continue;
                 }
 
+                if json["type"] == "OFFLINE_CHALLENGE_VERIFY"
+                    || json["action"] == "OFFLINE_CHALLENGE_VERIFY"
+                {
+                    if crate::enclave_is_locked(&app_handle) {
+                        println!("DEBUG: Rejected OFFLINE_CHALLENGE_VERIFY — enclave locked");
+                        crate::focus_main_window(&app_handle);
+                        let _ = response_tx.send(Message::Text(
+                            crate::enclave_locked_error().to_string().into(),
+                        ));
+                        continue;
+                    }
+
+                    match crate::vault::load_vault(&app_handle) {
+                        Ok(vault) => {
+                            let resp = match handle_offline_challenge_verify(&vault, &json) {
+                                Ok(assertion) => assertion,
+                                Err(err) => err,
+                            };
+                            let _ = response_tx.send(Message::Text(resp.to_string().into()));
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "code": "ERR_VAULT_UNAVAILABLE",
+                                    "message": format!("Failed to load vault: {}", e)
+                                })
+                                .to_string()
+                                .into(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
                 let raw_profile_id = json
                     .get("profile_id")
                     .and_then(|v| if v.is_null() { None } else { v.as_str() })
@@ -807,7 +843,9 @@ where
                     || json["type"] == "sign_credential"
                     || json["type"] == "POLY_CREDENTIAL_REQUEST"
                     || json["type"] == "POLLY_CREDENTIAL_REQUEST"
-                    || json["type"] == "OMNI_SIGN_REQUEST";
+                    || json["type"] == "OMNI_SIGN_REQUEST"
+                    || json["type"] == "OFFLINE_CHALLENGE_VERIFY"
+                    || json["action"] == "OFFLINE_CHALLENGE_VERIFY";
                 if is_signing_frame && crate::enclave_is_locked(&app_handle) {
                     println!("DEBUG: Rejected bridge signing request — enclave locked");
                     crate::focus_main_window(&app_handle);
@@ -1358,6 +1396,218 @@ async fn handle_omni_sign_request(
     });
 }
 
+/// Handler for SEC-004 Central SPOF mitigation offline challenge verification (`OFFLINE_CHALLENGE_VERIFY`).
+///
+/// Per SEC-004 (docs/AUTH_FLOW_SPECIFICATION.md §18), when iyou_idp (https://iyou.me) is unreachable,
+/// satellite apps can request an ephemeral (<= 300s TTL), audience-bound W3C Verifiable Presentation
+/// directly from the user's local iyou_home bridge (wss://home.iyou.me:9001).
+pub fn handle_offline_challenge_verify(
+    vault: &crate::vault::VaultStore,
+    json: &serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Value> {
+    handle_offline_challenge_verify_at(vault, json, None)
+}
+
+pub fn handle_offline_challenge_verify_at(
+    vault: &crate::vault::VaultStore,
+    json: &serde_json::Value,
+    fixed_time: Option<u64>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    // 1. Validate challenge: non-empty, >= 16 chars
+    let challenge = match json.get("challenge").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() && s.chars().count() >= 16 => s.to_string(),
+        _ => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_INVALID_CHALLENGE",
+                "message": "Challenge must be a non-empty string with at least 16 characters"
+            }));
+        }
+    };
+
+    // 2. Validate audience: non-empty
+    let audience = match json.get("audience").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_INVALID_AUDIENCE",
+                "message": "Audience must be a non-empty string"
+            }));
+        }
+    };
+
+    // 3. Resolve target persona (L1 or L2; defaulting to Primary Identity L1; failing closed with ERR_AIR_GAP_VIOLATION if Level 0 is requested)
+    let req_profile_id = json
+        .get("profile_id")
+        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+        .unwrap_or("")
+        .trim();
+
+    let target_profile = if req_profile_id.is_empty() {
+        // Default to Primary Identity L1
+        vault
+            .profiles
+            .iter()
+            .find(|p| p.level == 1 && p.profile_id == crate::vault::DEFAULT_PERSONA_PROFILE_ID)
+            .or_else(|| vault.profiles.iter().find(|p| p.level == 1 && p.derivation_index >= 1))
+            .or_else(|| vault.profiles.iter().find(|p| p.level == 1))
+            .or_else(|| vault.public_persona())
+            .ok_or_else(|| {
+                serde_json::json!({
+                    "type": "error",
+                    "code": "ERR_NO_PRIMARY_PERSONA",
+                    "message": "No primary Level 1 persona found in vault"
+                })
+            })?
+    } else {
+        // Explicit profile requested
+        if req_profile_id == crate::vault::ANCHOR_PROFILE_ID {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_AIR_GAP_VIOLATION",
+                "message": "ERR_AIR_GAP_VIOLATION: Level 0 Anchor identity is air-gapped from offline challenge verification"
+            }));
+        }
+
+        if vault.dependents.iter().any(|d| d.dependent_id == req_profile_id) {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_AIR_GAP_VIOLATION",
+                "message": "ERR_AIR_GAP_VIOLATION: Dependent identity is air-gapped from offline challenge verification"
+            }));
+        }
+
+        if vault.roles.iter().any(|r| r.role_id == req_profile_id) {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_AIR_GAP_VIOLATION",
+                "message": "ERR_AIR_GAP_VIOLATION: Level 3 Role identity is air-gapped from offline challenge verification"
+            }));
+        }
+
+        if vault.businesses.iter().any(|b| b.business_id == req_profile_id) {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_AIR_GAP_VIOLATION",
+                "message": "ERR_AIR_GAP_VIOLATION: Level 4 Business identity requires merchant authorization"
+            }));
+        }
+
+        let p = match vault.profiles.iter().find(|p| p.profile_id == req_profile_id) {
+            Some(p) => p,
+            None => {
+                return Err(serde_json::json!({
+                    "type": "error",
+                    "code": "ERR_PROFILE_NOT_FOUND",
+                    "message": format!("Profile not found: '{}'", req_profile_id)
+                }));
+            }
+        };
+
+        if p.level == 0 || p.derivation_index == 0 || p.is_anchor() || p.is_system_reserved {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_AIR_GAP_VIOLATION",
+                "message": "ERR_AIR_GAP_VIOLATION: Level 0 identity is air-gapped from offline challenge verification"
+            }));
+        }
+
+        if p.level != 1 && p.level != 2 {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_AIR_GAP_VIOLATION",
+                "message": format!(
+                    "ERR_AIR_GAP_VIOLATION: Profile level {} is not authorized for offline challenge verification",
+                    p.level
+                )
+            }));
+        }
+
+        p
+    };
+
+    // Extra air-gap check on resolved profile
+    if target_profile.level == 0 || target_profile.derivation_index == 0 || target_profile.is_anchor() {
+        return Err(serde_json::json!({
+            "type": "error",
+            "code": "ERR_AIR_GAP_VIOLATION",
+            "message": "ERR_AIR_GAP_VIOLATION: Resolved profile is Level 0"
+        }));
+    }
+
+    // 4. Resolve keypair
+    let kp = match crate::vault::get_profile_keypair(vault, &target_profile.profile_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_KEY_DERIVATION_FAILED",
+                "message": format!("Failed to derive keypair: {}", e)
+            }));
+        }
+    };
+
+    // 5. Timestamps: issued_at = now, expires_at = issued_at + 300
+    let issued_at = match fixed_time {
+        Some(t) => t,
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                serde_json::json!({
+                    "type": "error",
+                    "code": "ERR_INTERNAL_CLOCK",
+                    "message": format!("System clock error: {}", e)
+                })
+            })?
+            .as_secs(),
+    };
+    let expires_at = issued_at + 300;
+
+    // 6. Construct canonical W3C Verifiable Presentation
+    let presentation = serde_json::json!({
+        "@context": ["https://www.w3.org/2018/credentials/v1"],
+        "type": ["VerifiablePresentation"],
+        "holder": kp.did,
+        "issuer": kp.did,
+        "challenge": challenge,
+        "audience": audience,
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+        "verifiableCredential": []
+    });
+
+    let key_b58 = bs58::encode(kp.signing_key.to_bytes()).into_string();
+    let signed_vp_str = match did_rust::issue_vc(&presentation.to_string(), &kp.did, &key_b58) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_SIGNING_FAILED",
+                "message": format!("Failed to sign presentation: {}", e)
+            }));
+        }
+    };
+
+    let vp_val: serde_json::Value = match serde_json::from_str(&signed_vp_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "code": "ERR_SERIALIZATION_FAILED",
+                "message": format!("Failed to parse signed presentation JSON: {}", e)
+            }));
+        }
+    };
+
+    // 7. Return offline assertion response
+    Ok(serde_json::json!({
+        "type": "OFFLINE_ASSERTION",
+        "vp": vp_val,
+        "expires_at": expires_at
+    }))
+}
+
 pub async fn start_ws_server(app: AppHandle) {
     listen_on("[::]:9001", app).await;
 }
@@ -1743,6 +1993,260 @@ mod tests {
         unregister_client(&ws_state, conn1);
         assert_eq!(ws_state.client_senders.lock().unwrap().len(), 0);
         assert!(ws_state.response_sender.lock().unwrap().is_none());
+    }
+
+    fn crypto_test_vault() -> VaultStore {
+        let seed = vec![0x42u8; 32];
+        let root_seed_b58 = bs58::encode(&seed).into_string();
+        let make_p = |id: &str, idx: u32, lvl: u8, sys: bool, act: bool| {
+            let kp = crate::vault::derive_deterministic_keypair(&seed, idx);
+            Profile {
+                profile_id: id.to_string(),
+                profile_name: format!("{} Persona", id),
+                derivation_index: idx,
+                did: kp.did,
+                credentials: vec![],
+                nostr_pubkey_hex: "abcd".repeat(16),
+                level: lvl,
+                is_system_reserved: sys,
+                active: act,
+                imported_seed_b58: None,
+                imported_nostr_sk_hex: None,
+                handle: None,
+                display_name: None,
+                avatar_url: None,
+                banner_url: None,
+                bio: None,
+                nip05: None,
+                linked_credential_ids: vec![],
+            }
+        };
+        VaultStore {
+            root_seed_base58: root_seed_b58,
+            profiles: vec![
+                make_p("anchor", 0, 0, true, false),
+                make_p("primary", 1, 1, false, true),
+                make_p("dad_bod", 2, 2, false, false),
+                make_p("work_sock", 3, 2, false, false),
+            ],
+            sovereign_identities: vec![],
+            dependents: vec![],
+            roles: vec![],
+            businesses: vec![],
+            child_pods: vec![],
+        }
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_l1_default() {
+        let vault = crypto_test_vault();
+        let req = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "a_valid_challenge_nonce_12345",
+            "audience": "https://satellite.iyou.me"
+        });
+
+        let res = handle_offline_challenge_verify(&vault, &req)
+            .expect("L1 default assertion must succeed");
+        assert_eq!(res["type"], "OFFLINE_ASSERTION");
+        assert!(res["expires_at"].is_u64());
+
+        let vp = &res["vp"];
+        let l1_p = vault.profiles.iter().find(|p| p.level == 1).unwrap();
+        assert_eq!(vp["holder"], l1_p.did);
+        assert_eq!(vp["issuer"], l1_p.did);
+        assert_eq!(vp["challenge"], "a_valid_challenge_nonce_12345");
+        assert_eq!(vp["audience"], "https://satellite.iyou.me");
+        assert_eq!(vp["verifiableCredential"], serde_json::json!([]));
+        assert!(vp["proof"].is_object());
+        assert_eq!(vp["proof"]["type"], "Ed25519Signature2018");
+        assert_eq!(vp["proof"]["verificationMethod"], format!("{}#keys-1", l1_p.did));
+
+        // Verify with did_rust verify_vp
+        let verification = did_rust::verify_vp(&vp.to_string());
+        let ver_json: serde_json::Value = serde_json::from_str(&verification).unwrap();
+        assert_eq!(ver_json["valid"], true, "VP verification failed: {:?}", ver_json);
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_l1_explicit() {
+        let vault = crypto_test_vault();
+        let req = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "explicit_l1_challenge_nonce_16",
+            "audience": "https://satellite.iyou.me",
+            "profile_id": "primary"
+        });
+
+        let res = handle_offline_challenge_verify(&vault, &req)
+            .expect("L1 explicit assertion must succeed");
+        assert_eq!(res["type"], "OFFLINE_ASSERTION");
+
+        let vp = &res["vp"];
+        let l1_p = vault.profiles.iter().find(|p| p.profile_id == "primary").unwrap();
+        assert_eq!(vp["holder"], l1_p.did);
+        assert_eq!(vp["issuer"], l1_p.did);
+        assert_eq!(vp["challenge"], "explicit_l1_challenge_nonce_16");
+        assert_eq!(vp["audience"], "https://satellite.iyou.me");
+
+        let verification = did_rust::verify_vp(&vp.to_string());
+        let ver_json: serde_json::Value = serde_json::from_str(&verification).unwrap();
+        assert_eq!(ver_json["valid"], true, "VP verification failed: {:?}", ver_json);
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_l2_burner() {
+        let vault = crypto_test_vault();
+        let req = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "b_valid_challenge_nonce_67890",
+            "audience": "https://satellite.iyou.me",
+            "profile_id": "dad_bod"
+        });
+
+        let res = handle_offline_challenge_verify(&vault, &req)
+            .expect("L2 burner assertion must succeed");
+        assert_eq!(res["type"], "OFFLINE_ASSERTION");
+
+        let vp = &res["vp"];
+        let l2_p = vault.profiles.iter().find(|p| p.profile_id == "dad_bod").unwrap();
+        assert_eq!(vp["holder"], l2_p.did);
+        assert_eq!(vp["issuer"], l2_p.did);
+        assert_eq!(vp["challenge"], "b_valid_challenge_nonce_67890");
+        assert_eq!(vp["audience"], "https://satellite.iyou.me");
+
+        // Verify with did_rust verify_vp
+        let verification = did_rust::verify_vp(&vp.to_string());
+        let ver_json: serde_json::Value = serde_json::from_str(&verification).unwrap();
+        assert_eq!(ver_json["valid"], true, "VP verification failed: {:?}", ver_json);
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_300s_expiry_calculation() {
+        let vault = crypto_test_vault();
+        let fixed_now = 1700000000u64;
+        let req = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "challenge_nonce_exactly_16_ch",
+            "audience": "satellite_client_42"
+        });
+
+        let res = handle_offline_challenge_verify_at(&vault, &req, Some(fixed_now))
+            .expect("Should succeed with fixed timestamp");
+        assert_eq!(res["type"], "OFFLINE_ASSERTION");
+        let expires_at = res["expires_at"].as_u64().unwrap();
+        assert_eq!(expires_at, fixed_now + 300);
+
+        let vp = &res["vp"];
+        assert_eq!(vp["issued_at"], fixed_now);
+        assert_eq!(vp["expires_at"], fixed_now + 300);
+        assert_eq!(
+            vp["expires_at"].as_u64().unwrap() - vp["issued_at"].as_u64().unwrap(),
+            300
+        );
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_missing_or_short_challenge_rejected() {
+        let vault = crypto_test_vault();
+
+        // Missing challenge
+        let req1 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "audience": "sat_app"
+        });
+        let err1 = handle_offline_challenge_verify(&vault, &req1).unwrap_err();
+        assert_eq!(err1["type"], "error");
+        assert_eq!(err1["code"], "ERR_INVALID_CHALLENGE");
+
+        // Empty challenge
+        let req2 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "",
+            "audience": "sat_app"
+        });
+        let err2 = handle_offline_challenge_verify(&vault, &req2).unwrap_err();
+        assert_eq!(err2["type"], "error");
+        assert_eq!(err2["code"], "ERR_INVALID_CHALLENGE");
+
+        // Whitespace-only challenge
+        let req2b = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "                ",
+            "audience": "sat_app"
+        });
+        let err2b = handle_offline_challenge_verify(&vault, &req2b).unwrap_err();
+        assert_eq!(err2b["type"], "error");
+        assert_eq!(err2b["code"], "ERR_INVALID_CHALLENGE");
+
+        // Short challenge (< 16 chars, 15 chars)
+        let req3 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "short_nonce_123",
+            "audience": "sat_app"
+        });
+        let err3 = handle_offline_challenge_verify(&vault, &req3).unwrap_err();
+        assert_eq!(err3["type"], "error");
+        assert_eq!(err3["code"], "ERR_INVALID_CHALLENGE");
+
+        // Exactly 16 chars should be accepted
+        let req4 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "1234567890123456",
+            "audience": "sat_app"
+        });
+        assert!(handle_offline_challenge_verify(&vault, &req4).is_ok());
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_missing_or_empty_audience_rejected() {
+        let vault = crypto_test_vault();
+
+        // Missing audience
+        let req1 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "valid_nonce_16_characters_long"
+        });
+        let err1 = handle_offline_challenge_verify(&vault, &req1).unwrap_err();
+        assert_eq!(err1["type"], "error");
+        assert_eq!(err1["code"], "ERR_INVALID_AUDIENCE");
+
+        // Empty audience
+        let req2 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "valid_nonce_16_characters_long",
+            "audience": ""
+        });
+        let err2 = handle_offline_challenge_verify(&vault, &req2).unwrap_err();
+        assert_eq!(err2["type"], "error");
+        assert_eq!(err2["code"], "ERR_INVALID_AUDIENCE");
+
+        // Whitespace-only audience
+        let req3 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "valid_nonce_16_characters_long",
+            "audience": "   "
+        });
+        let err3 = handle_offline_challenge_verify(&vault, &req3).unwrap_err();
+        assert_eq!(err3["type"], "error");
+        assert_eq!(err3["code"], "ERR_INVALID_AUDIENCE");
+    }
+
+    #[test]
+    fn test_offline_challenge_verify_level0_airgap_rejected() {
+        let vault = crypto_test_vault();
+
+        // Explicit anchor profile_id
+        let req1 = serde_json::json!({
+            "type": "OFFLINE_CHALLENGE_VERIFY",
+            "challenge": "valid_nonce_16_characters_long",
+            "audience": "sat_app",
+            "profile_id": "anchor"
+        });
+        let err1 = handle_offline_challenge_verify(&vault, &req1).unwrap_err();
+        assert_eq!(err1["type"], "error");
+        assert_eq!(err1["code"], "ERR_AIR_GAP_VIOLATION");
+        assert!(err1["message"].as_str().unwrap().contains("ERR_AIR_GAP_VIOLATION"));
     }
 }
 
