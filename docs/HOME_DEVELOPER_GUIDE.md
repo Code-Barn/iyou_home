@@ -490,13 +490,15 @@ variable.
 
 ### 5.2 Prosody XMPP & OMEMO Messaging (`:5222`)
 
-The Messages subsystem provides decentralized, end-to-end encrypted messaging using XMPP over WebSocket (RFC 7395) and OMEMO Double Ratchet encryption.
+User-facing messaging has been consolidated into the standalone `iyou_chat` satellite application (`https://chat.iyou.me`). `iyou_home` serves as the Sovereign Enclave: hosting the local Prosody XMPP daemon (`:5222`), Port `9001` signature bridge, Port `9002` Blossom storage server, and the contact petname SSOT.
 
+For developer diagnostics, the legacy `PeerChat` UI is preserved inside **Developer Tools** under the **Local XMPP Loopback Harness (:5222)**:
 - **JID Scheme**: `{nostr_pubkey_hex}@127.0.0.1`.
 - **SASL Authentication**: Plaintext SASL against embedded Prosody using Level 1 persona hex key.
 - **Address Resolution**: Supports npub (`npub1...`), did:key (`did:key:z6Mk...`), raw 64-char hex, and bare JID formats.
 - **OMEMO Device Bundles**: Stored in `omemo_store.json`. Each device mints distinct numerical device IDs, an identity key (`Ik`), a signed prekey (`Spk`) signed with Ed25519, and a pool of one-time prekeys (`Opks`).
 - **JID Sanitization**: Bare JID localparts MUST be 64-character lowercase hex strings derived via `did_to_pubkey` to satisfy RFC 7622 / XEP-0106 nodeprep rules.
+- **Satellite Launch**: External launcher button `Open iyou_chat ↗` in the Services panel and Contact List hands off to `iyou_chat` (`https://chat.iyou.me` or `http://127.0.0.1:8017` in local dev).
 
 ### 5.3 Mobile QR Pairing Protocol (`iyouhome://pair`)
 

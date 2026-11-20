@@ -108,7 +108,7 @@ All execution phases are complete and verified across both backend and frontend.
 
 - [x] **6.1** Embedded Prosody XMPP daemon with WebSocket transport (`:5222`)
 - [x] **6.2** OMEMO Double Ratchet session negotiation and bundle publishing (`omemo_publish_bundle`, `omemo_fetch_peer_bundle`)
-- [x] **6.3** Split-pane Messages tab UI (`MessagesTab.tsx`) with real-time thread persistence and JID resolution
+- [x] **6.3** Split-pane Messages tab UI (`MessagesTab.tsx`) with real-time thread persistence and JID resolution (shelved to Developer Tools `Local XMPP Loopback Harness (:5222)`; primary messaging consolidated into standalone `iyou_chat`)
 - [x] **6.4** SASL PLAIN authentication bound to Level 1 persona hex key
 
 ---

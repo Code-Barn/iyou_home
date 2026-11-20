@@ -16,6 +16,13 @@
  */
 
 import "@testing-library/jest-dom";
+import { vi } from "vitest";
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn().mockResolvedValue(undefined),
+  openPath: vi.fn().mockResolvedValue(undefined),
+  open: vi.fn().mockResolvedValue(undefined),
+}));
 
 // vitest's jsdom environment does not surface window.localStorage; provide a
 // spec-compliant in-memory Storage so components using it can be tested.

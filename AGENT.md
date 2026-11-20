@@ -101,38 +101,48 @@ Identity keys are derived deterministically from a single 32-byte cryptographic 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ iyou_home v0.2.2 · SigBridge 🟢  Nostr 🟢  Blossom 🟢  Sync 🟢  [👤 Primary] │
+│ iyou_home v0.2.3 · SigBridge 🟢  Nostr 🟢  Blossom 🟢  Sync 🟢  [👤 Primary] │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ [💬 Messages] [🛡️ Enclave] [📜 Credentials] [🔑 Vault] [⚙️ Services] [📊] [🧪]│
+│ [🛡️ Enclave] [📜 Credentials] [🔑 Vault] [⚙️ Services] [📊 Governance] [🛠️]│
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  1. 💬 Messages: Split-Pane OMEMO Encrypted Chat Inbox & Peer Composer     │
-│  2. 🛡️ Enclave: Project Zero Persona Matrix, Contact Enclave & Disclosures   │
-│  3. 📜 Credentials: W3C VC Repository & Universal JSON/File Import         │
-│  4. 🔑 Vault & Recovery: Master Seed Reveal, .iyoubackup & Family Enclave   │
-│  5. ⚙️ Services: Daemon Switchboard (:9001-:9003, :5222), Invites & Admin   │
-│  6. 📊 Governance Auditor: Poll Integrity & Blossom BUD-01 Merkle Consensus │
-│  7. 🧪 Manual Signer: Raw Challenge Signer (Developer Mode Only)           │
+│  1. 🛡️ Enclave: Project Zero Persona Matrix, Contact Enclave & Disclosures   │
+│  2. 📜 Credentials: W3C VC Repository & Universal JSON/File Import         │
+│  3. 🔑 Vault & Recovery: Master Seed Reveal, .iyoubackup & Family Enclave   │
+│  4. ⚙️ Services: Daemon Switchboard (:9001-:9003, :5222), Invites & Admin   │
+│  5. 📊 Governance Auditor: Poll Integrity & Blossom BUD-01 Merkle Consensus │
+│  6. 🛠️ Developer Tools: Raw Signer & Local XMPP Loopback Harness (:5222)   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **`💬 Messages` (`MessagesTab.tsx`)**:
-   - Split-pane E2EE chat inbox powered by XMPP over WebSocket (`:5222`) and OMEMO Double Ratchet.
-   - JID resolution from contact addresses (`npub`, `did:key`, raw hex, or bare JID).
-   - Device bundle publishing (`omemo_publish_bundle`) and peer bundle fetch (`omemo_fetch_peer_bundle`).
-2. **`🛡️ Enclave` (`ProjectZero.tsx`)**:
+> **Note on Messaging Architecture**: User-facing messaging has been consolidated into the standalone `iyou_chat` satellite (`https://chat.iyou.me` or `http://127.0.0.1:8017` in local dev mode). `iyou_home` serves as the local Sovereign Enclave (signing bridge `:9001`, Blossom storage `:9002`, contact petname SSOT, and local XMPP daemon `:5222`). The legacy `PeerChat` UI is preserved under Developer Tools (`Local XMPP Loopback Harness (:5222)`) for raw diagnostics. External launcher buttons (`Open iyou_chat ↗`) in the Services panel and Contact List hand off directly to `iyou_chat`.
+
+1. **`🛡️ Enclave` (`ProjectZero.tsx`)**:
    - Persona Matrix: Visual tier cards (L0 Anchor, L1 Public, L2+ Burners) with break-glass rotation.
    - Contact Enclave: 3-tier trust badges (`Inner Circle`, `Trusted Alliance`, `Peer`), alias management, and selective disclosure card issuance/import.
    - Sovereign Custody: WebAuthn PRF graduation import.
-3. **`📜 Credentials` (`TrustAssets.tsx`)**:
+   - Cross-App Chat Launch: Contact actions hand off directly to `iyou_chat` satellite via `@tauri-apps/plugin-opener`.
+2. **`📜 Credentials` (`TrustAssets.tsx`)**:
    - W3C Verifiable Credential repository with persona filtering and keyword search.
    - Universal `[ + Import Credential ]` modal with W3C structural validation (`@context`, `type`, `issuer`, `credentialSubject`, `proof`).
-4. **`🔑 Vault & Recovery` (`KeysManager.tsx`)**:
+3. **`🔑 Vault & Recovery` (`KeysManager.tsx`)**:
    - Master Seed Reveal (typed `REVEAL MY SEED` confirmation, 10s countdown, 30s auto-dismiss).
    - Encrypted `.iyoubackup` export and restore (HKDF-SHA256 + AES-256-GCM) with full `ledgers/` archive.
    - Mobile Pairing Station (`PairingModal.tsx` / `DevicePairing.tsx`): QR-based ECDH X25519 sealed seed transit.
    - **Family & Delegations Enclave (`FamilyEnclave.tsx` & `PodBindingModal.tsx`, RFC-005)**:
+     - Dependent pod creation (under-13 managed, 13–17 teen delegate with revocation rights).
+     - Threshold multisig approval queue for high-risk identity modifications.
+4. **`⚙️ Services` (`ServiceSwitchPanel.tsx`)**:
+   - Daemon lifecycle switches: SigBridge (`:9001`, always-on), Blossom (`:9002`), Nostr personal relay (`:9003`), and local Prosody XMPP (`:5222`).
+   - Satellite Launcher: `Open iyou_chat ↗` launcher button linking to `https://chat.iyou.me` (or `http://127.0.0.1:8017` in dev mode).
+   - Offline Media Vault (BUD-01 Blossom blob inspector, upload, and deletion).
+   - Invite Manager & Referral Tree.
+5. **`📊 Governance Auditor` (`GovernanceAuditor.tsx`)**:
+   - Real-time cryptographic validation of civic polls, multi-relay gossip integrity, and Blossom Merkle consensus snapshots.
+6. **`🛠️ Developer Tools` (`DeveloperTools.tsx`, Developer Mode Only)**:
+   - Raw Challenge Signer (`SovereignSigner.tsx`): Ad-hoc challenge signing across all active Level 1/2 personas.
+   - Local XMPP Loopback Harness (`:5222`): Collapsible diagnostic harness mounting legacy `PeerChat.tsx` for raw local loopback testing.
      - Custodial child pods, 3-share Shamir escrow distribution, supervisory grants (`kind:9114`), and 2-of-3 seed recovery.
    - Global Session Revocation Kill-Switch (signs `GLOBAL_SESSION_REVOKE` token dispatched to IdP).
 5. **`⚙️ Services` (`ServiceSwitchPanel.tsx`)**:

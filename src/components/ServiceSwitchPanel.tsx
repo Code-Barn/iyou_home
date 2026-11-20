@@ -24,6 +24,7 @@ import SovereigntyStatusPanel from "./SovereigntyStatusPanel";
 import InviteManager from "./invites/InviteManager";
 import AdminPanel from "./admin/AdminPanel";
 import { checkAndBootstrapSponsor } from "../lib/authBridge";
+import { openExternalUrl, getChatAppUrl } from "../lib/externalLauncher";
 
 type ServiceStatus = "running" | "stopped" | "starting";
 
@@ -365,6 +366,31 @@ export default function ServiceSwitchPanel() {
                       </div>
                     ) : (
                       <>
+                        {svc.name === "Chat" && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void openExternalUrl(getChatAppUrl());
+                            }}
+                            style={{
+                              fontSize: "0.82rem",
+                              background: "#4f46e5",
+                              color: "#ffffff",
+                              border: "none",
+                              padding: "0.35rem 0.7rem",
+                              borderRadius: "6px",
+                              cursor: "pointer",
+                              fontWeight: 600,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "0.25rem",
+                              transition: "background 0.15s ease",
+                            }}
+                            title="Open standalone iyou_chat client"
+                          >
+                            Open iyou_chat ↗
+                          </button>
+                        )}
                         <label className="autostart-toggle">
                           <input
                             type="checkbox"

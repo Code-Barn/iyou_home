@@ -27,21 +27,21 @@ import FirstRunGateway from "./components/onboarding/FirstRunGateway";
 import GlobalStatusBar from "./components/GlobalStatusBar";
 import ServiceSwitchPanel from "./components/ServiceSwitchPanel";
 import KeysManager from "./components/KeysManager";
-import SovereignSigner from "./components/SovereignSigner";
+import DeveloperTools from "./components/DeveloperTools";
 import TrustAssets from "./components/TrustAssets";
 import GovernanceAuditor from "./components/GovernanceAuditor";
 import WsSignPopup from "./components/WsSignPopup";
 import ProjectZero from "./components/enclave/ProjectZero";
-import MessagesTab from "./components/MessagesTab";
+import { openExternalUrl, getChatAppUrl } from "./lib/externalLauncher";
 import "./App.css";
 
 type TabId =
-  | "messages"
   | "enclave"
   | "assets"
   | "vault"
   | "services"
   | "governance"
+  | "devtools"
   | "signer";
 
 interface TabDef {
@@ -52,13 +52,12 @@ interface TabDef {
 }
 
 const TABS: TabDef[] = [
-  { id: "messages", label: "Messages", icon: "\uD83D\uDCAC" },
-  { id: "enclave", label: "Enclave", icon: "\uD83D\uDEE1\uFE0F" },
-  { id: "assets", label: "Credentials", icon: "\uD83D\uDCDC" },
-  { id: "vault", label: "Vault & Recovery", icon: "\uD83D\uDD11" },
-  { id: "services", label: "Services", icon: "\u2699\uFE0F" },
-  { id: "governance", label: "Governance Auditor", icon: "\uD83D\uDCCA" },
-  { id: "signer", label: "Manual Signer", icon: "\uD83E\uDDEA", devOnly: true },
+  { id: "enclave", label: "Enclave", icon: "🛡️" },
+  { id: "assets", label: "Credentials", icon: "📜" },
+  { id: "vault", label: "Vault & Recovery", icon: "🔑" },
+  { id: "services", label: "Services", icon: "⚙️" },
+  { id: "governance", label: "Governance Auditor", icon: "📊" },
+  { id: "devtools", label: "Developer Tools", icon: "🛠️", devOnly: true },
 ];
 
 const DEV_MODE_KEY = "iyou_home_dev_mode";
@@ -66,7 +65,6 @@ const DEV_MODE_KEY = "iyou_home_dev_mode";
 function App() {
   const [activeTab, setActiveTab] = useState<TabId>("enclave");
   const [activeProfile, setActiveProfile] = useState<PersonaProfile | null>(null);
-  const [selectedChatPeer, setSelectedChatPeer] = useState<ChatPeerTarget | null>(null);
   const [showDevMode, setShowDevMode] = useState<boolean>(() => {
     try {
       return localStorage.getItem(DEV_MODE_KEY) === "true";
@@ -326,10 +324,9 @@ function App() {
     invoke("set_enclave_locked", { locked: isAppLocked }).catch(() => {});
   }, [isAppLocked]);
 
-  // Cross-tab chat handoff: switch to Messages and focus the given peer.
+  // External chat handoff: launch standalone iyou_chat satellite with target peer
   const openChat = useCallback((target: ChatPeerTarget) => {
-    setSelectedChatPeer(target);
-    setActiveTab("messages");
+    void openExternalUrl(getChatAppUrl(target.peerId));
   }, []);
 
   const visibleTabs = TABS.filter((t) => !t.devOnly || showDevMode);
@@ -456,12 +453,6 @@ function App() {
         </div>
 
         <div className="tab-content">
-          {activeTab === "messages" && (
-            <MessagesTab
-              initialPeer={selectedChatPeer}
-              onClearInitialPeer={() => setSelectedChatPeer(null)}
-            />
-          )}
           {activeTab === "enclave" && (
             <ProjectZero
               onRequestChat={openChat}
@@ -480,8 +471,8 @@ function App() {
           )}
           {activeTab === "services" && <ServiceSwitchPanel />}
           {activeTab === "governance" && <GovernanceAuditor />}
-          {activeTab === "signer" && showDevMode && (
-            <SovereignSigner activeProfile={activeProfile} />
+          {(activeTab === "devtools" || activeTab === "signer") && showDevMode && (
+            <DeveloperTools activeProfile={activeProfile} />
           )}
         </div>
 

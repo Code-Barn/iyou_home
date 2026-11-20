@@ -231,7 +231,7 @@ describe("App", () => {
     await renderReadyApp();
     // Tab buttons are inside .tabs container; status bar also has button text matching "Enclave"
     const tabs = document.querySelector(".tabs");
-    expect(tabs?.textContent).toContain("Messages");
+    expect(tabs?.textContent).not.toContain("Messages");
     expect(tabs?.textContent).toContain("Enclave");
     expect(tabs?.textContent).toContain("Credentials");
     expect(tabs?.textContent).toContain("Vault");
@@ -239,19 +239,11 @@ describe("App", () => {
     expect(tabs?.textContent).toContain("Governance");
   });
 
-  it("navigates to the Messages tab and renders the split-pane inbox", async () => {
+  it("shelves Messages from primary navigation and keeps enclave focused", async () => {
     await renderReadyApp();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Messages/i }));
-    });
-
-    await waitFor(() => {
-      expect(
-        screen.getByText("Select a conversation or start a new encrypted chat"),
-      ).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /Start New Chat/i })).toBeInTheDocument();
-    });
+    const tabs = document.querySelector(".tabs");
+    expect(tabs?.textContent).not.toContain("Messages");
+    expect(screen.queryByRole("button", { name: /Messages/i })).not.toBeInTheDocument();
   });
 
   it("defaults to Enclave tab on launch", async () => {
@@ -356,11 +348,11 @@ describe("App", () => {
     expect(screen.getByText("Developer Mode")).toBeInTheDocument();
   });
 
-  it("Developer Mode toggle shows Manual Signer tab", async () => {
+  it("Developer Mode toggle shows Developer Tools tab and mounts local XMPP loopback harness", async () => {
     await renderReadyApp();
 
-    // Manual Signer tab should not be visible by default
-    expect(screen.queryByRole("button", { name: /Manual Signer/i })).not.toBeInTheDocument();
+    // Developer Tools tab should not be visible by default
+    expect(screen.queryByRole("button", { name: /Developer Tools/i })).not.toBeInTheDocument();
 
     // Toggle dev mode
     const devToggle = screen.getByText("Developer Mode");
@@ -368,8 +360,39 @@ describe("App", () => {
       fireEvent.click(devToggle);
     });
 
-    // Manual Signer tab should now be visible
-    expect(screen.getByRole("button", { name: /Manual Signer/i })).toBeInTheDocument();
+    // Developer Tools tab should now be visible
+    const devTabBtn = screen.getByRole("button", { name: /Developer Tools/i });
+    expect(devTabBtn).toBeInTheDocument();
+
+    // Navigate to Developer Tools
+    await act(async () => {
+      fireEvent.click(devTabBtn);
+    });
+
+    // Verify Developer Tools view renders Sovereign Signer and Collapsible Loopback Harness
+    expect(screen.getByText("Local XMPP Loopback Harness (:5222)")).toBeInTheDocument();
+
+    // Click harness toggle to expand
+    await act(async () => {
+      fireEvent.click(screen.getByText("Local XMPP Loopback Harness (:5222)"));
+    });
+
+    // Verify diagnostic notice is displayed
+    expect(
+      screen.getByText(/Diagnostic tool for testing raw local/i),
+    ).toBeInTheDocument();
+  });
+
+  it("renders Open iyou_chat launcher button in Services tab", async () => {
+    await renderReadyApp();
+    const servicesTab = screen.getByRole("button", { name: /Services/i });
+    await act(async () => {
+      fireEvent.click(servicesTab);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Open iyou_chat ↗/i })).toBeInTheDocument();
+    });
   });
 
   it("navigates to Enclave tab and shows Project Zero", async () => {
