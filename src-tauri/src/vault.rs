@@ -28,7 +28,6 @@ use k256::schnorr::SigningKey as SecpSigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 // Identity Graduation transit crypto (AGENT.md §16 / AUTH_FLOW_SPECIFICATION §16).

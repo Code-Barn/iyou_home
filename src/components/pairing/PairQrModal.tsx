@@ -28,6 +28,24 @@ interface PairFrame {
   expires_at: number;
 }
 
+interface RelayStatusPayload {
+  frame_id: string;
+  status: "connecting" | "connected" | "offline" | "completed" | "error";
+  relay: string;
+  message?: string;
+}
+
+interface OfflineSealedResponse {
+  envelope: {
+    frame_id: string;
+    device_did: string;
+    iv_b64: string;
+    ciphertext_b64: string;
+  };
+  sealed_qr_png_b64: string;
+  sealed_uri: string;
+}
+
 type PairStatus = "idle" | "scanning" | "verified" | "expired";
 
 interface Props {
@@ -48,15 +66,24 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
   const [remaining, setRemaining] = useState(0);
   const [verifiedDevice, setVerifiedDevice] = useState<PairedDeviceRecord | null>(null);
 
-  // Manual handshake harness state.
-  const [deviceDid, setDeviceDid] = useState("did:key:smashphone-proto");
-  const [deviceName, setDeviceName] = useState("Smashphone (proto)");
-  const [codeInput, setCodeInput] = useState("");
-  const [manualError, setManualError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Relay signaling status state
+  const [relayStatus, setRelayStatus] = useState<"connecting" | "connected" | "offline" | "completed" | "error">("connecting");
+  const [relayMessage, setRelayMessage] = useState<string | null>(null);
 
+  // Offline air-gapped response state
+  const [offlineInput, setOfflineInput] = useState("");
+  const [offlineError, setOfflineError] = useState<string | null>(null);
+  const [offlineBusy, setOfflineBusy] = useState(false);
+  const [offlineSealed, setOfflineSealed] = useState<OfflineSealedResponse | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const frameRef = useRef<PairFrame | null>(null);
   const statusRef = useRef<PairStatus>("idle");
   const closeTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    frameRef.current = frame;
+  }, [frame]);
 
   useEffect(() => {
     statusRef.current = status;
@@ -69,7 +96,7 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
       setStatus("verified");
       setVerifiedDevice(record);
       setError(null);
-      setManualError(null);
+      setOfflineError(null);
       onPaired();
       if (closeTimer.current) window.clearTimeout(closeTimer.current);
       closeTimer.current = window.setTimeout(() => onClose(), 1600);
@@ -84,8 +111,11 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
     }
     setLoading(true);
     setError(null);
-    setManualError(null);
-    setCodeInput("");
+    setOfflineError(null);
+    setOfflineInput("");
+    setOfflineSealed(null);
+    setRelayStatus("connecting");
+    setRelayMessage(null);
     try {
       const f = await invoke<PairFrame>("pair_begin");
       setFrame(f);
@@ -97,6 +127,14 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
       setLoading(false);
     }
   }, []);
+
+  // Cancel frame immediately when closed
+  const handleModalClose = useCallback(() => {
+    if (frameRef.current && statusRef.current === "scanning") {
+      void invoke("pair_cancel", { frameId: frameRef.current.frame_id }).catch(() => {});
+    }
+    onClose();
+  }, [onClose]);
 
   // Begin a fresh frame whenever the modal opens.
   useEffect(() => {
@@ -115,7 +153,7 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
     return () => window.clearInterval(id);
   }, [open, frame, status]);
 
-  // Listen for the backend handshake completion (real mobile path).
+  // Listen for the backend handshake completion (mobile path).
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -127,50 +165,64 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
         if (cancelled) fn();
         else unlisten = fn;
       })
-      .catch(() => {
-        /* event bus unavailable — manual harness still works */
-      });
+      .catch(() => {});
     return () => {
       cancelled = true;
       unlisten?.();
     };
   }, [open, enterVerified]);
 
+  // Listen for relay signaling status updates.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    listen<RelayStatusPayload>("pair://relay-status", (event) => {
+      if (cancelled) return;
+      if (frameRef.current && event.payload.frame_id !== frameRef.current.frame_id) return;
+      setRelayStatus(event.payload.status);
+      if (event.payload.message) {
+        setRelayMessage(event.payload.message);
+      }
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [open]);
+
   useEffect(
     () => () => {
       if (closeTimer.current) window.clearTimeout(closeTimer.current);
+      if (frameRef.current && statusRef.current === "scanning") {
+        void invoke("pair_cancel", { frameId: frameRef.current.frame_id }).catch(() => {});
+      }
     },
     []
   );
 
-  const handleSimulateConfirm = async () => {
-    if (!frame) return;
-    setManualError(null);
-    setError(null);
-    if (codeInput.trim() !== frame.verification_code) {
-      setManualError("Verification code does not match the displayed code.");
+  const handleProcessOfflineResponse = async () => {
+    if (!offlineInput.trim()) {
+      setOfflineError("Please paste the response URI or JSON from iyou_mobile_swift.");
       return;
     }
-    if (!deviceDid.trim()) {
-      setManualError("Device DID is required.");
-      return;
-    }
-    if (!deviceName.trim()) {
-      setManualError("Device name is required.");
-      return;
-    }
-    setBusy(true);
+    setOfflineBusy(true);
+    setOfflineError(null);
     try {
-      const record = await invoke<PairedDeviceRecord>("pair_confirm", {
-        frameId: frame.frame_id,
-        deviceDid: deviceDid.trim(),
-        deviceName: deviceName.trim(),
+      const res = await invoke<OfflineSealedResponse>("pair_process_offline_response", {
+        responseUriOrJson: offlineInput.trim(),
       });
-      enterVerified(record);
+      setOfflineSealed(res);
+      onPaired();
     } catch (e) {
-      setManualError(typeof e === "string" ? e : String(e));
+      setOfflineError(typeof e === "string" ? e : String(e));
     } finally {
-      setBusy(false);
+      setOfflineBusy(false);
     }
   };
 
@@ -179,35 +231,90 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
   const lowTime = status === "scanning" && remaining <= 30;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay" onClick={handleModalClose}>
       <div
         className="modal-content"
         onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: "520px" }}
+        style={{ maxWidth: "540px" }}
       >
         <h3 style={{ marginTop: 0 }}>{"\uD83D\uDCF1"} Pair Mobile Device</h3>
 
-        {/* High-friction security warning */}
+        {/* Security warning */}
         <div
           style={{
             border: "1px solid #f59e0b",
             background: "#fffbeb",
             borderRadius: "8px",
             padding: "0.75rem 1rem",
-            marginBottom: "1rem",
+            marginBottom: "0.85rem",
           }}
         >
           <p style={{ margin: 0, fontSize: "0.82rem", color: "#92400e", lineHeight: "1.55" }}>
-            <strong>Security note:</strong> scanning this QR begins an encrypted
-            seed handshake to a <em>new</em> device. The 6-character code below
-            is the authorization proof — anyone holding the QR and code could
-            initiate a sealed seed frame to their own device. Only scan with a
-            device you control. The frame expires automatically in 5 minutes
-            and is never persisted.
+            <strong>Security note:</strong> scanning this QR initiates an encrypted
+            root master seed transfer to your mobile companion. The 6-character code below
+            is the physical presence proof — only scan with a device you control.
+            Frames expire in 5 minutes and are never persisted unencrypted.
           </p>
         </div>
 
-        {loading && <p className="muted">Generating offline pairing frame…</p>}
+        {/* Live Relay Status Pill */}
+        {status === "scanning" && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.5rem",
+              padding: "0.4rem 0.75rem",
+              borderRadius: "6px",
+              fontSize: "0.78rem",
+              marginBottom: "1rem",
+              background:
+                relayStatus === "connected"
+                  ? "#f0fdf4"
+                  : relayStatus === "offline" || relayStatus === "error"
+                  ? "#fffbeb"
+                  : "#f8fafc",
+              border: `1px solid ${
+                relayStatus === "connected"
+                  ? "#bbf7d0"
+                  : relayStatus === "offline" || relayStatus === "error"
+                  ? "#fde68a"
+                  : "#e2e8f0"
+              }`,
+              color:
+                relayStatus === "connected"
+                  ? "#166534"
+                  : relayStatus === "offline" || relayStatus === "error"
+                  ? "#92400e"
+                  : "#475569",
+            }}
+          >
+            <span
+              style={{
+                width: "8px",
+                height: "8px",
+                borderRadius: "50%",
+                background:
+                  relayStatus === "connected"
+                    ? "#22c55e"
+                    : relayStatus === "offline" || relayStatus === "error"
+                    ? "#f59e0b"
+                    : "#3b82f6",
+                flexShrink: 0,
+              }}
+            />
+            <span style={{ fontWeight: 500 }}>
+              {relayMessage ||
+                (relayStatus === "connected"
+                  ? "Live relay active (relay.iyou.me) — waiting for mobile companion"
+                  : relayStatus === "offline" || relayStatus === "error"
+                  ? "Relay unreachable — use Complete Offline / Air-Gapped Pairing below"
+                  : "Connecting to signaling relay (relay.iyou.me)...")}
+            </span>
+          </div>
+        )}
+
+        {loading && <p className="muted">Generating ephemeral pairing frame…</p>}
         {error && (
           <p
             style={{
@@ -223,19 +330,18 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
         )}
 
         {status === "verified" && verifiedDevice && (
-          <div style={{ textAlign: "center", padding: "1rem 0" }}>
-            <div style={{ fontSize: "2.5rem" }}>{"\u2705"}</div>
-            <h3 style={{ margin: "0.25rem 0" }}>
+          <div style={{ textAlign: "center", padding: "1.5rem 0" }}>
+            <div style={{ fontSize: "2.8rem" }}>{"\u2705"}</div>
+            <h3 style={{ margin: "0.5rem 0 0.25rem 0" }}>
               Paired {verifiedDevice.device_name}
             </h3>
             <p className="muted" style={{ fontSize: "0.82rem" }}>
-              The device is now bound to this vault and appears in the paired
-              device list.
+              The device is now registered in pairing.json and bound to this vault.
             </p>
           </div>
         )}
 
-        {((status === "scanning" || status === "expired") && frame) && (
+        {(status === "scanning" || status === "expired") && frame && (
           <>
             <div
               style={{
@@ -258,12 +364,12 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
                   <img
                     src={frame.qr_png_b64}
                     alt="Pairing QR code"
-                    width={240}
-                    height={240}
+                    width={220}
+                    height={220}
                     style={{ display: "block", borderRadius: "4px" }}
                   />
                 ) : (
-                  <div style={{ width: 240, height: 240 }} />
+                  <div style={{ width: 220, height: 220 }} />
                 )}
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -311,7 +417,7 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
                     style={{
                       color: lowTime ? "#dc2626" : "#137333",
                       fontWeight: 600,
-                      fontSize: "0.9rem",
+                      fontSize: "0.88rem",
                       margin: 0,
                     }}
                   >
@@ -327,72 +433,144 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
               </button>
             )}
 
+            {/* Offline / Air-Gapped Pairing Panel */}
             {status === "scanning" && (
               <details
+                open={Boolean(offlineSealed)}
                 style={{
                   border: "1px dashed var(--color-border, #cbd5e1)",
                   borderRadius: "8px",
-                  padding: "0.5rem 0.75rem",
+                  padding: "0.6rem 0.85rem",
                   marginBottom: "1rem",
+                  background: offlineSealed ? "#f8fafc" : "transparent",
                 }}
               >
                 <summary
                   style={{
                     cursor: "pointer",
-                    fontSize: "0.78rem",
-                    color: "var(--color-text-muted)",
+                    fontSize: "0.82rem",
+                    color: "var(--color-text-secondary, #475569)",
                     fontWeight: 600,
                   }}
                 >
-                  Simulate mobile handshake (no mobile app yet)
+                  Complete Offline / Air-Gapped Pairing
                 </summary>
-                <div style={{ marginTop: "0.5rem" }}>
-                  <p style={{ fontSize: "0.75rem", color: "var(--color-text-muted)", marginTop: 0 }}>
-                    Type the displayed verification code and a DID to exercise
-                    the full confirm path end-to-end on this machine.
-                  </p>
-                  <div className="form-group">
-                    <label>Verification code (must match)</label>
-                    <input
-                      type="text"
-                      value={codeInput}
-                      onChange={(e) => setCodeInput(e.target.value)}
-                      placeholder={frame.verification_code}
-                      maxLength={6}
-                      autoComplete="off"
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label>Device DID</label>
-                    <input
-                      type="text"
-                      value={deviceDid}
-                      onChange={(e) => setDeviceDid(e.target.value)}
-                      placeholder="did:key:..."
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label>Device name</label>
-                    <input
-                      type="text"
-                      value={deviceName}
-                      onChange={(e) => setDeviceName(e.target.value)}
-                      placeholder="My phone"
-                    />
-                  </div>
-                  {manualError && (
-                    <p style={{ color: "#dc2626", fontSize: "0.8rem", margin: "0 0 0.5rem 0" }}>
-                      {manualError}
+
+                {!offlineSealed ? (
+                  <div style={{ marginTop: "0.6rem" }}>
+                    <p style={{ fontSize: "0.76rem", color: "var(--color-text-muted, #64748b)", marginTop: 0, lineHeight: "1.45" }}>
+                      If your mobile companion is air-gapped or cannot reach relay.iyou.me, paste the response URI or JSON from <strong>iyou_mobile_swift</strong> below.
                     </p>
-                  )}
-                  <button
-                    onClick={handleSimulateConfirm}
-                    disabled={busy}
-                    style={{ background: "#137333", color: "white" }}
-                  >
-                    {busy ? "Confirming…" : "Complete Pairing"}
-                  </button>
-                </div>
+                    <div className="form-group" style={{ marginBottom: "0.5rem" }}>
+                      <textarea
+                        rows={3}
+                        value={offlineInput}
+                        onChange={(e) => setOfflineInput(e.target.value)}
+                        placeholder="iyouhome://pair-ack?frame_id=...&x25519=...&did=...&name=...&code=..."
+                        style={{
+                          width: "100%",
+                          fontSize: "0.74rem",
+                          fontFamily: "var(--font-mono, monospace)",
+                          padding: "0.45rem",
+                          borderRadius: "6px",
+                          border: "1px solid #cbd5e1",
+                          boxSizing: "border-box",
+                        }}
+                      />
+                    </div>
+                    {offlineError && (
+                      <p style={{ color: "#dc2626", fontSize: "0.78rem", margin: "0 0 0.5rem 0" }}>
+                        {offlineError}
+                      </p>
+                    )}
+                    <button
+                      onClick={handleProcessOfflineResponse}
+                      disabled={offlineBusy}
+                      style={{
+                        background: "#2563eb",
+                        color: "white",
+                        padding: "0.45rem 0.85rem",
+                        fontSize: "0.8rem",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                        border: "none",
+                        fontWeight: 500,
+                      }}
+                    >
+                      {offlineBusy ? "Sealing Seed…" : "Process Response & Seal Seed"}
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: "0.75rem", textAlign: "center" }}>
+                    <p style={{ fontSize: "0.84rem", fontWeight: 600, color: "#166534", margin: "0 0 0.4rem 0" }}>
+                      {"\u2705"} Seed Envelope Sealed Successfully
+                    </p>
+                    <p style={{ fontSize: "0.75rem", color: "#64748b", margin: "0 0 0.75rem 0", lineHeight: "1.4" }}>
+                      <strong>Step 3:</strong> Scan this sealed seed QR code with <strong>iyou_mobile_swift</strong> to finalize master seed import.
+                    </p>
+                    <div
+                      style={{
+                        display: "inline-block",
+                        padding: "8px",
+                        background: "#fff",
+                        border: "1px solid #e5e7eb",
+                        borderRadius: "8px",
+                        marginBottom: "0.75rem",
+                      }}
+                    >
+                      <img
+                        src={offlineSealed.sealed_qr_png_b64}
+                        alt="Sealed seed QR code"
+                        width={220}
+                        height={220}
+                        style={{ display: "block" }}
+                      />
+                    </div>
+                    <div style={{ display: "flex", gap: "0.5rem", justifyContent: "center", alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        onClick={() => {
+                          void navigator.clipboard.writeText(offlineSealed.sealed_uri);
+                          setCopied(true);
+                          setTimeout(() => setCopied(false), 2000);
+                        }}
+                        style={{
+                          fontSize: "0.76rem",
+                          padding: "0.35rem 0.65rem",
+                          background: "#f1f5f9",
+                          border: "1px solid #cbd5e1",
+                          borderRadius: "6px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {copied ? "\u2705 Copied URI" : "\uD83D\uDCCB Copy Sealed URI"}
+                      </button>
+                      <button
+                        onClick={() => {
+                          enterVerified({
+                            device_id: offlineSealed.envelope.frame_id,
+                            device_did: offlineSealed.envelope.device_did,
+                            device_name: "Paired Companion",
+                            paired_at: Math.floor(Date.now() / 1000),
+                            last_seen_at: Math.floor(Date.now() / 1000),
+                            revoked_at: null,
+                          });
+                        }}
+                        style={{
+                          fontSize: "0.76rem",
+                          padding: "0.35rem 0.75rem",
+                          background: "#16a34a",
+                          color: "#fff",
+                          border: "none",
+                          borderRadius: "6px",
+                          cursor: "pointer",
+                          fontWeight: 600,
+                        }}
+                      >
+                        Finish Pairing
+                      </button>
+                    </div>
+                  </div>
+                )}
               </details>
             )}
           </>
@@ -412,7 +590,7 @@ export default function PairQrModal({ open, onClose, onPaired }: Props) {
             </button>
           )}
           <button
-            onClick={onClose}
+            onClick={handleModalClose}
             style={{
               background: "#f3f4f6",
               border: "1px solid #d1d5db",

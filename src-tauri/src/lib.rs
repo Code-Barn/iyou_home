@@ -45,6 +45,7 @@ mod moderation;
 mod nostr_relay;
 mod omemo;
 mod pairing;
+pub mod pairing_transport;
 mod pods;
 mod prosody;
 mod tray;
@@ -3087,8 +3088,61 @@ fn set_seed_backup_confirmed(app: AppHandle, confirmed: bool) -> Result<(), Stri
 // ---------- Device pairing ----------
 
 #[tauri::command]
-fn pair_begin(state: State<'_, pairing::PairFrameState>) -> Result<pairing::PairFrameResponse, String> {
-    pairing::begin_pairing(&state)
+fn pair_begin(
+    app: AppHandle,
+    state: State<'_, pairing::PairFrameState>,
+) -> Result<pairing::PairFrameResponse, String> {
+    let resp = pairing::begin_pairing(&state)?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    if let Ok(mut senders) = state.cancel_senders.lock() {
+        senders.insert(resp.frame_id.clone(), cancel_tx);
+    }
+    let relay_app = app.clone();
+    let frame_id = resp.frame_id.clone();
+    tauri::async_runtime::spawn(async move {
+        pairing_transport::start_pairing_relay_listener(
+            relay_app,
+            frame_id,
+            "wss://relay.iyou.me".to_string(),
+            cancel_rx,
+        )
+        .await;
+    });
+    Ok(resp)
+}
+
+#[tauri::command]
+fn pair_cancel(state: State<'_, pairing::PairFrameState>, frame_id: String) -> Result<(), String> {
+    pairing::cancel_pairing(&state, &frame_id)
+}
+
+#[tauri::command]
+fn pair_process_offline_response(
+    app: AppHandle,
+    state: State<'_, pairing::PairFrameState>,
+    response_uri_or_json: String,
+) -> Result<pairing_transport::OfflineSealedResponse, String> {
+    let (frame_id, mobile_x25519, device_did, device_name, verification_code) =
+        pairing_transport::parse_offline_response_input(&response_uri_or_json)?;
+
+    let envelope = pairing_transport::handle_incoming_mobile_handshake(
+        &app,
+        &state,
+        &frame_id,
+        &mobile_x25519,
+        &device_did,
+        &device_name,
+        &verification_code,
+    )?;
+
+    let sealed_uri = pairing::export_sealed_envelope_uri(&envelope);
+    let sealed_qr_png_b64 = pairing::export_sealed_envelope_qr(&envelope)?;
+
+    Ok(pairing_transport::OfflineSealedResponse {
+        envelope,
+        sealed_qr_png_b64,
+        sealed_uri,
+    })
 }
 
 #[tauri::command]
@@ -4219,6 +4273,8 @@ pub fn run() {
             get_vault_status,
             set_seed_backup_confirmed,
             pair_begin,
+            pair_cancel,
+            pair_process_offline_response,
             pair_seal_seed_for_device,
             pair_confirm,
             pair_list_devices,

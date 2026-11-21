@@ -80,12 +80,14 @@ pub struct ActivePairFrame {
 
 pub struct PairFrameState {
     pub frames: Mutex<HashMap<String, ActivePairFrame>>,
+    pub cancel_senders: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Default for PairFrameState {
     fn default() -> Self {
         Self {
             frames: Mutex::new(HashMap::new()),
+            cancel_senders: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -267,6 +269,58 @@ pub fn save_pairing_store(app: &AppHandle, store: &PairingStore) -> Result<(), S
 
 // ---------- Pairing lifecycle ----------
 
+pub fn percent_encode(s: &str) -> String {
+    let mut res = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                res.push(byte as char);
+            }
+            _ => {
+                res.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    res
+}
+
+pub fn percent_decode(s: &str) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next().ok_or_else(|| "Invalid percent encoding".to_string())?;
+            let h2 = chars.next().ok_or_else(|| "Invalid percent encoding".to_string())?;
+            let hex_bytes = [h1, h2];
+            let hex_str = std::str::from_utf8(&hex_bytes)
+                .map_err(|_| "Invalid UTF-8 in hex".to_string())?;
+            let val = u8::from_str_radix(hex_str, 16)
+                .map_err(|_| "Invalid hex in percent encoding".to_string())?;
+            bytes.push(val);
+        } else if b == b'+' {
+            bytes.push(b' ');
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8: {}", e))
+}
+
+pub fn export_sealed_envelope_uri(envelope: &SealedSeedEnvelope) -> String {
+    format!(
+        "iyouhome://pair-sealed?frame_id={}&did={}&iv={}&ct={}&ver=1",
+        envelope.frame_id,
+        percent_encode(&envelope.device_did),
+        percent_encode(&envelope.iv_b64),
+        percent_encode(&envelope.ciphertext_b64),
+    )
+}
+
+pub fn export_sealed_envelope_qr(envelope: &SealedSeedEnvelope) -> Result<String, String> {
+    let uri = export_sealed_envelope_uri(envelope);
+    render_qr_png_b64(&uri)
+}
+
 /// Begin a new pairing frame: ephemeral X25519 keypair, 12-byte nonce,
 /// 6-character code, 5-minute expiry, and an offline PNG QR deep link.
 pub fn begin_pairing(state: &PairFrameState) -> Result<PairFrameResponse, String> {
@@ -293,7 +347,7 @@ pub fn begin_pairing(state: &PairFrameState) -> Result<PairFrameResponse, String
     let expires_at = now + PAIR_FRAME_TTL_SECS;
 
     let deep_link = format!(
-        "iyouhome://pair?frame_id={}&x25519={}&nonce={}&ver=1",
+        "iyouhome://pair?frame_id={}&x25519={}&nonce={}&relay=wss://relay.iyou.me&ver=1",
         frame_id,
         pub_hex,
         hex::encode(&nonce)
@@ -324,6 +378,19 @@ pub fn begin_pairing(state: &PairFrameState) -> Result<PairFrameResponse, String
         qr_png_b64,
         expires_at,
     })
+}
+
+/// Immediately cancel an active pairing frame and its background relay listener.
+pub fn cancel_pairing(state: &PairFrameState, frame_id: &str) -> Result<(), String> {
+    if let Ok(mut guard) = state.frames.lock() {
+        guard.remove(frame_id);
+    }
+    if let Ok(mut senders) = state.cancel_senders.lock() {
+        if let Some(tx) = senders.remove(frame_id) {
+            let _ = tx.send(());
+        }
+    }
+    Ok(())
 }
 
 /// Sealing core, independent of app/vault wiring so it is unit-testable.
@@ -426,6 +493,11 @@ pub fn confirm_pairing(
 ) -> Result<PairedDeviceRecord, String> {
     if let Ok(mut guard) = state.frames.lock() {
         guard.remove(frame_id);
+    }
+    if let Ok(mut senders) = state.cancel_senders.lock() {
+        if let Some(tx) = senders.remove(frame_id) {
+            let _ = tx.send(());
+        }
     }
 
     let did = device_did.trim().to_string();
@@ -547,7 +619,7 @@ mod tests {
         let guard = state.frames.lock().unwrap();
         let frame = guard.get(&resp.frame_id).unwrap();
         let uri = format!(
-            "iyouhome://pair?frame_id={}&x25519={}&nonce={}&ver=1",
+            "iyouhome://pair?frame_id={}&x25519={}&nonce={}&relay=wss://relay.iyou.me&ver=1",
             frame.frame_id,
             frame.ephemeral_pub_hex,
             hex::encode(frame.nonce)
@@ -556,6 +628,49 @@ mod tests {
         let secret = StaticSecret::from(*frame.ephemeral_secret);
         let derived = hex::encode(PublicKey::from(&secret).as_bytes());
         assert_eq!(uri.contains(&derived), true);
+        assert!(uri.contains("relay=wss://relay.iyou.me"));
+    }
+
+    #[test]
+    fn test_export_sealed_envelope_qr() {
+        let envelope = SealedSeedEnvelope {
+            frame_id: "test-frame-123".to_string(),
+            device_did: "did:key:z6MkuTest123".to_string(),
+            iv_b64: "dGVzdC1pdi0xMjM=".to_string(),
+            ciphertext_b64: "c2VhbGVkLWNpcGhlcnRleHQ=".to_string(),
+        };
+        let uri = export_sealed_envelope_uri(&envelope);
+        assert!(uri.starts_with("iyouhome://pair-sealed?frame_id=test-frame-123"));
+        assert!(uri.contains("did=did%3Akey%3Az6MkuTest123"));
+        assert!(uri.contains("iv=dGVzdC1pdi0xMjM%3D"));
+        assert!(uri.contains("ct=c2VhbGVkLWNpcGhlcnRleHQ%3D"));
+        assert!(uri.ends_with("&ver=1"));
+
+        let qr_b64 = export_sealed_envelope_qr(&envelope).expect("QR encoding must succeed");
+        assert!(qr_b64.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn test_cancel_pairing() {
+        let state = PairFrameState::default();
+        let resp = begin_pairing(&state).unwrap();
+        assert!(state.frames.lock().unwrap().contains_key(&resp.frame_id));
+
+        cancel_pairing(&state, &resp.frame_id).expect("cancel_pairing should succeed");
+        assert!(!state.frames.lock().unwrap().contains_key(&resp.frame_id));
+    }
+
+    #[test]
+    fn test_percent_encode_decode() {
+        let orig = "did:key:z6Mktest+value/with=symbols";
+        let enc = percent_encode(orig);
+        assert!(!enc.contains(':'));
+        assert!(!enc.contains('+'));
+        assert!(!enc.contains('/'));
+        assert!(!enc.contains('='));
+
+        let dec = percent_decode(&enc).expect("decode should succeed");
+        assert_eq!(dec, orig);
     }
 
     #[test]
